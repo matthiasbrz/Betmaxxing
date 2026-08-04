@@ -1,0 +1,47 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: betmaxxing
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_locally}
+      POSTGRES_DB: betmaxxing
+    ports:
+      - "5432:5432"
+    volumes:
+      - betmaxxing_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U betmaxxing"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    command: uvicorn betmaxxing.api.main:app --host 0.0.0.0 --port 8000
+    environment:
+      BETMAXXING_DATABASE_URL: postgresql+psycopg://betmaxxing:${POSTGRES_PASSWORD:-change_me_locally}@db:5432/betmaxxing
+      BETMAXXING_MODE: ${BETMAXXING_MODE:-demo}
+      BETMAXXING_CORS_ORIGINS: http://localhost:5173
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Separate process on purpose: running it inside the API would fire every job
+  # once per worker. Start with `docker compose --profile scheduler up`.
+  scheduler:
+    build: .
+    command: python -m betmaxxing.scheduler.runner
+    environment:
+      BETMAXXING_DATABASE_URL: postgresql+psycopg://betmaxxing:${POSTGRES_PASSWORD:-change_me_locally}@db:5432/betmaxxing
+      BETMAXXING_MODE: ${BETMAXXING_MODE:-demo}
+      BETMAXXING_SCHEDULER_ENABLED: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles:
+      - scheduler
+
+volumes:
+  betmaxxing_db:

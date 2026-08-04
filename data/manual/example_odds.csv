@@ -1,0 +1,8 @@
+bookmaker,sport,competition,stage,surface,sets_to_win,home,away,start_time_utc,market,period,line,selection_code,selection_label,decimal_odds,observed_at_utc
+Winamax,football,Ligue 1,J3,,,Olympique Lyonnais,Stade Rennais,2026-08-04T17:00:00+00:00,1x2,full_time,,home,Olympique Lyonnais,1.63,2026-08-04T09:00:00+00:00
+Winamax,football,Ligue 1,J3,,,Olympique Lyonnais,Stade Rennais,2026-08-04T17:00:00+00:00,1x2,full_time,,draw,Match nul,4.20,2026-08-04T09:00:00+00:00
+Winamax,football,Ligue 1,J3,,,Olympique Lyonnais,Stade Rennais,2026-08-04T17:00:00+00:00,1x2,full_time,,away,Stade Rennais,5.00,2026-08-04T09:00:00+00:00
+Winamax,football,Ligue 1,J3,,,Olympique Lyonnais,Stade Rennais,2026-08-04T17:00:00+00:00,total_goals,full_time,2.5,over,Plus de 2.5 buts,1.86,2026-08-04T09:00:00+00:00
+Winamax,football,Ligue 1,J3,,,Olympique Lyonnais,Stade Rennais,2026-08-04T17:00:00+00:00,total_goals,full_time,2.5,under,Moins de 2.5 buts,1.98,2026-08-04T09:00:00+00:00
+Winamax,tennis,ATP Masters 1000 Montreal,R64,hard,2,Alejandro Tabilo,Rafael Jodar,2026-08-04T14:00:00+00:00,match_winner,full_time,,home,Alejandro Tabilo,1.76,2026-08-04T09:00:00+00:00
+Winamax,tennis,ATP Masters 1000 Montreal,R64,hard,2,Alejandro Tabilo,Rafael Jodar,2026-08-04T14:00:00+00:00,match_winner,full_time,,away,Rafael Jodar,2.07,2026-08-04T09:00:00+00:00

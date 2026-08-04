@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Every job runs in demo mode: deterministic, keyless, and no network calls to
+  # any provider. A CI run must never depend on a bookmaker being reachable.
+  BETMAXXING_MODE: demo
+  BETMAXXING_NOTIFICATIONS_ENABLED: "false"
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Format check
+        run: ruff format --check src tests
+
+      - name: Type check
+        run: mypy
+
+      - name: Tests
+        run: pytest --cov=betmaxxing --cov-report=term-missing
+
+      - name: Migrations apply from scratch
+        env:
+          BETMAXXING_DATABASE_URL: sqlite+pysqlite:///./ci-migrations.db
+        run: alembic upgrade head
+
+      - name: Demo scan runs end to end
+        run: betmaxxing scan --json > /dev/null
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: No committed .env file
+        run: |
+          if git ls-files --error-unmatch .env 2>/dev/null; then
+            echo "::error::.env must never be committed"
+            exit 1
+          fi
+          echo "ok — no .env tracked"
+
+      - name: .env.example carries no secret values
+        run: |
+          if grep -nE '^[A-Z_]*(API_KEY|TOKEN|PASSWORD|SECRET)=.+' .env.example; then
+            echo "::error::.env.example must list secret variables without values"
+            exit 1
+          fi
+          echo "ok — no populated secrets in .env.example"
+
+      - name: Scan history for common secret patterns
+        run: |
+          # Deliberately narrow: real provider key shapes, not every long string.
+          pattern='(sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
+          if git grep -nEI "$pattern" -- . ':!.github/workflows/ci.yml'; then
+            echo "::error::possible secret committed"
+            exit 1
+          fi
+          echo "ok — no secret pattern found"
