@@ -113,6 +113,9 @@ class TheOddsApiClient:
         budget_per_scan: int = 50,
         transport: httpx.BaseTransport | None = None,
         sleep: Any = time.sleep,
+        budget_ledger: Any = None,
+        provider_name: str = "the_odds_api",
+        now: Any = None,
     ) -> None:
         if not api_key:
             raise TheOddsApiAuthError(
@@ -127,6 +130,11 @@ class TheOddsApiClient:
         self._transport = transport
         self._sleep = sleep
         self._quota = QuotaInfo()
+        #: Durable, cross-process daily ceiling. ``None`` keeps the per-scan
+        #: guard only, which is all a unit test of the client itself needs.
+        self._ledger = budget_ledger
+        self._provider_name = provider_name
+        self._now = now
 
     # -- budget -------------------------------------------------------------
     @property
@@ -144,20 +152,57 @@ class TheOddsApiClient:
                 f"({self._spent} consommés, {cost} demandés) — appel refusé."
             )
 
+    def _reserve(self, cost: int, request: str) -> int | None:
+        """Authorise one attempt against both ceilings, before it is made."""
+        if self._ledger is None:
+            self._check_budget(cost)
+            return None
+        from betmaxxing.domain.timeutil import utc_now
+
+        return int(
+            self._ledger.reserve(
+                provider=self._provider_name,
+                cost=cost,
+                request=request,
+                now=self._now or utc_now(),
+                scan_spent=self._spent,
+                scan_budget=self._budget,
+            )
+        )
+
     # -- requests -----------------------------------------------------------
-    def get(self, path: str, params: dict[str, Any] | None = None, *, cost: int = 1) -> ApiResponse:
-        """GET with retries, budget guard and redacted diagnostics."""
-        self._check_budget(cost)
+    def get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        cost: int = 1,
+        billable: bool = True,
+    ) -> ApiResponse:
+        """GET with retries, budget guard and redacted diagnostics.
+
+        The budget is checked **per attempt**, not once per call. A retry is a
+        second request that costs credits exactly like the first, so it has to
+        pass the same gate; checking only on entry let ``max_retries`` multiply
+        the configured ceiling.
+
+        ``billable=False`` is reserved for the endpoints v4 documents as free —
+        today only ``/sports`` discovery. Such a call takes no reservation and
+        does not move the spend counter, because charging it would make the
+        ceiling refuse work it should have allowed.
+        """
         url = f"{self._base_url}/{path.lstrip('/')}"
         query = {**(params or {}), "apiKey": self._api_key}
 
         attempt = 0
         while True:
             attempt += 1
+            reservation = self._reserve(cost, path) if billable else None
             try:
                 with httpx.Client(timeout=self._timeout, transport=self._transport) as client:
                     response = client.get(url, params=query)
             except httpx.TimeoutException:
+                self._release(reservation)
                 if attempt > self._max_retries:
                     raise TheOddsApiError(
                         f"timeout après {attempt} tentative(s) sur {redact(url)}"
@@ -165,7 +210,9 @@ class TheOddsApiClient:
                 self._backoff(attempt, None)
                 continue
             except httpx.TransportError as exc:
-                # DNS / connection failures. The message may contain the URL.
+                # DNS / connection failures: no response, so no credit spent.
+                # The message may contain the URL.
+                self._release(reservation)
                 if attempt > self._max_retries:
                     raise TheOddsApiError(
                         f"erreur de transport sur {redact(url)}: {redact(str(exc))}"
@@ -174,7 +221,11 @@ class TheOddsApiClient:
                 continue
 
             self._quota = parse_quota(response.headers)
-            self._spent += self._quota.last_cost or cost
+            if billable:
+                # An absent header means the true cost is unknown; charge the
+                # estimate rather than nothing.
+                self._spent += self._quota.last_cost if self._quota.last_cost is not None else cost
+                self._reconcile(reservation, self._quota.last_cost)
 
             if response.status_code in (401, 403):
                 raise TheOddsApiAuthError(
@@ -215,6 +266,14 @@ class TheOddsApiClient:
                 ) from None
 
             return ApiResponse(payload=payload, quota=self._quota)
+
+    def _reconcile(self, reservation: int | None, observed: int | None) -> None:
+        if self._ledger is not None and reservation is not None:
+            self._ledger.reconcile(reservation, observed_cost=observed)
+
+    def _release(self, reservation: int | None) -> None:
+        if self._ledger is not None and reservation is not None:
+            self._ledger.release(reservation)
 
     def _backoff(self, attempt: int, retry_after: str | None) -> None:
         """Honour ``Retry-After`` when present, else exponential with jitter."""

@@ -36,11 +36,13 @@ uvicorn betmaxxing.api.main:app --reload
 Tests, lint, types :
 
 ```bash
-pytest                 # 670 tests
+pytest -W error        # 804 tests ; `python -m pytest` exécute exactement la même suite
 ruff check .           # tout le dépôt, migrations comprises
 ruff format --check .
 mypy
 ```
+
+Aucun avertissement n'est filtré : `filterwarnings = ["error"]`, sans exception.
 
 Le mode démo est **entièrement déterministe et synthétique**. Chaque cote qu'il produit
 porte `provider="demo"` et `bookmaker="DEMO_BOOK"` pour qu'elle ne puisse jamais être
@@ -160,7 +162,23 @@ Un scan rapporte aussi un `collection_status` : `OK`, `COLLECTED_NO_MODEL`,
 
 L'adaptateur est implémenté et testé sur contrats locaux (aucun appel réseau en CI).
 **Aucun appel réel n'a été effectué**, donc la couverture de `winamax_fr` n'est pas
-confirmée. Pour la vérifier vous-même :
+confirmée.
+
+Ce qu'il fait, et ce que « fait » veut dire ici :
+
+| Élément | État |
+|---|---|
+| Découverte `/sports` | Implémentée ; les compétitions inactives ne sont pas interrogées |
+| Marchés principaux (`h2h`, `totals`) | Appel groupé par compétition |
+| `draw_no_bet`, `double_chance`, `h2h_3_way_h1`, `totals_h1`, `double_chance_h1` | **Réellement demandés** par événement, sous contrôle du budget — et non simplement présents dans `MARKET_MAP` |
+| `h2h_s1`, « gagne au moins un set », tennis `totals` | Refusés : `UNSUPPORTED_BY_PROVIDER` ou sémantique non confirmée |
+| Budget par scan et par jour | Réservation **persistante** avant chaque tentative, retries compris ; rapprochée avec `x-requests-last` |
+| Historique (payant) | Interface et estimateur de coût **hors ligne** seulement. Aucun téléchargement |
+
+« Demandé et persisté » est prouvé **sur fixture locale**, pas contre le service réel.
+La distinction est le sujet de tout ce paragraphe.
+
+Pour vérifier la couverture réelle vous-même :
 
 ```bash
 export BETMAXXING_THE_ODDS_API_KEY=...   # votre clé, jamais versionnée
@@ -254,4 +272,13 @@ doit être vérifiée auprès de l'ANJ avant diffusion plutôt qu'affichée pér
   rien aujourd'hui.
 - `TheOddsApiProvider` est `IMPLEMENTED_UNVERIFIED` — aucun appel réel.
 - Le Challenge est `PARTIAL` : persistant et testé, mais désactivé par défaut.
-- Le planificateur est sûr multi-workers contre **une seule** base, pas un cluster.
+- Le planificateur est sûr multi-workers contre **une seule base SQLite**, ce qui est
+  testé. La voie PostgreSQL (`SKIP LOCKED`) est écrite mais **n'est pas exercée en CI**.
+  Rien ne coordonne plusieurs bases.
+- `renew_lease()` existe et est protégé par le jeton de possession, mais le runner ne
+  l'appelle pas : un scan dépassant 15 minutes serait repris par un autre worker.
+- Une identité ambiguë part en file de revue (`event_mapping_reviews`) qui n'a encore
+  ni commande ni route : elle se lit en SQL.
+- La table d'alias participants est consultée par le rapprochement mais aucun import ne
+  l'alimente ; elle est vide en pratique.
+- Le downgrade de la migration `b7c1e9d24a10` ne reconstruit pas `events.source_ids`.

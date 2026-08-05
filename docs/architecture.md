@@ -44,9 +44,16 @@ Un serveur web avec N workers exécuterait chaque tâche N fois, et un scan qui 
 un worker dégrade le service des requêtes. Le planificateur tourne donc seul.
 
 Son état vit dans `scheduler_jobs` : occurrences matérialisées à l'avance, réclamées
-atomiquement avec un bail, acquittées **après** persistance. Un `set()` en mémoire ne
+atomiquement avec un bail **et un jeton de possession**, acquittées **après** persistance
+et **uniquement** sur un résultat explicitement classé succès. Un `set()` en mémoire ne
 pouvait offrir ni reprise après redémarrage, ni récupération d'un worker crashé, ni
-sûreté multi-workers (D-020). Détail et limites : `docs/scheduler.md`.
+sûreté multi-workers (D-020).
+
+Deux corrections structurantes s'y ajoutent (D-030, D-031) : les états réclamables sont
+filtrés **en SQL avant `ORDER BY`/`LIMIT`**, sinon les lignes terminées finissent par
+occuper toute la fenêtre de sélection ; et tout achèvement est conditionné par le jeton
+de la réclamation courante, car réaffirmer `state = 'RUNNING'` ne distingue pas un
+ancien détenteur d'un nouveau. Détail et limites : `docs/scheduler.md`.
 
 ### Un seul chemin de collecte
 
@@ -65,6 +72,18 @@ idempotente par empreinte de snapshot, pas par cache mémoire.
 Un identifiant sans sémantique, une table `(provider, provider_event_id) → internal_id`,
 et un historique des horaires. Un report met à jour le même événement ; deux affiches
 distinctes le même jour restent distinctes (D-022).
+
+**Et une identité indéterminée n'est pas une identité.** La résolution retourne
+`RESOLVED`, `CREATED`, `AMBIGUOUS` ou `REJECTED`, et seuls les deux premiers portent un
+identifiant. Une ambiguïté n'écrit rien d'autre qu'une ligne de revue : marquer un
+résultat « ambigu » tout en retournant `candidates[0]` revenait à deviner en le
+signalant, ce qui reste deviner (D-034).
+
+### Un budget n'est un budget que s'il est persistant
+
+Un compteur en mémoire ne borne ni un retry, ni deux workers, ni un redémarrage. Chaque
+tentative fournisseur réserve son coût dans `provider_budget_ledger` avant d'être émise,
+puis rapproche la réservation du coût réellement facturé (D-035).
 
 ### Le registre de modèles est la seule autorité sur la publication
 
@@ -160,20 +179,32 @@ Deux étapes, dans cet ordre :
 1. **Autoritaire** — `(provider, provider_event_id)` dans `event_source_map`. Un
    fournisseur qui garde son identifiant stable à travers un report nous donne une
    identité stable sans effort.
-2. **Inter-fournisseurs** — seulement si la paire est inconnue : même sport, mêmes
-   participants normalisés, coup d'envoi à ±6 h. Une seule correspondance lie ;
-   plusieurs sont **refusées** comme ambiguës.
+2. **Inter-fournisseurs** — seulement si la paire est inconnue. Tout signal présent des
+   **deux** côtés doit concorder : sport, participants canoniques (via les alias déclarés
+   par le fournisseur), compétition, saison, tour/stage, et coup d'envoi à ±6 h. Un
+   signal absent d'un côté est un silence, pas un désaccord : les fournisseurs
+   renseignent ces champs de façon inégale, et traiter une compétition absente comme
+   « compétition différente » scinderait chaque rencontre en deux.
 
 Deux identifiants du **même** fournisseur ne fusionnent jamais : un fournisseur connaît
 son catalogue, donc deux identifiants signifient deux affiches.
 
-Quand la résolution ne tranche pas, l'événement est marqué `mapping_ambiguous` et
-**rejeté** via `EVENT_MAPPING_AMBIGUOUS` — deviner serait pire que s'abstenir.
+Une seule correspondance lie. Plusieurs sont **refusées** : la résolution retourne
+`AMBIGUOUS` sans identifiant, n'écrit aucune correspondance, ne modifie aucun événement
+candidat, ne rattache aucun snapshot, et dépose le cas dans `event_mapping_reviews`.
+Le scan rejette explicitement l'événement via `EVENT_MAPPING_AMBIGUOUS` — deviner serait
+pire que s'abstenir.
 
 ## Limites assumées
 
-- Le ledger sécurise plusieurs workers contre **une même base**. Rien ne coordonne
-  plusieurs bases.
+- Le ledger sécurise plusieurs workers contre **une même base**, et c'est testé sur
+  SQLite. Le chemin PostgreSQL (`FOR UPDATE SKIP LOCKED`) est écrit mais n'est exercé
+  par aucun test de la CI. Rien ne coordonne plusieurs bases.
+- `renew_lease()` est protégé par le jeton mais le runner ne l'appelle pas : un travail
+  plus long que le bail serait repris par un autre worker.
+- La file `event_mapping_reviews` n'a ni CLI ni route : elle se lit en SQL.
+- La table d'alias participants est consultée par le rapprochement, mais aucun import ne
+  l'alimente.
 - Le rattrapage est borné à 2 h : une panne plus longue ne rejoue pas les occurrences
   manquées.
 - SQLite convient au développement et aux tests ; PostgreSQL est requis en exploitation

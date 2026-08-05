@@ -8,7 +8,6 @@ same rung twice.
 from __future__ import annotations
 
 import pytest
-from tests.test_challenge import make_candidate
 
 from betmaxxing.challenge import Challenge, ChallengeConfig
 from betmaxxing.challenge.repository import (
@@ -18,6 +17,7 @@ from betmaxxing.challenge.repository import (
 )
 from betmaxxing.config import Settings
 from betmaxxing.domain.enums import BetOutcome, ChallengeState
+from helpers import make_candidate
 
 
 def make_challenge() -> Challenge:

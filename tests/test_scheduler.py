@@ -124,7 +124,7 @@ class TestRestartDurability:
         first = JobLedger(db_settings)
         first.enqueue(job_type=JobType.DAILY_SCAN, scheduled_for=NOW, scope_id=None)
         claimed = first.claim_due(now=NOW, worker="w1")
-        first.mark_succeeded(claimed[0].job_id, scan_id="s1")
+        first.mark_succeeded(claimed[0], scan_id="s1")
 
         restarted = JobLedger(db_settings)
         assert restarted.claim_due(now=NOW, worker="w2") == []
@@ -156,19 +156,24 @@ class TestRestartDurability:
         ledger.enqueue(job_type=JobType.DAILY_SCAN, scheduled_for=NOW, scope_id=None)
         claimed = ledger.claim_due(now=NOW, worker="w1")
         # Simulate a failure after the work started but before acknowledgement.
-        ledger.mark_failed(claimed[0].job_id, error="boom", now=NOW)
+        ledger.mark_failed(claimed[0], error="boom", now=NOW)
         assert ledger.get_state(claimed[0].job_id) is JobState.FAILED_RETRYABLE
-        assert len(ledger.claim_due(now=NOW, worker="w2")) == 1
+        # Retryable, but not immediately: the backoff exists so the runner does
+        # not claim-fail-claim in a tight loop.
+        assert ledger.claim_due(now=NOW, worker="w2") == []
+        assert len(ledger.claim_due(now=NOW + timedelta(hours=1), worker="w2")) == 1
 
     def test_repeated_failure_is_parked_as_final(self, db_settings: Settings) -> None:
         ledger = JobLedger(db_settings)
         ledger.enqueue(job_type=JobType.DAILY_SCAN, scheduled_for=NOW, scope_id=None)
+        moment = NOW
         for _ in range(MAX_ATTEMPTS):
-            claimed = ledger.claim_due(now=NOW, worker="w")
+            claimed = ledger.claim_due(now=moment, worker="w")
             if not claimed:
                 break
-            ledger.mark_failed(claimed[0].job_id, error="boom", now=NOW)
-        assert ledger.claim_due(now=NOW, worker="w") == []
+            ledger.mark_failed(claimed[0], error="boom", now=moment)
+            moment += timedelta(hours=1)  # past the retry backoff
+        assert ledger.claim_due(now=moment, worker="w") == []
         assert ledger.counts_by_state().get(str(JobState.FAILED_FINAL)) == 1
 
 

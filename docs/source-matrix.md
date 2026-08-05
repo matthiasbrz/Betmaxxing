@@ -87,19 +87,41 @@ Tant que le droit de conserver une réponse brute n'est pas confirmé, seuls son
 stockés : le **normalisé** (événements, snapshots), les **identifiants source**,
 les **horodatages** et les **métadonnées d'audit**. Aucun payload brut durable.
 
-### Marchés cartographiés
+### Marchés : cartographié ≠ collecté
 
-| Clé fournisseur | Sport | Marché Betmaxxing |
-|---|---|---|
-| `h2h` | football | 1X2 temps réglementaire |
-| `totals` | football | Total buts, ligne exacte |
-| `draw_no_bet` | football | Draw no bet |
-| `double_chance` | football | Double chance |
-| `h2h_3_way_h1` | football | 1X2 première mi-temps |
-| `totals_h1` | football | Total buts première mi-temps |
-| `double_chance_h1` | football | Double chance première mi-temps |
-| `h2h` | tennis | Vainqueur du match |
-| `totals` | tennis | Total de jeux — **désactivé par défaut** (sémantique jeux/sets non confirmée) |
+Ces deux mots ne veulent pas dire la même chose, et la version précédente de ce
+document les confondait. **Cartographié** signifie que `map_market()` sait traduire la
+réponse. **Collecté** signifie qu'une requête la demande réellement. Cinq marchés
+étaient cartographiés sans jamais être demandés : leurs tests de mapping passaient et
+ne prouvaient rien sur la collecte.
+
+| Clé fournisseur | Sport | Marché Betmaxxing | Cartographié | Demandé | Persisté sur fixture |
+|---|---|---|---|---|---|
+| `h2h` | football | 1X2 temps réglementaire | ✅ | ✅ appel groupé | ✅ |
+| `totals` | football | Total buts, ligne exacte | ✅ | ✅ appel groupé | ✅ |
+| `draw_no_bet` | football | Draw no bet | ✅ | ✅ par événement | ✅ |
+| `double_chance` | football | Double chance | ✅ | ✅ par événement | ✅ |
+| `h2h_3_way_h1` | football | 1X2 première mi-temps | ✅ | ✅ par événement | ✅ |
+| `totals_h1` | football | Total buts première mi-temps | ✅ | ✅ par événement | ✅ |
+| `double_chance_h1` | football | Double chance première mi-temps | ✅ | ✅ par événement | ❌ aucune fixture |
+| `h2h` | tennis | Vainqueur du match | ✅ | ✅ appel groupé | ✅ |
+| `totals` | tennis | Total de jeux | ✅ | ⛔ **désactivé** | — (sémantique jeux/sets non confirmée) |
+
+« Persisté sur fixture » veut dire : un test sans réseau vérifie la requête émise
+**puis** le snapshot produit. Aucune de ces lignes n'a été confirmée contre le service
+réel — l'adaptateur reste `IMPLEMENTED_UNVERIFIED`.
+
+Les marchés par événement coûtent une requête chacun. Ils passent par le même contrôle
+budgétaire que le reste et sont **ignorés avec un motif rapporté** quand la marge
+journalière est insuffisante : un jeu de marchés incomplet est un résultat normal.
+
+### Découverte des compétitions actives
+
+`/sports` est interrogé avant toute collecte et intersecté avec l'allowlist configurée.
+Une compétition inactive n'est pas interrogée du tout — inutile de payer un crédit pour
+une réponse vide. Une réponse `/sports` illisible est traitée comme un **échec de
+découverte** (repli sur l'allowlist, avec avertissement), pas comme « rien n'est en
+saison » : la confusion inverse annulerait silencieusement toute la collecte.
 
 ### Marchés explicitement refusés
 
@@ -113,10 +135,46 @@ jamais synthétisés à partir d'autres cotes : un prix que le bookmaker n'a pas
 proposé n'est pas un prix. Les fair odds internes du modèle restent disponibles
 et sont clairement une sortie de modèle, pas une cotation.
 
-### Couverture manquante ≠ panne
+### Taxonomie des réponses — six situations, pas une
 
-Une réponse valide qui ne contient pas `winamax_fr` produit
-`COVERAGE_MISSING`, **pas** `PROVIDER_ERROR`, et ne déclenche jamais le mode démo.
+Une réponse valide qui ne contient pas `winamax_fr` produit `COVERAGE_MISSING`, **pas**
+`PROVIDER_ERROR`, et ne déclenche jamais le mode démo. L'inverse est tout aussi
+important, et c'est ce que la version précédente ne faisait pas : **un échec total ne
+doit jamais être présenté comme une couverture manquante.**
+
+| Situation | Statut |
+|---|---|
+| Toutes les compétitions en erreur | `PROVIDER_ERROR` |
+| Snapshots obtenus | `OK` |
+| Bookmaker présent, aucun marché exploitable | `NO_CANDIDATE` |
+| Événements présents, bookmaker configuré absent | `COVERAGE_MISSING` |
+| Réponse valide et vide (rien dans la fenêtre) | `NO_CANDIDATE` |
+| Échec partiel | données valides conservées + `partial_errors` |
+
+Authentification invalide et plafond budgétaire sont traités séparément, comme des
+échecs typés que l'ordonnanceur distingue (voir `docs/scheduler.md`).
+
+### Budget — appliqué, pas déclaré
+
+Chaque tentative, retry compris, réserve son coût estimé dans `provider_budget_ledger`
+**avant** d'être émise, contre le plafond par scan et le plafond journalier UTC. La
+réservation est ensuite rapprochée de `x-requests-last`. En-tête absent : l'estimation
+est conservée (coût inconnu = pire cas). Erreur de transport sans réponse : la
+réservation est libérée.
+
+Deux workers d'une même base ne peuvent donc pas dépasser ensemble le plafond
+journalier — ce qui était le cas avec le compteur en mémoire du client. La
+sérialisation repose sur le verrou d'écriture du moteur ; elle est testée sur SQLite,
+pas sur PostgreSQL.
+
+### Historique (payant) — estimation seule
+
+`betmaxxing.providers.the_odds_api.historical` fournit une interface et un **estimateur
+de coût hors ligne** prenant sports, compétitions, période, marchés, intervalle de
+snapshots et bookmaker. Il retourne une **borne supérieure** accompagnée de ses
+hypothèses. `fetch_historical()` lève : aucun téléchargement n'est implémenté, aucun
+endpoint payant n'est contacté, et une exécution future exigera un consentement
+explicite distinct de celui d'un scan.
 
 ### Comment vérifier vous-même
 

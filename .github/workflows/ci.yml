@@ -43,11 +43,29 @@ jobs:
       - name: Type check
         run: mypy
 
-      - name: Tests
-        # pyproject sets `filterwarnings = ["error", ...]`, so any warning that
-        # is not explicitly listed there fails the suite. Passing -W here would
-        # override those filters, so it is deliberately absent.
-        run: pytest --cov=betmaxxing --cov-report=term-missing
+      - name: Tests (console script, warnings fatal)
+        # The console script, not `python -m pytest`: the two resolve imports
+        # differently and a suite that only collects under one of them is not a
+        # suite. `-W error` is redundant with pyproject's `filterwarnings =
+        # ["error"]` and passed anyway, so this step still fails on a warning
+        # even if someone loosens the ini file.
+        run: pytest -W error --cov=betmaxxing --cov-report=term-missing
+
+      - name: The two pytest invocations collect the same suite
+        run: |
+          script_count=$(pytest --collect-only -q | tail -1)
+          module_count=$(python -m pytest --collect-only -q | tail -1)
+          echo "pytest:          $script_count"
+          echo "python -m pytest: $module_count"
+          test "$script_count" = "$module_count"
+
+      - name: No warning filter hides the Starlette/httpx deprecation
+        run: |
+          if grep -n "starlette.testclient" pyproject.toml; then
+            echo "::error::the Starlette/httpx warning must be resolved, not filtered"
+            exit 1
+          fi
+          echo "ok — no Starlette/httpx filter"
 
       - name: Migrations apply to a fresh database
         env:
@@ -59,6 +77,13 @@ jobs:
           BETMAXXING_DATABASE_URL: sqlite+pysqlite:///./ci-upgrade.db
         run: |
           alembic upgrade 65c32b5e3f63
+          alembic upgrade head
+
+      - name: Migrations apply from the previous tranche's schema
+        env:
+          BETMAXXING_DATABASE_URL: sqlite+pysqlite:///./ci-tranche.db
+        run: |
+          alembic upgrade 3ce123580afa
           alembic upgrade head
 
       - name: No schema drift between models and migrations

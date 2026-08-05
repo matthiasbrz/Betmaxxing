@@ -8,32 +8,47 @@ The model here is the standard one for reliable job execution:
 
 * occurrences are **materialised** into a table ahead of time by
   :meth:`JobLedger.materialise`, with a unique constraint on
-  ``(job_type, scheduled_for, scope_id)`` making enqueue idempotent;
-* a worker **claims** due occurrences atomically and takes a **lease**;
-* a job is marked ``SUCCEEDED`` only *after* its work is durably persisted;
+  ``(job_type, scheduled_for, scope_id)`` making enqueue idempotent — including
+  when two workers insert the same occurrence at the same instant;
+* a worker **claims** due occurrences atomically, taking a lease *and* a fresh
+  **fencing token**;
+* a job is marked ``SUCCEEDED`` only *after* its work is durably persisted, and
+  only by the holder of the token the claim handed out;
 * an expired lease is reclaimable, so a crashed worker does not strand a job.
+
+Two properties the previous version claimed but did not have
+-----------------------------------------------------------
+**No starvation.** Claimable states are filtered in SQL, *before* ``ORDER BY``
+and ``LIMIT``. The old query selected the oldest rows regardless of state and
+filtered in Python, so a few dozen ``SUCCEEDED`` rows filled the window and a
+genuinely due job was never reached.
+
+**No stale completion.** Every terminal transition is a conditional UPDATE on
+``(job_id, state=RUNNING, lease_owner, claim_token)``. A worker that lost its
+lease during a pause changes zero rows and gets :class:`StaleLeaseError`. Simply
+re-asserting ``state = 'RUNNING'`` was not enough: that is what the row already
+said, so both a stale holder and a second reclaimer matched.
 
 Concurrency guarantee, stated precisely
 ---------------------------------------
-Claiming does a conditional UPDATE (``WHERE job_id = ... AND state = 'PENDING'``)
-and treats "0 rows updated" as "someone else took it". On PostgreSQL this is
-serialised by row locking. On SQLite it is serialised by the database-level write
-lock. Both are safe for **multiple workers against one database**.
-
-What is *not* claimed: nothing here coordinates across databases, and the
-catch-up policy is deliberately bounded rather than replaying an unbounded
-backlog. See docs/scheduler.md.
+Multiple workers against **one** database are safe on PostgreSQL (row locking,
+with ``SKIP LOCKED`` on the selection) and on SQLite (database-level write lock).
+Both are exercised by tests; only SQLite is exercised in CI. Nothing here
+coordinates across databases, and the catch-up policy is deliberately bounded
+rather than replaying an unbounded backlog. See docs/scheduler.md.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
+from sqlalchemy.exc import IntegrityError
 
 from betmaxxing.config import Settings
 from betmaxxing.domain.timeutil import PARIS, ensure_utc, from_storage, to_display, utc_now
@@ -49,6 +64,9 @@ DEFAULT_LEASE = timedelta(minutes=15)
 DEFAULT_CATCHUP_GRACE = timedelta(hours=2)
 #: Retry ceiling before a job is parked as FAILED_FINAL.
 MAX_ATTEMPTS = 3
+#: Base delay before a retryable failure becomes claimable again. Doubles per
+#: attempt. Without it the runner claims, fails and re-claims in a tight loop.
+DEFAULT_RETRY_BACKOFF = timedelta(minutes=5)
 
 
 class JobType(StrEnum):
@@ -64,6 +82,19 @@ class JobState(StrEnum):
     FAILED_FINAL = "FAILED_FINAL"
 
 
+#: The only states a claim may transition out of. ``SUCCEEDED`` and
+#: ``FAILED_FINAL`` are terminal and must never enter the selection window.
+CLAIMABLE_STATES = frozenset({JobState.PENDING, JobState.FAILED_RETRYABLE, JobState.RUNNING})
+
+
+class StaleLeaseError(RuntimeError):
+    """The caller no longer owns this job.
+
+    Raised when a completion is attempted with a token that is not the current
+    one — the job was reclaimed by another worker, or already finished.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class ClaimedJob:
     """A job this worker now owns for the duration of its lease."""
@@ -74,6 +105,9 @@ class ClaimedJob:
     #: Event internal id for a milestone, ``None`` for a global scan.
     scope_id: str | None
     attempts: int
+    #: Fencing token. Required to complete the job; a stale holder does not have it.
+    claim_token: str
+    lease_expires_at: datetime | None = None
 
     @property
     def is_event_scoped(self) -> bool:
@@ -87,12 +121,22 @@ def occurrence_id(job_type: JobType, scheduled_for: datetime, scope_id: str) -> 
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
+def new_claim_token() -> str:
+    return uuid.uuid4().hex[:32]
+
+
 class JobLedger:
     """SQL-backed occurrence store."""
 
-    def __init__(self, settings: Settings, lease: timedelta = DEFAULT_LEASE) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        lease: timedelta = DEFAULT_LEASE,
+        retry_backoff: timedelta = DEFAULT_RETRY_BACKOFF,
+    ) -> None:
         self._settings = settings
         self._lease = lease
+        self._retry_backoff = retry_backoff
 
     # -- writing ------------------------------------------------------------
     def enqueue(
@@ -103,26 +147,37 @@ class JobLedger:
         scope_id: str | None,
         now: datetime | None = None,
     ) -> str | None:
-        """Insert one occurrence. Returns its id, or ``None`` if it already existed."""
+        """Insert one occurrence. Returns its id, or ``None`` if it already existed.
+
+        "Already existed" covers the race: two workers materialising the same
+        instant both see an empty table, both insert, and the unique constraint
+        on ``(job_type, scheduled_for, scope_id)`` picks a winner. The loser
+        treats the ``IntegrityError`` as "someone else enqueued it", which is
+        exactly what happened.
+        """
         moment = ensure_utc(now or utc_now())
         scope = scope_id or ""
         when = ensure_utc(scheduled_for).replace(second=0, microsecond=0)
         job_id = occurrence_id(job_type, when, scope)
 
-        with session_scope(self._settings) as session:
-            if session.get(SchedulerJobRow, job_id) is not None:
-                return None
-            session.add(
-                SchedulerJobRow(
-                    job_id=job_id,
-                    job_type=str(job_type),
-                    scheduled_for=when,
-                    scope_id=scope,
-                    state=str(JobState.PENDING),
-                    attempts=0,
-                    created_at=moment,
+        try:
+            with session_scope(self._settings) as session:
+                if session.get(SchedulerJobRow, job_id) is not None:
+                    return None
+                session.add(
+                    SchedulerJobRow(
+                        job_id=job_id,
+                        job_type=str(job_type),
+                        scheduled_for=when,
+                        scope_id=scope,
+                        state=str(JobState.PENDING),
+                        attempts=0,
+                        created_at=moment,
+                    )
                 )
-            )
+        except IntegrityError:
+            logger.debug("occurrence %s already enqueued by another worker", job_id)
+            return None
         return job_id
 
     def materialise(
@@ -186,27 +241,46 @@ class JobLedger:
         """Atomically take ownership of up to ``limit`` due occurrences.
 
         Due means ``scheduled_for <= now`` and either ``PENDING``,
-        ``FAILED_RETRYABLE`` under the attempt ceiling, or ``RUNNING`` with an
-        expired lease (the crashed-worker recovery path).
+        ``FAILED_RETRYABLE`` whose backoff has elapsed and which is under the
+        attempt ceiling, or ``RUNNING`` with a genuinely expired lease (the
+        crashed-worker recovery path).
         """
         moment = ensure_utc(now)
         expiry = moment + self._lease
         claimed: list[ClaimedJob] = []
 
         with session_scope(self._settings) as session:
-            rows = session.scalars(
+            statement = (
                 select(SchedulerJobRow)
-                .where(SchedulerJobRow.scheduled_for <= moment)
+                .where(
+                    SchedulerJobRow.scheduled_for <= moment,
+                    # Filtered here, in SQL, *before* ORDER BY and LIMIT. Doing
+                    # it in Python let terminal rows fill the window.
+                    or_(
+                        SchedulerJobRow.state == str(JobState.PENDING),
+                        (SchedulerJobRow.state == str(JobState.FAILED_RETRYABLE))
+                        & (SchedulerJobRow.attempts < MAX_ATTEMPTS)
+                        & (
+                            SchedulerJobRow.next_attempt_at.is_(None)
+                            | (SchedulerJobRow.next_attempt_at <= moment)
+                        ),
+                        (SchedulerJobRow.state == str(JobState.RUNNING))
+                        & (SchedulerJobRow.attempts < MAX_ATTEMPTS)
+                        & SchedulerJobRow.lease_expires_at.is_not(None)
+                        & (SchedulerJobRow.lease_expires_at <= moment),
+                    ),
+                )
                 .order_by(SchedulerJobRow.scheduled_for)
-                .limit(limit * 4)
-            ).all()
+                .limit(limit)
+            )
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                # Two workers then never even see the same row. SQLite has no
+                # equivalent and relies on the compare-and-swap below.
+                statement = statement.with_for_update(skip_locked=True)
+
+            rows = session.scalars(statement).all()
 
             for row in rows:
-                if len(claimed) >= limit:
-                    break
-                if not self._is_claimable(row, moment):
-                    continue
-
                 # Snapshot everything needed *before* the UPDATE: SQLAlchemy
                 # synchronises matching in-session objects, so reading
                 # `row.attempts` afterwards returns the already-incremented
@@ -217,13 +291,24 @@ class JobLedger:
                 scope = row.scope_id or None
                 next_attempt = row.attempts + 1
                 expected_state = row.state
+                expected_token = row.claim_token
+                token = new_claim_token()
 
-                # Conditional update: whoever changes the row first wins.
+                # Compare-and-swap on state *and* token. Re-asserting the state
+                # alone is not enough when reclaiming an expired RUNNING lease:
+                # RUNNING is what the row already says, so a second reclaimer
+                # would also match.
+                condition = (
+                    SchedulerJobRow.claim_token.is_(None)
+                    if expected_token is None
+                    else SchedulerJobRow.claim_token == expected_token
+                )
                 result = session.execute(
                     update(SchedulerJobRow)
                     .where(
                         SchedulerJobRow.job_id == job_id,
                         SchedulerJobRow.state == expected_state,
+                        condition,
                     )
                     .values(
                         state=str(JobState.RUNNING),
@@ -231,6 +316,8 @@ class JobLedger:
                         started_at=moment,
                         lease_owner=worker,
                         lease_expires_at=expiry,
+                        claim_token=token,
+                        next_attempt_at=None,
                     )
                 )
                 if result.rowcount != 1:  # type: ignore[attr-defined]
@@ -243,65 +330,120 @@ class JobLedger:
                         scheduled_for=scheduled_for,
                         scope_id=scope,
                         attempts=next_attempt,
+                        claim_token=token,
+                        lease_expires_at=expiry,
                     )
                 )
         return claimed
 
-    def _is_claimable(self, row: SchedulerJobRow, moment: datetime) -> bool:
-        state = JobState(row.state)
-        if state is JobState.PENDING:
-            return True
-        if state is JobState.FAILED_RETRYABLE:
-            return row.attempts < MAX_ATTEMPTS
-        if state is JobState.RUNNING:
-            # Reclaim only after the lease has genuinely expired.
-            return (
-                row.lease_expires_at is not None
-                and from_storage(row.lease_expires_at) <= moment
-                and row.attempts < MAX_ATTEMPTS
-            )
-        return False
-
     # -- completion ---------------------------------------------------------
     def mark_succeeded(
-        self, job_id: str, *, scan_id: str | None = None, now: datetime | None = None
+        self,
+        job: ClaimedJob | str,
+        *,
+        claim_token: str | None = None,
+        scan_id: str | None = None,
+        now: datetime | None = None,
     ) -> None:
-        """Call only after the corresponding work is durably persisted."""
-        self._finish(job_id, JobState.SUCCEEDED, now=now, scan_id=scan_id)
+        """Call only after the corresponding work is durably persisted.
+
+        Accepts the :class:`ClaimedJob` itself so the token cannot be forgotten.
+        """
+        job_id, token = _identify(job, claim_token)
+        moment = ensure_utc(now or utc_now())
+        values: dict[str, object] = {
+            "state": str(JobState.SUCCEEDED),
+            "finished_at": moment,
+            "lease_owner": None,
+            "lease_expires_at": None,
+            "claim_token": None,
+            "next_attempt_at": None,
+            "error": None,
+        }
+        if scan_id:
+            values["scan_id"] = scan_id
+        self._complete(job_id, token, values)
 
     def mark_failed(
-        self, job_id: str, *, error: str, retryable: bool = True, now: datetime | None = None
+        self,
+        job: ClaimedJob | str,
+        *,
+        error: str,
+        claim_token: str | None = None,
+        retryable: bool = True,
+        retry_after: timedelta | None = None,
+        now: datetime | None = None,
     ) -> None:
+        job_id, token = _identify(job, claim_token)
+        moment = ensure_utc(now or utc_now())
+
         with session_scope(self._settings) as session:
             row = session.get(SchedulerJobRow, job_id)
             if row is None:
-                return
-            final = not retryable or row.attempts >= MAX_ATTEMPTS
-            row.state = str(JobState.FAILED_FINAL if final else JobState.FAILED_RETRYABLE)
-            row.finished_at = ensure_utc(now or utc_now())
-            row.error = error[:2000]
-            row.lease_owner = None
-            row.lease_expires_at = None
+                raise StaleLeaseError(f"job {job_id} n'existe plus")
+            attempts = row.attempts
 
-    def _finish(
+        final = not retryable or attempts >= MAX_ATTEMPTS
+        backoff = retry_after if retry_after is not None else self._backoff_for(attempts)
+        self._complete(
+            job_id,
+            token,
+            {
+                "state": str(JobState.FAILED_FINAL if final else JobState.FAILED_RETRYABLE),
+                "finished_at": moment,
+                "error": error[:2000],
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "claim_token": None,
+                "next_attempt_at": None if final else moment + backoff,
+            },
+        )
+
+    def renew_lease(self, job: ClaimedJob, *, now: datetime | None = None) -> datetime:
+        """Extend a lease that is about to expire while work is still running.
+
+        Guarded by the same fencing token: a worker whose lease already lapsed
+        cannot take it back from whoever picked the job up.
+        """
+        moment = ensure_utc(now or utc_now())
+        expiry = moment + self._lease
+        self._complete(
+            job.job_id,
+            job.claim_token,
+            {"lease_expires_at": expiry},
+            keep_running=True,
+        )
+        return expiry
+
+    def _backoff_for(self, attempts: int) -> timedelta:
+        return self._retry_backoff * (2 ** max(attempts - 1, 0))
+
+    def _complete(
         self,
         job_id: str,
-        state: JobState,
+        token: str | None,
+        values: dict[str, object],
         *,
-        now: datetime | None,
-        scan_id: str | None = None,
+        keep_running: bool = False,
     ) -> None:
+        """Conditional transition guarded by the fencing token."""
         with session_scope(self._settings) as session:
-            row = session.get(SchedulerJobRow, job_id)
-            if row is None:
-                return
-            row.state = str(state)
-            row.finished_at = ensure_utc(now or utc_now())
-            row.lease_owner = None
-            row.lease_expires_at = None
-            row.error = None
-            if scan_id:
-                row.scan_id = scan_id
+            result = session.execute(
+                update(SchedulerJobRow)
+                .where(
+                    SchedulerJobRow.job_id == job_id,
+                    SchedulerJobRow.state == str(JobState.RUNNING),
+                    SchedulerJobRow.claim_token == token,
+                )
+                .values(**values)
+            )
+            if result.rowcount != 1:  # type: ignore[attr-defined]
+                raise StaleLeaseError(
+                    f"job {job_id} n'est plus détenu par ce worker (jeton périmé) — "
+                    "aucune ligne modifiée. Une autre tentative est peut-être en cours."
+                )
+        if keep_running:
+            return
 
     # -- inspection ---------------------------------------------------------
     def get_state(self, job_id: str) -> JobState | None:
@@ -327,3 +469,9 @@ class JobLedger:
                 )
             ).all()
             return len(rows)
+
+
+def _identify(job: ClaimedJob | str, claim_token: str | None) -> tuple[str, str | None]:
+    if isinstance(job, ClaimedJob):
+        return job.job_id, job.claim_token
+    return job, claim_token

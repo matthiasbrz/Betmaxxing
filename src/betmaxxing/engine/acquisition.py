@@ -26,9 +26,10 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 
 from betmaxxing import DISCLAIMER
 from betmaxxing.config import RunMode, Settings, get_settings
@@ -43,11 +44,13 @@ from betmaxxing.domain.models import (
 )
 from betmaxxing.domain.timeutil import is_in_window, scan_window, utc_now
 from betmaxxing.engine.scan import AnalysisOutput, analyse
-from betmaxxing.ingestion.identity import EventIdentityService
+from betmaxxing.ingestion.identity import EventIdentityService, ResolvedEvent
 from betmaxxing.ingestion.normalize import assemble_books
 from betmaxxing.providers.base import (
+    BudgetExceeded,
     CollectionBatch,
     ProviderError,
+    ProviderQuotaExceeded,
     ProviderUnavailable,
     collect_via_listing,
 )
@@ -65,6 +68,33 @@ logger = logging.getLogger("betmaxxing.acquisition")
 SPORTS_IN_SCOPE: list[Sport] = [Sport.FOOTBALL, Sport.TENNIS]
 
 
+class FailureKind(StrEnum):
+    """Why a collection failed, at the granularity a caller must act on.
+
+    The scheduler needs this to decide between "retry later", "stop retrying"
+    and "wait for the next budget window"; a bare ``PROVIDER_ERROR`` status
+    cannot distinguish a 503 from a missing API key.
+    """
+
+    #: Timeout, transport failure, 5xx, or a partial failure that became total.
+    TRANSIENT = "TRANSIENT"
+    #: Missing/invalid key, 401/403, 422, unusable configuration. Retrying will
+    #: fail identically until a human changes something.
+    CONFIGURATION = "CONFIGURATION"
+    #: Scan or daily credit ceiling reached. Retrying now cannot succeed.
+    BUDGET = "BUDGET"
+
+
+def classify_failure(error: Exception) -> FailureKind:
+    """Map a provider exception onto the action the caller should take."""
+    # Order matters: ProviderQuotaExceeded subclasses ProviderUnavailable.
+    if isinstance(error, BudgetExceeded | ProviderQuotaExceeded):
+        return FailureKind.BUDGET
+    if isinstance(error, ProviderUnavailable):
+        return FailureKind.CONFIGURATION
+    return FailureKind.TRANSIENT
+
+
 @dataclass(slots=True)
 class AcquisitionResult:
     """What a run produced, including the batch actually written."""
@@ -73,6 +103,8 @@ class AcquisitionResult:
     batch: CollectionBatch
     events_persisted: int
     snapshots_persisted: int
+    #: ``None`` on any completed collection, including one that found nothing.
+    failure: FailureKind | None = None
 
     @property
     def data_health(self) -> DataHealth:
@@ -111,20 +143,19 @@ class AcquisitionService:
         try:
             providers = bundle or build_providers(settings, moment, manual_odds_path)
         except ProviderUnavailable as exc:
-            return self._unavailable(scan_id, moment, window, str(exc))
+            return self._unavailable(scan_id, moment, window, exc, persist=persist)
 
         try:
             batch = self._collect(providers, window, moment)
         except ProviderError as exc:
             logger.warning("collection failed: %s", exc)
-            return self._unavailable(
-                scan_id, moment, window, str(exc), status=CollectionStatus.PROVIDER_ERROR
-            )
+            return self._unavailable(scan_id, moment, window, exc, persist=persist)
 
         # --- persist source data first -------------------------------------
         events_written = snapshots_written = 0
+        unattributable: list[CanonicalEvent] = []
         if persist:
-            batch = self._resolve_identity(batch)
+            batch, unattributable = self._resolve_identity(batch)
             events_written, snapshots_written = self._persist_batch(batch, settings)
 
         in_window = [e for e in batch.events if is_in_window(e.start_time_utc, window)]
@@ -145,6 +176,7 @@ class AcquisitionService:
             scan_id=scan_id,
             window=window,
         )
+        analysis.rejections.extend(self._ambiguity_rejections(unattributable))
 
         collection_status = self._classify(batch, providers, analysis, normalized.books)
         status = ScanStatus.CANDIDATES_FOUND if analysis.candidates else ScanStatus.NO_CANDIDATE
@@ -198,19 +230,29 @@ class AcquisitionService:
             return collector(SPORTS_IN_SCOPE, window)
         return collect_via_listing(providers.odds, SPORTS_IN_SCOPE, window, moment)
 
-    def _resolve_identity(self, batch: CollectionBatch) -> CollectionBatch:
-        """Map provider events onto stable internal ids and rewrite the batch.
+    def resolve_identities(
+        self, events: Iterable[CanonicalEvent], *, provider: str
+    ) -> list[CanonicalEvent]:
+        """Rewrite events onto internal identity, dropping unusable ones.
 
-        Snapshots are rewritten too, so a snapshot can never reference an event
-        that was not resolved and stored.
+        Exposed so the scheduler can plan milestones against **internal** ids.
+        Planning against a provider id is what made every milestone scan analyse
+        zero events: the analysis filter compares internal ids.
         """
-        remap: dict[str, str] = {}
-        resolved_events: list[CanonicalEvent] = []
+        out: list[CanonicalEvent] = []
+        for event, resolution in self._resolve_each(events, provider):
+            if resolution.usable:
+                out.append(event.model_copy(update={"internal_id": resolution.internal_id}))
+        return out
 
-        for event in batch.events:
-            source_id = event.source_ids.get(batch.provider) or event.internal_id
+    def _resolve_each(
+        self, events: Iterable[CanonicalEvent], provider: str
+    ) -> list[tuple[CanonicalEvent, ResolvedEvent]]:
+        resolved: list[tuple[CanonicalEvent, ResolvedEvent]] = []
+        for event in events:
+            source_id = event.source_ids.get(provider) or event.internal_id
             resolution = self._identity.resolve(
-                provider=batch.provider,
+                provider=provider,
                 provider_event_id=source_id,
                 sport=event.sport,
                 competition=event.competition,
@@ -218,27 +260,54 @@ class AcquisitionService:
                 away_name=event.away.name,
                 start_time_utc=event.start_time_utc,
                 status=event.status,
+                stage=event.stage,
+                season=event.season,
             )
-            remap[event.internal_id] = resolution.internal_id
-            resolved_events.append(
-                event.model_copy(
-                    update={
-                        "internal_id": resolution.internal_id,
-                        "mapping_ambiguous": event.mapping_ambiguous or resolution.ambiguous,
-                    }
+            resolved.append((event, resolution))
+        return resolved
+
+    def _resolve_identity(
+        self, batch: CollectionBatch
+    ) -> tuple[CollectionBatch, list[CanonicalEvent]]:
+        """Map provider events onto stable internal ids and rewrite the batch.
+
+        Three outcomes, and only one of them keeps data:
+
+        * resolved or created — the event and its snapshots are rewritten onto
+          the internal id and persisted;
+        * **ambiguous** — the event is dropped from the batch entirely and its
+          snapshots with it. Attaching them to one of the candidate fixtures
+          would fabricate an attribution; the case is already queued for review
+          by the identity service. The dropped events are returned separately so
+          the scan can reject them explicitly rather than omit them silently;
+        * rejected — same, with a different diagnosis.
+
+        Snapshots are rewritten too, so a snapshot can never reference an event
+        that was not resolved and stored.
+        """
+        remap: dict[str, str] = {}
+        resolved_events: list[CanonicalEvent] = []
+        unattributable: list[CanonicalEvent] = []
+
+        for event, resolution in self._resolve_each(batch.events, batch.provider):
+            if resolution.internal_id is not None:
+                remap[event.internal_id] = resolution.internal_id
+                resolved_events.append(
+                    event.model_copy(update={"internal_id": resolution.internal_id})
                 )
-            )
-            if resolution.ambiguous:
-                batch.partial_errors.append(resolution.ambiguity_detail)
+                continue
+
+            unattributable.append(event.model_copy(update={"mapping_ambiguous": True}))
+            batch.partial_errors.append(resolution.detail)
 
         resolved_snapshots: list[OddsSnapshot] = []
         for snapshot in batch.snapshots:
             target = remap.get(snapshot.event_internal_id)
             if target is None:
                 # A snapshot with no resolved event is dropped and reported,
-                # never persisted against a dangling id.
+                # never persisted against a dangling id or a guessed one.
                 batch.partial_errors.append(
-                    f"snapshot sans événement résolu : {snapshot.selection.key}"
+                    f"snapshot non rattaché (identité indéterminée) : {snapshot.selection.key}"
                 )
                 continue
             resolved_snapshots.append(
@@ -249,7 +318,24 @@ class AcquisitionService:
 
         batch.events = resolved_events
         batch.snapshots = resolved_snapshots
-        return batch
+        return batch, unattributable
+
+    def _ambiguity_rejections(self, events: Sequence[CanonicalEvent]) -> list[Rejection]:
+        """Say out loud that a fixture was seen and deliberately not priced."""
+        return [
+            Rejection(
+                event_internal_id=event.internal_id,
+                event_label=f"{event.home.name} - {event.away.name}",
+                selection_key="",
+                code=RejectionCode.EVENT_MAPPING_AMBIGUOUS,
+                detail=(
+                    "Identité de l'événement indéterminée : plusieurs rencontres "
+                    "existantes correspondent. Aucune cote n'a été rattachée ; le cas "
+                    "est en file de revue (event_mapping_reviews)."
+                ),
+            )
+            for event in events
+        ]
 
     def _persist_batch(self, batch: CollectionBatch, settings: Settings) -> tuple[int, int]:
         """Store events then snapshots. Idempotent on natural keys."""
@@ -344,11 +430,22 @@ class AcquisitionService:
         scan_id: str,
         moment: datetime,
         window: tuple[datetime, datetime],
-        reason: str,
+        error: Exception,
+        *,
+        persist: bool = True,
         status: CollectionStatus = CollectionStatus.PROVIDER_ERROR,
     ) -> AcquisitionResult:
+        """Build — and persist — the scan document for a failed collection.
+
+        The previous version returned this document without storing it, so the
+        only durable trace of an outage was a log line. An error scan carries the
+        diagnosis, the window it was trying to cover and the configuration
+        fingerprint; it is exactly what an operator needs afterwards, and it
+        costs one row.
+        """
         from betmaxxing.domain.enums import ProviderHealth
 
+        reason = str(error)
         health = DataHealth(
             providers=[
                 ProviderStatus(
@@ -377,8 +474,15 @@ class AcquisitionService:
             batch=None,
             warnings=[reason],
         )
+        if persist:
+            with session_scope(self._settings) as session:
+                ScanRepository(session).save(result)
         return AcquisitionResult(
-            scan=result, batch=empty, events_persisted=0, snapshots_persisted=0
+            scan=result,
+            batch=empty,
+            events_persisted=0,
+            snapshots_persisted=0,
+            failure=classify_failure(error),
         )
 
 

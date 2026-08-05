@@ -70,7 +70,9 @@ BETMAXXING_SCHEDULER_ENABLED=true python -m betmaxxing.scheduler.runner
 
 Son état vit dans `scheduler_jobs` : un redémarrage reprend là où il en était, et un
 worker crashé libère son occurrence à l'expiration du bail. Plusieurs workers contre
-**une même base** sont sûrs ; rien ne coordonne plusieurs bases.
+**une même base SQLite** sont sûrs, et c'est testé (famine, jeton de possession,
+reprise concurrente, insertion concurrente). Le chemin PostgreSQL `FOR UPDATE SKIP
+LOCKED` est écrit mais n'est pas exercé en CI. Rien ne coordonne plusieurs bases.
 
 ## The Odds API — variables et budgets
 
@@ -79,9 +81,18 @@ export BETMAXXING_ODDS_PROVIDER=the_odds_api
 export BETMAXXING_THE_ODDS_API_KEY=...          # jamais dans un fichier versionné
 export BETMAXXING_BOOKMAKERS=winamax_fr
 export BETMAXXING_THE_ODDS_API_REGIONS=eu,fr
-export BETMAXXING_PROVIDER_BUDGET_PER_SCAN=50   # refus AVANT l'appel si dépassé
-export BETMAXXING_PROVIDER_BUDGET_PER_DAY=450
+export BETMAXXING_PROVIDER_BUDGET_PER_SCAN=50   # refus AVANT chaque tentative
+export BETMAXXING_PROVIDER_BUDGET_PER_DAY=450   # idem, partagé entre workers
 ```
+
+Les deux plafonds sont **appliqués**, pas seulement déclarés : chaque tentative — retry
+compris — réserve son coût estimé dans `provider_budget_ledger` avant d'être émise, et
+la réservation est rapprochée du `x-requests-last` renvoyé. Un en-tête absent laisse
+l'estimation en place (coût inconnu = pire cas) ; une erreur de transport sans réponse
+libère la réservation.
+
+La sérialisation repose sur le verrou d'écriture du moteur. Elle est testée sur SQLite ;
+le comportement PostgreSQL n'est pas exercé en CI.
 
 La clé n'apparaît jamais dans une URL journalisée, une exception, une trace ou une
 réponse d'API : le client masque `apiKey=` avant toute sortie.
@@ -180,7 +191,33 @@ alembic upgrade head
 pytest
 ```
 
-Les migrations sont additives et testées dans les deux sens : sur base neuve et depuis
-le schéma de référence `65c32b5e3f63`. `alembic check` échoue s'il manque une migration.
+Les migrations sont testées sur **cinq** chemins, dont ceux qui peuvent perdre des
+données :
+
+| Chemin | Couvert |
+|---|---|
+| Base vide → `head` | ✅ |
+| Schéma initial vide → `head` | ✅ |
+| **Schéma initial peuplé → `head`** | ✅ challenge + palier, événement avec `source_ids`, snapshot avec ligne, scan, candidat |
+| `3ce123580afa` (commit `f901d6e`) déjà appliqué → `head` | ✅ |
+| `alembic check` sans dérive, sur base peuplée | ✅ |
+
+Une base contenant un Challenge **ne pouvait pas** être migrée avant cette tranche :
+`ADD COLUMN ... NOT NULL` est refusé sur une table non vide. Les colonnes sont désormais
+ajoutées nullables, backfillées depuis le dernier palier réglé, vérifiées, puis
+resserrées.
+
+Si un document de Challenge est inexploitable, la migration **refuse** en nommant la
+ligne. Aucune banque n'est inventée. Pour parquer explicitement ces lignes :
+
+```bash
+BETMAXXING_MIGRATION_UNUSABLE_CHALLENGE=quarantine alembic upgrade head
+```
+
+Elles passent alors à l'état `quarantined` avec une banque à zéro et un motif lisible.
+
+**Limite du downgrade.** `b7c1e9d24a10` ne reconstruit pas `events.source_ids` depuis
+`event_source_map` : cette direction exigerait de deviner quelles lignes la migration a
+créées. C'est documenté plutôt que fabriqué.
 
 Redémarrez l'API **et** le planificateur.

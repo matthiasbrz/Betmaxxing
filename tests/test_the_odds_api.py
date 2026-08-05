@@ -110,8 +110,27 @@ def tennis_event() -> dict[str, Any]:
     }
 
 
+#: Per-test SQLite file, installed by the autouse fixture below. The provider
+#: now records every credit reservation durably, so it needs a database even in
+#: a contract test that makes no real call.
+_DATABASE_URL = ""
+
+
+@pytest.fixture(autouse=True)
+def _isolated_database(tmp_path: Any) -> Any:
+    from betmaxxing.storage.db import reset_engine
+
+    global _DATABASE_URL
+    reset_engine()
+    _DATABASE_URL = f"sqlite+pysqlite:///{tmp_path / 'odds.db'}"
+    yield
+    _DATABASE_URL = ""
+    reset_engine()
+
+
 def provider_settings(**overrides: Any) -> Settings:
     base: dict[str, Any] = {
+        "database_url": _DATABASE_URL or "sqlite+pysqlite:///:memory:",
         "mode": RunMode.PAPER,
         "odds_provider": "the_odds_api",
         "the_odds_api_key": SECRET,

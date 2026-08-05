@@ -179,7 +179,10 @@ class TestAmbiguity:
             start_time_utc=KICKOFF + timedelta(minutes=30),
         )
         assert outcome.ambiguous
-        assert "rapprochement refusé" in outcome.ambiguity_detail
+        assert "rapprochement refusé" in outcome.detail
+        # An ambiguity carries no identity at all: there is nothing to attach to.
+        assert outcome.internal_id is None
+        assert len(outcome.candidate_internal_ids) == 2
 
 
 class TestSameProviderNeverMerges:

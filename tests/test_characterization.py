@@ -94,7 +94,7 @@ class TestSchedulerStateSurvivesRestart:
         first = JobLedger(db_settings)
         first.enqueue(job_type=JobType.DAILY_SCAN, scheduled_for=NOW, scope_id=None)
         claimed = first.claim_due(now=NOW, worker="w1")
-        first.mark_succeeded(claimed[0].job_id, scan_id="s1")
+        first.mark_succeeded(claimed[0], scan_id="s1")
 
         # A brand new ledger stands in for a restarted process.
         restarted = JobLedger(db_settings)

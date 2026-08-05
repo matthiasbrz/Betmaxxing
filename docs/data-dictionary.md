@@ -10,6 +10,7 @@ uniquement à l'affichage.
 | `internal_id` | str | **Opaque et stable** (`evt_…`). Aucune sémantique temporelle : un report ne le change pas |
 | `sport` | enum | `football`, `tennis` |
 | `competition` | str | Libellé de la compétition tel que publié |
+| `season` | str? | Saison, quand le fournisseur la donne. Signal de rapprochement : deux rencontres de la même paire dans deux saisons sont deux rencontres |
 | `stage` | str? | Tour ou journée (« R64 », « J3 ») |
 | `surface` | str? | Tennis : `hard`, `clay`, `grass`, `carpet` |
 | `sets_to_win` | int? | Tennis : 2 (bo3) ou 3 (bo5) |
@@ -157,10 +158,12 @@ Score composite dans [0, 1] avec ses composantes.
 | `rejections` | Codes et détails |
 | `alerts` | Ledger de déduplication des notifications |
 | `challenges` / `challenge_steps` | Challenge — Montante, avec `version` (concurrence optimiste) |
-| `scheduler_jobs` | Occurrences du planificateur ; unique sur `(job_type, scheduled_for, scope_id)` |
+| `scheduler_jobs` | Occurrences du planificateur ; unique sur `(job_type, scheduled_for, scope_id)`. `claim_token` = jeton de possession exigé pour tout achèvement ; `next_attempt_at` = plancher de reprise après échec |
 | `event_source_map` | `(provider, provider_event_id) → internal_id` — résolution autoritaire |
 | `event_schedule_history` | Trace append-only des changements d'horaire et de statut |
-| `participant_aliases` | Orthographes alternatives par fournisseur |
+| `participant_aliases` | Orthographes alternatives, unique sur `(sport, source, alias)` — un fournisseur ne peut plus évincer l'alias d'un autre. Consultée par le rapprochement ; **aucun import ne l'alimente aujourd'hui** |
+| `event_mapping_reviews` | File de revue des identités ambiguës. Une ambiguïté n'écrit **que** ici : ni correspondance, ni événement, ni snapshot |
+| `provider_budget_ledger` | Une ligne par tentative fournisseur : coût réservé, coût constaté (`x-requests-last`), libération, fenêtre journalière UTC |
 | `collection_batches` | Un lot de collecte, **même sans candidat** |
 | `model_registry` | Statut de validation persistant par `(model_id, version)` |
 

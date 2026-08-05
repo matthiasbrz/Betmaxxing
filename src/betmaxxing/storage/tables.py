@@ -50,6 +50,9 @@ class EventRow(Base):
     #: Order-sensitive participant key, used only for cross-provider matching.
     #: Identity itself is the opaque `canonical_id`, never this key.
     participant_pair_key: Mapped[str | None] = mapped_column(String(320), nullable=True, index=True)
+    #: Matching signal: two fixtures between the same pair in different seasons
+    #: are different fixtures, however close their kick-offs happen to be.
+    season: Mapped[str | None] = mapped_column(String(32), nullable=True)
     start_time_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     status: Mapped[str] = mapped_column(String(32), default="scheduled")
     mapping_ambiguous: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -231,10 +234,17 @@ class EventScheduleHistoryRow(Base):
 
 
 class ParticipantAliasRow(Base):
-    """Alternate spellings of a team or player, per provider."""
+    """Alternate spellings of a team or player, per provider.
+
+    The key includes ``source``: two providers may legitimately ship the same
+    short form, and a ``(sport, alias)`` key let whichever was inserted first
+    silently own it for everyone.
+    """
 
     __tablename__ = "participant_aliases"
-    __table_args__ = (UniqueConstraint("sport", "alias", name="uq_participant_alias"),)
+    __table_args__ = (
+        UniqueConstraint("sport", "source", "alias", name="uq_participant_alias_source"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     sport: Mapped[str] = mapped_column(String(32), index=True)
@@ -255,6 +265,9 @@ class SchedulerJobRow(Base):
     __table_args__ = (
         UniqueConstraint("job_type", "scheduled_for", "scope_id", name="uq_scheduler_occurrence"),
         Index("ix_scheduler_state_due", "state", "scheduled_for"),
+        # Supports the claim query, which filters on state first so terminal
+        # rows never enter the ORDER BY / LIMIT window.
+        Index("ix_scheduler_claimable", "state", "scheduled_for", "next_attempt_at"),
     )
 
     job_id: Mapped[str] = mapped_column(String(32), primary_key=True)
@@ -272,6 +285,13 @@ class SchedulerJobRow(Base):
     lease_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    #: Fencing token, regenerated on every claim. Completing a job requires
+    #: presenting the token the claim handed out, so a worker that lost its
+    #: lease cannot finish (or fail) the attempt that replaced it.
+    claim_token: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    #: Earliest instant a FAILED_RETRYABLE job may be claimed again. Without it
+    #: the runner re-claims a failing job on the very next loop iteration.
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     scan_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
@@ -296,6 +316,58 @@ class CollectionBatchRow(Base):
     coverage_status: Mapped[str] = mapped_column(String(32), default="OK")
     partial_errors: Mapped[dict] = mapped_column(JSON, default=dict)
     quota: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class EventMappingReviewRow(Base):
+    """Provider events whose internal identity could not be decided.
+
+    An ambiguity creates a row here and *nothing else*: no mapping, no event, no
+    snapshot. Attributing a price to whichever fixture sorted first is worse
+    than declining to price it, so the decision is deferred to a human.
+    """
+
+    __tablename__ = "event_mapping_reviews"
+    __table_args__ = (UniqueConstraint("provider", "provider_event_id", name="uq_mapping_review"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(64), index=True)
+    provider_event_id: Mapped[str] = mapped_column(String(128))
+    sport: Mapped[str] = mapped_column(String(32))
+    competition: Mapped[str] = mapped_column(String(160))
+    home_name: Mapped[str] = mapped_column(String(160))
+    away_name: Mapped[str] = mapped_column(String(160))
+    start_time_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    candidate_internal_ids: Mapped[list] = mapped_column(JSON, default=list)
+    detail: Mapped[str] = mapped_column(Text)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    resolved: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
+
+class ProviderBudgetLedgerRow(Base):
+    """Durable credit reservations, one row per attempted provider request.
+
+    A per-process counter cannot bound spending: it resets with the process, and
+    two workers each get a private allowance. Reserving here *before* every
+    attempt — including a retry — is what makes the daily ceiling real, and
+    reconciling ``observed_cost`` against ``x-requests-last`` is what keeps the
+    reservation honest once the response arrives.
+    """
+
+    __tablename__ = "provider_budget_ledger"
+    __table_args__ = (Index("ix_budget_provider_day", "provider", "day_utc"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(64))
+    #: UTC calendar day, ``YYYY-MM-DD``. The provider's quota window is UTC, so
+    #: a local-time window would leak spend across the boundary.
+    day_utc: Mapped[str] = mapped_column(String(10))
+    request: Mapped[str] = mapped_column(String(200))
+    batch_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    reserved_cost: Mapped[int] = mapped_column(Integer, default=0)
+    #: ``None`` until the response is reconciled; 0 once released.
+    observed_cost: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    released: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class ModelRegistryRow(Base):

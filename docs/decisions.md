@@ -277,3 +277,177 @@ one known Starlette TestClient warning silenced by message.
 **Raison.** A warning nobody fails on is a warning nobody reads. CI runs plain
 `pytest` — passing `-W` on the command line would override the ini filters and
 defeat the point.
+
+> **Superseded in part by D-028.** The Starlette exception was not a resolution;
+> the filter is gone and the warning no longer occurs. The rest of D-027 stands.
+
+---
+
+## Instruction 02 bis — closing the audited P0/P1 anomalies
+
+The record below is additive. Nothing above has been rewritten: a decision that
+turned out to be wrong is marked superseded, not deleted.
+
+### D-028 — The Starlette/httpx warning is removed, not filtered
+
+**Decision.** Install `httpx2` as a dev dependency and delete the
+`ignore:Using \`httpx\` with \`starlette.testclient\`` filter. `filterwarnings`
+is now exactly `["error"]`, and CI runs `pytest -W error`.
+**Raison.** Starlette ≥ 1.3 imports `httpx2` when it is present and only warns
+when it has to fall back to `httpx` 0.x. The warning was therefore a missing
+dependency, not an unavoidable upstream defect — and D-027 had described it as
+the latter. A filter that hides a fixable warning trains everyone to ignore the
+category.
+**Coût.** Two extra packages in the test environment (`httpx2`, `httpcore2`) and
+one more in `constraints.txt`. The application's own client still uses `httpx`;
+the distributions have different import names and coexist.
+**Vérification.** `grep starlette.testclient pyproject.toml` finds nothing, and
+CI fails if it ever does again.
+
+### D-029 — Test helpers live in an explicitly importable module
+
+**Decision.** Shared factories move to `tests/helpers.py`, made importable by
+`pythonpath = ["tests"]` in `pyproject.toml`. No test module may import another
+test module; a test enforces it by parsing the AST of every test file.
+**Raison.** `from tests.test_challenge import make_candidate` resolved under
+`python -m pytest` (which puts the working directory on `sys.path`) and failed
+under the `pytest` console script that CI runs. CI was therefore collecting
+nothing while reporting success — the worst possible failure mode for a test
+suite, because it is indistinguishable from passing.
+**Coût.** One extra ini setting, and a rule to remember.
+**Vérification.** A test runs both invocations in a subprocess and compares what
+they collect, module by module.
+
+### D-030 — Claim selection filters state in SQL; completion is fenced by a token
+
+**Decision.** The claim query filters `PENDING` / eligible `FAILED_RETRYABLE` /
+expired `RUNNING` **before** `ORDER BY` and `LIMIT`, backed by an index on
+`(state, scheduled_for, next_attempt_at)`. Every claim mints a `claim_token`,
+returned on `ClaimedJob`; `mark_succeeded`, `mark_failed` and `renew_lease` are
+conditional updates on `(job_id, state=RUNNING, claim_token)` and raise
+`StaleLeaseError` when they change zero rows.
+**Raison.** Two distinct defects. Filtering claimable states in Python meant a
+few dozen finished rows filled the selection window and a genuinely due job was
+never reached — a scheduler that stops working the more it has worked. And
+re-asserting `state = 'RUNNING'` cannot fence anything, because `RUNNING` is what
+the row already says: both a stale lease holder and a second reclaimer matched
+it.
+**Coût.** Callers pass the `ClaimedJob` rather than a bare id, and must handle
+`StaleLeaseError`. Both are improvements: losing a lease is a real event.
+**Vérification.** 500 terminal rows do not starve a due job; a stale holder
+changes nothing; two workers racing one expired lease yield exactly one winner.
+
+### D-031 — `execute()` returns a typed outcome, and error scans are persisted
+
+**Decision.** `ExecutionResult` carries `SUCCESS` / `RETRYABLE_FAILURE` /
+`FINAL_FAILURE` / `BUDGET_EXHAUSTED`. A job is `SUCCEEDED` only on `SUCCESS`.
+Failed collections persist their scan document, and `FAILED_RETRYABLE` carries a
+`next_attempt_at` backoff.
+**Raison.** `execute()` returned a scan id, and a provider outage still produces
+a scan document — so an outage was acknowledged as a success and never retried.
+Separately, the error scan was built and thrown away, leaving a log line as the
+only trace of a failure. And with no backoff, a failing job was re-claimed on the
+very next loop iteration.
+**Coût.** One row per failed scan, which is the point.
+
+### D-032 — Discovery resolves identity before milestones are planned
+
+**Decision.** `discover_events()` returns events already mapped onto internal
+ids; a milestone's `scope_id` is always an internal id.
+**Raison.** The job carried the provider's id (`the_odds_api:evt-42`) while the
+analysis filter compares internal ids (`evt_9f3…`). The two never matched, so
+every milestone scan analysed zero events while reporting success. Resolving in
+one place makes the mismatch unrepresentable rather than merely fixed.
+**Coût.** Discovery now writes to the database, so it is no longer a pure read.
+
+### D-033 — A milestone in the recent past is due, not lost
+
+**Decision.** `milestones_for()` keeps instants at or before `now` as long as
+they are inside `DEFAULT_CATCHUP_GRACE`.
+**Raison.** With a 24 h scan window, the T−24 h milestone of an event inside that
+window is *always* slightly in the past at discovery time. Dropping every past
+instant therefore deleted one of the configured rescoring points entirely,
+silently, on every run.
+**Coût.** A restart inside the grace window may re-run one milestone. The ledger
+makes that idempotent.
+
+### D-034 — Ambiguous identity resolves to nothing at all
+
+**Decision.** `ResolvedEvent` becomes `RESOLVED` / `CREATED` / `AMBIGUOUS` /
+`REJECTED`, and only the first two carry an `internal_id`. An ambiguity creates
+no mapping, mutates no event, attaches no snapshot, and is queued in
+`event_mapping_reviews`. The scan rejects the fixture with
+`EVENT_MAPPING_AMBIGUOUS`. Matching consults competition, season, stage and the
+provider's declared aliases; a signal present on only one side is silence, not
+disagreement.
+**Raison.** The previous version returned `candidates[0]` *while* flagging the
+result ambiguous, so a price was still attributed to whichever row happened to
+sort first and a snapshot was persisted against it. Flagging a guess does not
+make it not a guess.
+**Coût.** Some prices are declined that a human could have attributed. That is
+the intended trade.
+
+### D-035 — Provider credits are reserved durably, before every attempt
+
+**Decision.** `provider_budget_ledger` records one row per attempt: reserved
+cost, observed cost, released flag, UTC day. Every attempt — including a retry —
+reserves against both the per-scan and per-day ceilings before the request is
+made. The reservation is reconciled against `x-requests-last`; an absent header
+leaves the estimate in place; a transport error that produced no response
+releases it.
+**Raison.** The guard was an integer on the HTTP client. It could not bound a
+retry (the counter moved only after a response), could not bound two workers
+(each had its own), and did not survive a restart. The configured daily budget
+was documentation, not a control.
+**Coût.** A database round trip per request, and a hard dependency on the schema
+existing before any paid call — which is the correct coupling.
+**Limite.** Serialisation relies on the engine's write lock. Proven on SQLite;
+the PostgreSQL path is written but not exercised in CI.
+
+### D-036 — A total collection failure is `PROVIDER_ERROR`, never missing coverage
+
+**Decision.** Six distinct outcomes: every league failing → `PROVIDER_ERROR`;
+snapshots → `OK`; bookmaker quoted but nothing mapped → `NO_CANDIDATE`; events
+present without our bookmaker → `COVERAGE_MISSING`; a valid empty response →
+`NO_CANDIDATE`; budget/auth handled separately. An unrecognisable `/sports`
+response is a *failed* discovery and falls back to the allowlist, not "nothing
+is in season".
+**Raison.** Collapsing the first four into `COVERAGE_MISSING` reported "every
+league returned 500" as "Winamax was not in the response" — a fault dressed as a
+normal absence, which is exactly the class of error this project exists to avoid.
+
+### D-037 — Additional markets are requested, not merely mapped
+
+**Decision.** `draw_no_bet`, `double_chance`, `h2h_3_way_h1`, `totals_h1` and
+`double_chance_h1` are fetched from the per-event endpoint after the grouped
+call, under the budget gate, and skipped with a reported reason when headroom is
+short. Tests assert the requests actually issued and the snapshots persisted.
+**Raison.** They were present in `MARKET_MAP` and never requested. A passing
+`map_market()` test proved the mapping, and nothing about collection — so the
+documentation claimed a coverage that no code path could produce.
+**Coût.** One extra request per football event when the budget allows.
+
+### D-038 — Historical odds get an interface and an offline estimator only
+
+**Decision.** `estimate_historical_cost()` is pure arithmetic returning an
+explicit upper bound; `fetch_historical()` raises. `HistoricalOddsRequest`
+carries `acknowledged_cost`, defaulting to `False`.
+**Raison.** Historical endpoints bill at a multiple of the live rate, and a
+season-wide backfill is a large irreversible spend. Consent to a live scan is not
+consent to a paid backfill, so the two must be separate decisions.
+
+### D-039 — Widen, backfill, verify, tighten
+
+**Decision.** A NOT NULL column added to a populated table is introduced
+nullable, backfilled from the existing document, verified to have no residual
+NULL, and only then tightened. A row that cannot be converted **refuses** the
+migration by name; quarantine is available but opt-in via
+`BETMAXXING_MIGRATION_UNUSABLE_CHALLENGE=quarantine`.
+**Raison.** `ALTER TABLE challenges ADD COLUMN version INTEGER NOT NULL` is
+rejected outright once the table has rows, so the previous migration could not be
+applied to any deployment that had ever created a Challenge. The empty-database
+test passed and proved nothing about that.
+**Coût.** Migrations contain data logic and must be tested with data.
+**Limite.** The `b7c1e9d24a10` downgrade does not rebuild `events.source_ids`
+from `event_source_map`: that direction cannot be done without guessing which
+rows the migration created. Documented rather than fabricated.

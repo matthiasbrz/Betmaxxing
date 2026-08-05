@@ -38,6 +38,7 @@ from betmaxxing.providers.base import (
     ProviderError,
     QuotaInfo,
 )
+from betmaxxing.providers.budget import ProviderBudgetLedger
 from betmaxxing.providers.the_odds_api.client import (
     TheOddsApiAuthError,
     TheOddsApiClient,
@@ -55,9 +56,25 @@ logger = logging.getLogger("betmaxxing.the_odds_api")
 
 PROVIDER_NAME = "the_odds_api"
 
-#: Markets requested in the grouped call. Additional markets are per-event and
-#: cost extra, so they stay behind the budget guard.
+#: Markets requested in the grouped, one-call-per-league request.
 CORE_MARKETS = ("h2h", "totals")
+
+#: Additional football markets. v4 exposes these on the **per-event** endpoint
+#: only, so they cost one request per event and are attempted after the core
+#: call, under the same budget gate. Declaring them in ``MARKET_MAP`` is not the
+#: same as collecting them — the previous version did only the former.
+ADDITIONAL_FOOTBALL_MARKETS = (
+    "draw_no_bet",
+    "double_chance",
+    "h2h_3_way_h1",
+    "totals_h1",
+    "double_chance_h1",
+)
+
+#: Cost, in credits, this adapter is willing to spend per event on the optional
+#: markets. Beyond it the core prices are kept and the extras are skipped: an
+#: incomplete market set is a normal, reportable outcome.
+ADDITIONAL_MARKET_MIN_HEADROOM = 4
 
 
 class TheOddsApiProvider:
@@ -76,13 +93,24 @@ class TheOddsApiProvider:
         self._now = now or utc_now()
         self._bookmakers = settings.bookmaker_list
         self.bookmaker = self._bookmakers[0] if self._bookmakers else "unknown"
+        self._budget = ProviderBudgetLedger(settings)
         self._client = client or TheOddsApiClient(
             api_key=settings.resolved_the_odds_api_key,
             base_url=settings.the_odds_api_base_url,
             timeout=settings.provider_timeout_seconds,
             max_retries=settings.provider_max_retries,
             budget_per_scan=settings.provider_budget_per_scan,
+            budget_ledger=self._budget,
+            provider_name=PROVIDER_NAME,
+            now=self._now,
         )
+        # An injected client (tests, or a caller wiring its own transport) still
+        # gets the durable ceiling: the budget is a property of the deployment,
+        # not of who constructed the HTTP layer.
+        if getattr(self._client, "_ledger", None) is None:
+            self._client._ledger = self._budget
+            self._client._provider_name = PROVIDER_NAME
+            self._client._now = self._now
         self._last_quota = QuotaInfo()
         self._coverage = CollectionStatus.OK
 
@@ -120,11 +148,18 @@ class TheOddsApiProvider:
         wanted = set(sports)
         regions = len([r for r in self._settings.the_odds_api_regions.split(",") if r.strip()])
 
+        keys = self._sport_keys_to_poll(wanted, batch)
+
+        attempted = 0
+        failed = 0
+        any_event_seen = False
         any_bookmaker_seen = False
-        for sport_key in self._settings.the_odds_api_sport_key_list:
+
+        for sport_key in keys:
             sport = classify_sport(sport_key)
-            if sport is None or sport not in wanted:
+            if sport is None:
                 continue
+            attempted += 1
             try:
                 cost = estimate_cost(markets=len(CORE_MARKETS), regions=regions)
                 response = self._client.get(
@@ -141,12 +176,14 @@ class TheOddsApiProvider:
                     cost=cost,
                 )
             except BudgetExceeded as exc:
+                failed += 1
                 batch.partial_errors.append(f"{sport_key}: {exc}")
                 continue
             except TheOddsApiAuthError:
                 raise
             except ProviderError as exc:
                 # Partial failure on one sport must not discard the others.
+                failed += 1
                 batch.partial_errors.append(f"{sport_key}: {redact(str(exc))}")
                 continue
 
@@ -154,18 +191,169 @@ class TheOddsApiProvider:
             batch.quota = response.quota
 
             for raw_event in response.payload or []:
+                any_event_seen = True
                 seen = self._ingest_event(raw_event, sport, window, received_at, batch)
                 any_bookmaker_seen = any_bookmaker_seen or seen
+                if seen and sport is Sport.FOOTBALL:
+                    self._collect_additional_markets(
+                        sport_key, raw_event, sport, window, received_at, batch, regions
+                    )
 
-        if batch.snapshots:
-            batch.coverage = CollectionStatus.OK
-        elif any_bookmaker_seen:
-            batch.coverage = CollectionStatus.NO_CANDIDATE
-        else:
-            # A correct response that simply lacks our bookmaker. Not a fault.
-            batch.coverage = CollectionStatus.COVERAGE_MISSING
+        batch.coverage = self._classify_coverage(
+            attempted=attempted,
+            failed=failed,
+            any_event_seen=any_event_seen,
+            any_bookmaker_seen=any_bookmaker_seen,
+            batch=batch,
+        )
         self._coverage = batch.coverage
         return batch
+
+    # -- taxonomy -----------------------------------------------------------
+    def _classify_coverage(
+        self,
+        *,
+        attempted: int,
+        failed: int,
+        any_event_seen: bool,
+        any_bookmaker_seen: bool,
+        batch: CollectionBatch,
+    ) -> CollectionStatus:
+        """Say precisely what happened. These are six different situations.
+
+        The previous version collapsed the first four into ``COVERAGE_MISSING``,
+        so "every league returned 500" was reported as "Winamax was not in the
+        response" — a fault presented as a normal absence.
+        """
+        if attempted and failed == attempted:
+            return CollectionStatus.PROVIDER_ERROR
+        if batch.snapshots:
+            return CollectionStatus.OK
+        if any_bookmaker_seen:
+            # The bookmaker was quoted, but nothing survived mapping.
+            return CollectionStatus.NO_CANDIDATE
+        if any_event_seen:
+            # Events exist in the window; our bookmaker is simply not among them.
+            return CollectionStatus.COVERAGE_MISSING
+        # A valid, empty response: nothing is playing in the window.
+        return CollectionStatus.NO_CANDIDATE
+
+    # -- discovery ----------------------------------------------------------
+    def _sport_keys_to_poll(self, wanted: set[Sport], batch: CollectionBatch) -> list[str]:
+        """Intersect the configured allowlist with the sports actually active.
+
+        Polling an out-of-season key costs a credit and returns nothing, so the
+        allowlist alone is not a plan. Discovery failing is not fatal: we fall
+        back to the allowlist and say so.
+        """
+        allowlist = [
+            key
+            for key in self._settings.the_odds_api_sport_key_list
+            if (sport := classify_sport(key)) is not None and sport in wanted
+        ]
+        if not allowlist:
+            return []
+
+        try:
+            response = self._client.get("sports", params={"all": "false"}, cost=0, billable=False)
+        except TheOddsApiAuthError:
+            raise
+        except ProviderError as exc:
+            batch.partial_errors.append(
+                f"découverte /sports indisponible ({redact(str(exc))}) — "
+                "l'allowlist configurée est utilisée telle quelle."
+            )
+            return allowlist
+
+        payload = response.payload
+        if not isinstance(payload, list):
+            batch.partial_errors.append(
+                "découverte /sports : réponse inattendue — l'allowlist configurée "
+                "est utilisée telle quelle."
+            )
+            return allowlist
+
+        descriptors = [e for e in payload if isinstance(e, dict) and "key" in e]
+        if payload and not descriptors:
+            # A non-empty response that is not a sports listing is a *failed*
+            # discovery, not "nothing is in season". Treating it as the latter
+            # would silently cancel the whole collection.
+            batch.partial_errors.append(
+                "découverte /sports : réponse non reconnue comme un catalogue de "
+                "compétitions — l'allowlist configurée est utilisée telle quelle."
+            )
+            return allowlist
+
+        active = {str(e["key"]) for e in descriptors if e.get("active", True)}
+        if not active:
+            batch.partial_errors.append("découverte /sports : aucune compétition active retournée.")
+            return []
+
+        selected = [key for key in allowlist if key in active]
+        for key in allowlist:
+            if key not in active:
+                batch.partial_errors.append(f"{key} : compétition inactive, non interrogée.")
+        return selected
+
+    # -- additional markets -------------------------------------------------
+    def _collect_additional_markets(
+        self,
+        sport_key: str,
+        raw_event: dict[str, Any],
+        sport: Sport,
+        window: tuple[datetime, datetime],
+        received_at: datetime,
+        batch: CollectionBatch,
+        regions: int,
+    ) -> None:
+        """Fetch the optional markets for one event, if the budget allows.
+
+        These live on the per-event endpoint, so each one is a separate request.
+        They are genuinely optional: a refusal here leaves the core prices in
+        place and is reported, never silently swallowed.
+        """
+        event_id = str(raw_event.get("id") or "")
+        if not event_id:
+            return
+        remaining = self._budget.remaining_today(self.name, self._now)
+        if remaining is not None and remaining < ADDITIONAL_MARKET_MIN_HEADROOM:
+            batch.partial_errors.append(
+                f"{event_id} : marchés additionnels ignorés, budget journalier "
+                f"restant insuffisant ({remaining})."
+            )
+            return
+
+        try:
+            response = self._client.get(
+                f"sports/{sport_key}/events/{event_id}/odds",
+                params={
+                    "regions": self._settings.the_odds_api_regions,
+                    "markets": ",".join(ADDITIONAL_FOOTBALL_MARKETS),
+                    "oddsFormat": "decimal",
+                    "dateFormat": "iso",
+                    "bookmakers": ",".join(self._bookmakers),
+                },
+                cost=estimate_cost(markets=len(ADDITIONAL_FOOTBALL_MARKETS), regions=regions),
+            )
+        except BudgetExceeded as exc:
+            batch.partial_errors.append(f"{event_id} : marchés additionnels ignorés — {exc}")
+            return
+        except TheOddsApiAuthError:
+            raise
+        except ProviderError as exc:
+            batch.partial_errors.append(
+                f"{event_id} : marchés additionnels indisponibles ({redact(str(exc))})."
+            )
+            return
+
+        self._last_quota = response.quota
+        batch.quota = response.quota
+        payload = response.payload
+        if isinstance(payload, list):
+            payload = payload[0] if payload else None
+        if not isinstance(payload, dict):
+            return
+        self._ingest_event(payload, sport, window, received_at, batch)
 
     def _ingest_event(
         self,
@@ -255,8 +443,12 @@ class TheOddsApiProvider:
                     )
 
         if snapshots:
-            batch.events.append(event)
-            batch.snapshots.extend(snapshots)
+            # The additional-markets pass revisits the same event, so the batch
+            # must not accumulate duplicates of it.
+            if all(existing.internal_id != event.internal_id for existing in batch.events):
+                batch.events.append(event)
+            known = {s.fingerprint for s in batch.snapshots}
+            batch.snapshots.extend(s for s in snapshots if s.fingerprint not in known)
         return matched
 
     # -- legacy listing API -------------------------------------------------

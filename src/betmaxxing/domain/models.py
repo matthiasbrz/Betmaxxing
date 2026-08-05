@@ -85,6 +85,9 @@ class CanonicalEvent(_Frozen):
     internal_id: str
     sport: Sport
     competition: str
+    #: Season label as published by the source, e.g. "2025-2026". A matching
+    #: signal: the same pair meeting in two seasons is two fixtures.
+    season: str | None = None
     #: Round / matchday label as published by the source, e.g. "R1", "J3".
     stage: str | None = None
     #: Tennis only: "hard", "clay", "grass", "carpet".

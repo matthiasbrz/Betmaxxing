@@ -43,14 +43,39 @@ Le planificateur **ne doit pas** tourner dans le serveur web :
 
 Une passe (`tick`) fait exactement ceci :
 
-1. **matérialiser** — insérer dans `scheduler_jobs` les occurrences qui devraient
+1. **découvrir** — lister les événements à venir **et résoudre leur identité
+   interne** ; un jalon ne porte jamais un identifiant fournisseur ;
+2. **matérialiser** — insérer dans `scheduler_jobs` les occurrences qui devraient
    exister dans les deux prochains jours ;
-2. **réclamer** — prendre atomiquement les occurrences dues, avec un bail ;
-3. **exécuter** — un jalon tourne **cadré sur son événement** (`scope_id`) ;
-4. **acquitter** — marquer `SUCCEEDED` **après** la persistance du lot.
+3. **réclamer** — prendre atomiquement les occurrences dues, avec un bail **et un
+   jeton de possession** ;
+4. **exécuter** — un jalon tourne **cadré sur son événement** (`scope_id`) ;
+5. **acquitter** — marquer `SUCCEEDED` **après** la persistance du lot, et
+   **uniquement** si le résultat appartient explicitement à la catégorie succès.
 
-L'ordre du point 4 est ce qui compte : acquitter avant la persistance ferait croire
+L'ordre du point 5 est ce qui compte : acquitter avant la persistance ferait croire
 au ledger qu'un lot est collecté alors qu'un crash l'a perdu.
+
+Le point 1 existe parce que la version précédente plaçait l'identifiant du
+fournisseur dans `scope_id` alors que le filtre d'analyse compare des identifiants
+internes : chaque scan de jalon analysait zéro événement en se déclarant réussi
+(D-032).
+
+## Taxonomie des résultats
+
+`execute()` retourne un résultat typé. Le runner décide à partir de lui, jamais à
+partir de l'absence d'exception.
+
+| Résultat | Statuts de collecte | Effet sur le job |
+|---|---|---|
+| `SUCCESS` | `OK`, `NO_CANDIDATE`, `COLLECTED_NO_MODEL`, `COVERAGE_MISSING`, `DATA_STALE` | `SUCCEEDED` |
+| `RETRYABLE_FAILURE` | timeout, transport, 5xx, panne partielle devenue totale | `FAILED_RETRYABLE` + `next_attempt_at` |
+| `FINAL_FAILURE` | clé absente, 401/403, 422, configuration inutilisable | `FAILED_FINAL`, pas de retry |
+| `BUDGET_EXHAUSTED` | plafond scan ou jour atteint | différé de 6 h, hors de la fenêtre budgétaire courante |
+
+**Un scan d'erreur est persisté dans tous les cas**, y compris quand aucun lot de
+données n'existe : le diagnostic est ce dont on a besoin après coup, et il coûte une
+ligne. Une panne fournisseur ne peut donc jamais produire un job `SUCCEEDED` (D-031).
 
 > **Historique.** L'implémentation précédente ne pouvait jamais déclencher : la
 > planification écartait les occurrences `run_at <= now` et la sélection ne gardait
@@ -64,8 +89,9 @@ au ledger qu'un lot est collecté alors qu'un crash l'a perdu.
 ## Idempotence et reprise
 
 Une contrainte unique sur `(job_type, scheduled_for, scope_id)` rend l'insertion
-idempotente : deux passes identiques ne créent pas de doublon. L'état vit **en base**,
-pas en mémoire, donc :
+idempotente, y compris quand deux workers insèrent la même occurrence au même instant :
+le perdant reçoit une `IntegrityError` et la traite comme « déjà planifiée », ce qui est
+exactement ce qui s'est produit. L'état vit **en base**, pas en mémoire, donc :
 
 - un redémarrage ne rejoue pas une occurrence déjà réussie ;
 - une occurrence `PENDING` en retard est reprise ;
@@ -77,16 +103,59 @@ Les occurrences antérieures à `DEFAULT_CATCHUP_GRACE` (2 h) ne sont pas matér
 Rejouer une journée de scans manqués après une panne consommerait du quota fournisseur
 pour produire des analyses périmées.
 
+À l'inverse, un jalon **légèrement** dans le passé est conservé. Avec une fenêtre de
+24 h, le jalon T−24 h d'un événement situé dans cette fenêtre est toujours un peu
+derrière nous au moment de la découverte : écarter tout instant passé supprimait donc
+purement et simplement ce point de rescoring, silencieusement, à chaque passe (D-033).
+Un instant **égal** à `now` est dû, pas passé.
+
+## Sélection sans famine
+
+La requête de réclamation filtre les états réclamables **en SQL, avant `ORDER BY` et
+`LIMIT`** :
+
+```sql
+WHERE scheduled_for <= :now
+  AND ( state = 'PENDING'
+     OR (state = 'FAILED_RETRYABLE' AND attempts < 3
+         AND (next_attempt_at IS NULL OR next_attempt_at <= :now))
+     OR (state = 'RUNNING' AND attempts < 3
+         AND lease_expires_at IS NOT NULL AND lease_expires_at <= :now) )
+ORDER BY scheduled_for LIMIT :limit
+```
+
+Index dédié : `ix_scheduler_claimable (state, scheduled_for, next_attempt_at)`.
+
+La version précédente sélectionnait les lignes les plus anciennes **tous états
+confondus** puis filtrait en Python : quelques dizaines de lignes terminées
+remplissaient la fenêtre et un job réellement dû n'était jamais atteint. Autrement dit,
+l'ordonnanceur cessait de fonctionner à mesure qu'il travaillait. Un test le vérifie
+avec 500 occurrences terminées.
+
 ## Concurrence — ce qui est garanti, et ce qui ne l'est pas
 
-**Garanti.** La réclamation est un `UPDATE` conditionnel (`WHERE job_id = … AND
-state = …`) ; « 0 ligne modifiée » signifie « quelqu'un d'autre l'a prise ». PostgreSQL
-sérialise par verrou de ligne, SQLite par verrou d'écriture global. Plusieurs workers
-contre **une même base** sont donc sûrs, et c'est testé.
+**Jeton de possession.** Chaque réclamation génère un `claim_token`. `mark_succeeded`,
+`mark_failed` et le renouvellement de bail sont des `UPDATE` conditionnés par
+`(job_id, state = 'RUNNING', claim_token)` et lèvent `StaleLeaseError` quand ils
+modifient zéro ligne. Un worker qui a perdu son bail pendant une pause ne peut donc ni
+réussir ni échouer la tentative qui l'a remplacé.
+
+Réaffirmer `state = 'RUNNING'` ne suffisait pas : c'est ce que la ligne disait déjà,
+donc l'ancien détenteur **et** un second repreneur correspondaient tous les deux
+(D-030).
+
+**Garanti et testé sur SQLite.** Plusieurs workers contre **une même base** :
+réclamation par compare-and-swap sur `(state, claim_token)`, insertion concurrente
+idempotente, reprise d'un bail expiré par un seul gagnant.
+
+**Écrit mais non exercé en CI.** Sur PostgreSQL, la sélection ajoute
+`FOR UPDATE SKIP LOCKED`. Le code est là ; aucun test de la CI ne tourne contre
+PostgreSQL, donc cette voie n'est pas *prouvée*.
 
 **Non garanti.** Rien ne coordonne plusieurs bases. Le bail (15 min par défaut) borne
 le temps pendant lequel un worker crashé bloque une occurrence ; il ne fait pas office
-de verrou distribué.
+de verrou distribué. `renew_lease()` existe et est protégé par le jeton, mais le runner
+ne l'appelle pas encore : un scan dépassant la durée du bail serait repris.
 
 ## Quotas
 

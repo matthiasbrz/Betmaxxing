@@ -44,6 +44,7 @@ class EventRepository:
             self._session.add(row)
         row.sport = str(event.sport)
         row.competition = event.competition
+        row.season = event.season
         row.stage = event.stage
         row.surface = event.surface
         row.sets_to_win = event.sets_to_win

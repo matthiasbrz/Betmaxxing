@@ -22,6 +22,8 @@ Create Date: 2026-08-05 06:20:24.151443
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Sequence
 
 import sqlalchemy as sa
@@ -31,6 +33,128 @@ revision: str = "3ce123580afa"
 down_revision: str | None = "65c32b5e3f63"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
+
+#: What to do with a Challenge whose stored document cannot be interpreted.
+#: The default refuses the migration and names the row, because inventing a bank
+#: balance for a money-tracking record is not an acceptable failure mode. Set
+#: ``BETMAXXING_MIGRATION_UNUSABLE_CHALLENGE=quarantine`` to park those rows in a
+#: terminal, zero-bank state instead — a deliberate, logged loss of one
+#: progression rather than a silent fabrication.
+UNUSABLE_CHALLENGE_POLICY = "BETMAXXING_MIGRATION_UNUSABLE_CHALLENGE"
+
+QUARANTINE_REASON = (
+    "Mise en quarantaine par la migration 3ce123580afa : le document historique "
+    "de ce Challenge ne permet pas de reconstituer une banque. Aucun montant n'a "
+    "été inventé ; reprenez la progression manuellement."
+)
+
+
+class UnusableChallengeDocument(RuntimeError):
+    """A challenge row whose bank cannot be reconstructed from what was stored."""
+
+
+def _bank_cents_from(document_json: str | None, steps: list[str]) -> int:
+    """Reconstruct the current bank the way the domain would.
+
+    Precedence, and why: a settled rung *is* the bank's history, so the last
+    ``bank_after_cents`` wins. Falling back to the configured initial bank is
+    only correct when nothing has been settled yet.
+    """
+    for raw in reversed(steps):
+        try:
+            step = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        after = step.get("bank_after_cents") if isinstance(step, dict) else None
+        if isinstance(after, int):
+            return after
+
+    try:
+        document = json.loads(document_json or "")
+    except (TypeError, ValueError) as exc:
+        raise UnusableChallengeDocument("document illisible") from exc
+    if not isinstance(document, dict):
+        raise UnusableChallengeDocument("document n'est pas un objet")
+    config = document.get("config")
+    if not isinstance(config, dict) or "initial_bank" not in config:
+        raise UnusableChallengeDocument("config.initial_bank absent")
+    try:
+        initial = float(config["initial_bank"])
+    except (TypeError, ValueError) as exc:
+        raise UnusableChallengeDocument("config.initial_bank non numérique") from exc
+    # Same half-up rounding as betmaxxing.challenge.to_cents.
+    return round(initial * 100)
+
+
+def _add_challenge_columns_safely() -> None:
+    """Add ``version`` and ``bank_cents`` to a table that may already have rows.
+
+    ``ADD COLUMN ... NOT NULL`` without a default is rejected outright once the
+    table is non-empty, which made this migration impossible to apply to any
+    deployment that had ever created a Challenge. The sequence below is the
+    standard one: widen, fill, verify, tighten, drop the transitional default.
+    """
+    connection = op.get_bind()
+
+    with op.batch_alter_table("challenges", schema=None) as batch_op:
+        batch_op.add_column(sa.Column("version", sa.Integer(), nullable=True))
+        batch_op.add_column(sa.Column("bank_cents", sa.Integer(), nullable=True))
+        batch_op.add_column(sa.Column("stop_reason", sa.Text(), nullable=True))
+
+    rows = connection.execute(sa.text("SELECT challenge_id, document FROM challenges")).fetchall()
+    policy = os.environ.get(UNUSABLE_CHALLENGE_POLICY, "refuse").strip().lower()
+
+    for challenge_id, document in rows:
+        steps = [
+            row[0]
+            for row in connection.execute(
+                sa.text(
+                    "SELECT document FROM challenge_steps WHERE challenge_id = :cid"
+                    " ORDER BY step_index"
+                ),
+                {"cid": challenge_id},
+            ).fetchall()
+        ]
+        try:
+            bank = _bank_cents_from(document, steps)
+        except UnusableChallengeDocument as exc:
+            if policy != "quarantine":
+                raise RuntimeError(
+                    f"Migration refusée : le Challenge {challenge_id!r} ne peut pas être "
+                    f"converti ({exc}). Aucune banque n'est inventée. Corrigez la ligne, "
+                    f"ou relancez avec {UNUSABLE_CHALLENGE_POLICY}=quarantine pour la "
+                    "parquer explicitement."
+                ) from exc
+            connection.execute(
+                sa.text(
+                    "UPDATE challenges SET version = 1, bank_cents = 0,"
+                    " state = 'quarantined', stop_reason = :reason"
+                    " WHERE challenge_id = :cid"
+                ),
+                {"cid": challenge_id, "reason": QUARANTINE_REASON},
+            )
+            continue
+
+        connection.execute(
+            sa.text(
+                "UPDATE challenges SET version = 1, bank_cents = :bank WHERE challenge_id = :cid"
+            ),
+            {"cid": challenge_id, "bank": bank},
+        )
+
+    unfilled = connection.execute(
+        sa.text("SELECT COUNT(*) FROM challenges WHERE version IS NULL OR bank_cents IS NULL")
+    ).scalar_one()
+    if unfilled:
+        raise RuntimeError(
+            f"Migration refusée : {unfilled} ligne(s) de challenges sans version ou banque "
+            "après backfill. Le schéma n'est pas resserré sur des données incomplètes."
+        )
+
+    # Only now, with every row carrying a verified value, is NOT NULL honest.
+    with op.batch_alter_table("challenges", schema=None) as batch_op:
+        batch_op.alter_column("version", existing_type=sa.Integer(), nullable=False)
+        batch_op.alter_column("bank_cents", existing_type=sa.Integer(), nullable=False)
 
 
 def upgrade() -> None:
@@ -170,10 +294,7 @@ def upgrade() -> None:
         batch_op.add_column(sa.Column("uncertainty_status", sa.String(length=32), nullable=True))
         batch_op.alter_column("ev_conservative", existing_type=sa.FLOAT(), nullable=True)
 
-    with op.batch_alter_table("challenges", schema=None) as batch_op:
-        batch_op.add_column(sa.Column("version", sa.Integer(), nullable=False))
-        batch_op.add_column(sa.Column("bank_cents", sa.Integer(), nullable=False))
-        batch_op.add_column(sa.Column("stop_reason", sa.Text(), nullable=True))
+    _add_challenge_columns_safely()
 
     with op.batch_alter_table("events", schema=None) as batch_op:
         batch_op.add_column(sa.Column("participant_pair_key", sa.String(length=320), nullable=True))

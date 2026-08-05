@@ -13,16 +13,11 @@ than from ``alembic.ini`` (so no connection string is ever committed).
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, inspect
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-REFERENCE_REVISION = "65c32b5e3f63"
+from helpers import REFERENCE_REVISION, column_names, run_alembic, table_names
 
 #: Tables that must exist at head.
 EXPECTED_TABLES = {
@@ -41,38 +36,6 @@ EXPECTED_TABLES = {
     "scan_runs",
     "scheduler_jobs",
 }
-
-
-def run_alembic(db_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = {
-        **os.environ,
-        "BETMAXXING_DATABASE_URL": f"sqlite+pysqlite:///{db_path}",
-        "BETMAXXING_MODE": "demo",
-    }
-    return subprocess.run(
-        [sys.executable, "-m", "alembic", *args],
-        cwd=REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
-def table_names(db_path: Path) -> set[str]:
-    engine = create_engine(f"sqlite+pysqlite:///{db_path}")
-    try:
-        return set(inspect(engine).get_table_names())
-    finally:
-        engine.dispose()
-
-
-def column_names(db_path: Path, table: str) -> dict[str, dict[str, object]]:
-    engine = create_engine(f"sqlite+pysqlite:///{db_path}")
-    try:
-        return {c["name"]: c for c in inspect(engine).get_columns(table)}
-    finally:
-        engine.dispose()
 
 
 @pytest.fixture
