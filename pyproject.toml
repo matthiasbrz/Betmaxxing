@@ -18,6 +18,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# `postgres` is not optional for CI any more: the concurrency suite needs a real
+# cluster, because SQLite cannot distinguish an atomic algorithm from a
+# serialised one. Installed as `.[dev,postgres]`.
 postgres = ["psycopg[binary]>=3.1"]
 dev = [
     "pytest>=8.2",
@@ -53,6 +56,7 @@ addopts = "-q --strict-markers"
 pythonpath = ["tests"]
 markers = [
     "slow: spawns a subprocess or otherwise takes seconds rather than milliseconds",
+    "postgres: needs a real PostgreSQL (BETMAXXING_TEST_POSTGRES_URL); skipped otherwise",
 ]
 # "error" makes any warning fail the suite, so a new deprecation cannot quietly
 # accumulate. There is deliberately no entry after it: a filter that hides a

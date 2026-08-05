@@ -79,11 +79,34 @@ identifiant. Une ambiguïté n'écrit rien d'autre qu'une ligne de revue : marqu
 résultat « ambigu » tout en retournant `candidates[0]` revenait à deviner en le
 signalant, ce qui reste deviner (D-034).
 
-### Un budget n'est un budget que s'il est persistant
+### Un budget n'est un budget que s'il est persistant *et* atomique
 
 Un compteur en mémoire ne borne ni un retry, ni deux workers, ni un redémarrage. Chaque
-tentative fournisseur réserve son coût dans `provider_budget_ledger` avant d'être émise,
-puis rapproche la réservation du coût réellement facturé (D-035).
+tentative fournisseur réserve son coût avant d'être émise, puis rapproche la réservation
+du coût réellement facturé (D-035).
+
+Mais persistant ne suffit pas : la première version lisait `SELECT SUM(...)` puis
+insérait, ce qui n'est atomique que parce que SQLite sérialise tous ses écrivains. La
+synchronisation passe désormais par **une seule ligne** par `(fournisseur, jour UTC)`,
+incrémentée sous condition (D-040). C'est la différence entre un algorithme correct et
+un algorithme qui a de la chance sur un moteur donné — et c'est pourquoi la CI exécute
+une suite contre un vrai PostgreSQL.
+
+### Un timeout ne coûte pas zéro
+
+Libérer une réservation demande une preuve : que la requête n'est jamais partie. Un
+timeout de lecture n'en est pas une — la requête est partie, la réponse a tardé, et le
+fournisseur a peut-être facturé. Tout ce qui est incertain reste comptabilisé au pire
+cas (D-041), parce que sous-compter la dépense est la seule erreur qu'un budget ne peut
+pas se permettre.
+
+### Le fencing protège le ledger, pas le monde
+
+Un jeton de possession empêche un worker périmé d'écrire dans le ledger. Il n'annule pas
+un message déjà envoyé. Deux mécanismes distincts sont donc nécessaires : un heartbeat
+qui empêche la reprise pendant que le travail tourne, et un outbox qui rend chaque effet
+externe au-plus-une-fois (D-042). Prétendre qu'un jeton suffit revient à protéger la
+comptabilité en laissant les effets se produire deux fois.
 
 ### Le registre de modèles est la seule autorité sur la publication
 
@@ -197,14 +220,13 @@ pire que s'abstenir.
 
 ## Limites assumées
 
-- Le ledger sécurise plusieurs workers contre **une même base**, et c'est testé sur
-  SQLite. Le chemin PostgreSQL (`FOR UPDATE SKIP LOCKED`) est écrit mais n'est exercé
-  par aucun test de la CI. Rien ne coordonne plusieurs bases.
-- `renew_lease()` est protégé par le jeton mais le runner ne l'appelle pas : un travail
-  plus long que le bail serait repris par un autre worker.
-- La file `event_mapping_reviews` n'a ni CLI ni route : elle se lit en SQL.
-- La table d'alias participants est consultée par le rapprochement, mais aucun import ne
-  l'alimente.
+- Le ledger sécurise plusieurs workers contre **une même base**, testé sur SQLite et sur
+  PostgreSQL 16 réel. Rien ne coordonne plusieurs bases, et ce n'est pas prévu.
+- Un effet externe déjà délivré n'est pas annulable : l'outbox empêche le second, pas le
+  premier.
+- Aucun notifieur n'est câblé dans le runner ; l'outbox et le contrôle de propriété
+  sont en place et testés.
+- La file `event_mapping_reviews` et les alias s'administrent en CLI, sans route API.
 - Le rattrapage est borné à 2 h : une panne plus longue ne rejoue pas les occurrences
   manquées.
 - SQLite convient au développement et aux tests ; PostgreSQL est requis en exploitation

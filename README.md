@@ -36,13 +36,24 @@ uvicorn betmaxxing.api.main:app --reload
 Tests, lint, types :
 
 ```bash
-pytest -W error        # 804 tests ; `python -m pytest` exécute exactement la même suite
+pytest -W error        # 972 tests ; `python -m pytest` exécute exactement la même suite
 ruff check .           # tout le dépôt, migrations comprises
 ruff format --check .
 mypy
 ```
 
 Aucun avertissement n'est filtré : `filterwarnings = ["error"]`, sans exception.
+
+Vingt-quatre de ces tests exigent un **vrai PostgreSQL** et sont ignorés sans lui :
+
+```bash
+export BETMAXXING_TEST_POSTGRES_URL=postgresql+psycopg://user@localhost:5432/betmaxxing_test
+pytest -m postgres
+```
+
+SQLite sérialise tous les écrivains derrière un verrou global, donc il ne peut pas
+distinguer un algorithme concurrent correct d'un algorithme chanceux. Les garanties de
+concurrence ne sont affirmées que là où un test PostgreSQL les soutient.
 
 Le mode démo est **entièrement déterministe et synthétique**. Chaque cote qu'il produit
 porte `provider="demo"` et `bookmaker="DEMO_BOOK"` pour qu'elle ne puisse jamais être
@@ -172,7 +183,8 @@ Ce qu'il fait, et ce que « fait » veut dire ici :
 | Marchés principaux (`h2h`, `totals`) | Appel groupé par compétition |
 | `draw_no_bet`, `double_chance`, `h2h_3_way_h1`, `totals_h1`, `double_chance_h1` | **Réellement demandés** par événement, sous contrôle du budget — et non simplement présents dans `MARKET_MAP` |
 | `h2h_s1`, « gagne au moins un set », tennis `totals` | Refusés : `UNSUPPORTED_BY_PROVIDER` ou sémantique non confirmée |
-| Budget par scan et par jour | Réservation **persistante** avant chaque tentative, retries compris ; rapprochée avec `x-requests-last` |
+| Budget par scan et par jour | Réservation **persistante et atomique** avant chaque tentative, retries compris ; rapprochée avec `x-requests-last`. Un coût incertain reste facturé |
+| Marchés tennis | `h2h` **seul**. `totals` tennis n'est ni demandé ni facturé tant que sa sémantique jeux/sets n'est pas confirmée |
 | Historique (payant) | Interface et estimateur de coût **hors ligne** seulement. Aucun téléchargement |
 
 « Demandé et persisté » est prouvé **sur fixture locale**, pas contre le service réel.
@@ -256,7 +268,7 @@ doit être vérifiée auprès de l'ANJ avant diffusion plutôt qu'affichée pér
 | `docs/model-cards.md` | model cards, hypothèses, limites |
 | `docs/scheduler.md` | exploitation du planificateur |
 | `docs/deployment.md` | déploiement et sauvegarde |
-| `docs/decisions.md` | journal des décisions (D-019 supersède D-008) |
+| `docs/decisions.md` | journal des décisions (D-019 supersède D-008, D-028 supersède en partie D-027) |
 | `docs/roadmap.md` | état, en cours, blocages, prochaine action |
 
 ---
@@ -272,13 +284,12 @@ doit être vérifiée auprès de l'ANJ avant diffusion plutôt qu'affichée pér
   rien aujourd'hui.
 - `TheOddsApiProvider` est `IMPLEMENTED_UNVERIFIED` — aucun appel réel.
 - Le Challenge est `PARTIAL` : persistant et testé, mais désactivé par défaut.
-- Le planificateur est sûr multi-workers contre **une seule base SQLite**, ce qui est
-  testé. La voie PostgreSQL (`SKIP LOCKED`) est écrite mais **n'est pas exercée en CI**.
-  Rien ne coordonne plusieurs bases.
-- `renew_lease()` existe et est protégé par le jeton de possession, mais le runner ne
-  l'appelle pas : un scan dépassant 15 minutes serait repris par un autre worker.
-- Une identité ambiguë part en file de revue (`event_mapping_reviews`) qui n'a encore
-  ni commande ni route : elle se lit en SQL.
-- La table d'alias participants est consultée par le rapprochement mais aucun import ne
-  l'alimente ; elle est vide en pratique.
-- Le downgrade de la migration `b7c1e9d24a10` ne reconstruit pas `events.source_ids`.
+- Le planificateur est sûr multi-workers contre **une même base**, testé sur SQLite
+  **et PostgreSQL 16 réel** (réclamation, fencing, heartbeat, insertion concurrente).
+  Rien ne coordonne plusieurs bases, et ce n'est pas prévu.
+- Un effet externe déjà envoyé n'est pas annulable. L'outbox empêche un **second**
+  envoi après reprise du job ; il ne rappelle pas le premier.
+- Aucun notifieur n'est branché dans le runner : l'outbox et le contrôle de propriété
+  existent et sont testés, le canal reste à câbler.
+- La file de revue d'ambiguïté et les alias s'administrent en CLI
+  (`betmaxxing identity …`) ; aucune route API, et aucun catalogue d'alias fourni.

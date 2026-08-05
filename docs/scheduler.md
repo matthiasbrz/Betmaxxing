@@ -83,8 +83,81 @@ ligne. Une panne fournisseur ne peut donc jamais produire un job `SUCCEEDED` (D-
 
 ## États
 
-`PENDING` → `RUNNING` → `SUCCEEDED`, ou `FAILED_RETRYABLE` (réessayable jusqu'à
-3 tentatives) → `FAILED_FINAL`.
+| État | Sens | Terminal ? |
+|---|---|---|
+| `PENDING` | matérialisée, pas encore prise | non |
+| `RUNNING` | détenue sous bail + jeton | non |
+| `SUCCEEDED` | travail persisté et acquitté | **oui** |
+| `FAILED_RETRYABLE` | panne fournisseur, backoff en cours (≤ 3 tentatives) | non |
+| `FAILED_FINAL` | plafond de tentatives atteint, ou échec de configuration | **oui** |
+| `DEFERRED` | attend l'ouverture d'une fenêtre externe — aujourd'hui le reset budgétaire UTC | non |
+| `SKIPPED_BUDGET` | budget épuisé **et** l'occurrence perd sa valeur avant le reset | **oui** |
+
+`DEFERRED` n'est **pas** un échec : il ne consomme aucune tentative et ne peut pas
+devenir `FAILED_FINAL`. Confondre « nous n'avons plus de crédits » avec « le
+fournisseur est en panne » parquait un job sain après trois refus budgétaires.
+
+## Budget épuisé — report ou abandon explicite
+
+Il n'y a plus de délai fixe. La politique est :
+
+1. la prochaine tentative est le **prochain minuit UTC**, plus une gigue
+   déterministe dérivée du `job_id` et bornée à dix minutes. Réessayer dans la
+   même journée UTC ne peut pas réussir : le quota du fournisseur est journalier ;
+2. le compteur de pannes fournisseur n'est pas touché ;
+3. si l'occurrence n'aura plus de valeur au reset, elle finit en `SKIPPED_BUDGET`
+   avec un motif et un scan d'audit, plutôt que d'être reportée dans le vide.
+
+« Plus de valeur » veut dire précisément :
+
+| Type | Échéance |
+|---|---|
+| `EVENT_MILESTONE` | le coup d'envoi de son événement |
+| `DAILY_SCAN` | `scheduled_for` + 2 h (la même grâce de rattrapage que la matérialisation) |
+
+Conséquence assumée : un scan quotidien dont le budget manque est **abandonné**,
+pas reporté — le ressusciter à minuit contredirait la règle qui refuse déjà de
+matérialiser une occurrence périmée. Les occurrences du lendemain sont créées
+normalement : un budget épuisé coûte un scan, pas le calendrier.
+
+La gigue vient du `job_id` et non d'un tirage aléatoire, pour que l'échéance ne
+bouge pas à chaque passe et qu'un redémarrage ne la repousse pas indéfiniment.
+
+## Heartbeat de bail
+
+Un scan peut durer plus que son bail. Exposer `renew_lease()` ne suffisait pas :
+personne ne l'appelait, donc l'occurrence était reprise et **exécutée une seconde
+fois**. Le jeton empêchait l'ancien worker d'acquitter — il n'annulait ni les
+requêtes fournisseur déjà payées, ni les lignes écrites, ni les messages envoyés.
+
+`LeaseGuard` encadre désormais l'exécution :
+
+- cadence de renouvellement = **bail / 3**, plancher 100 ms, dérivée du bail pour
+  que les deux ne puissent pas diverger ;
+- un renouvellement **synchrone** avant le travail : la réclamation a horodaté le
+  bail avec l'instant de *planification*, le travail tourne sur l'horloge murale,
+  et l'écart entre les deux est une fenêtre de reprise ;
+- chaque renouvellement lit l'horloge **au moment du renouvellement** ;
+- arrêt et `join` garantis dans un `finally`, en succès, en exception et en perte
+  de bail ;
+- un renouvellement refusé marque le garde comme perdu ; le runner **n'acquitte
+  pas** et laisse le job à celui qui le détient désormais.
+
+### Effets externes
+
+Le fencing protège le ledger, pas le monde extérieur : quand un worker découvre
+qu'il a perdu son bail, un message déjà envoyé est déjà arrivé. Deux garde-fous :
+
+- `JobLedger.assert_owns(job)` — à appeler avant tout effet non annulable ;
+- `notification_outbox(job_id, alert_key, channel)`, unique : réserver la ligne
+  autorise **un** envoi. Une reprise de la même occurrence n'envoie rien de plus.
+
+La clé inclut le `job_id` : une occurrence *nouvelle* doit pouvoir réalerter sur un
+changement matériel ; ce qui est interdit, c'est que la même occurrence alerte deux
+fois parce que son bail a changé de main.
+
+**Limite honnête.** L'outbox empêche le second envoi, pas le premier. Aucun
+mécanisme ici ne rappelle un message déjà délivré.
 
 ## Idempotence et reprise
 
@@ -144,18 +217,25 @@ Réaffirmer `state = 'RUNNING'` ne suffisait pas : c'est ce que la ligne disait 
 donc l'ancien détenteur **et** un second repreneur correspondaient tous les deux
 (D-030).
 
-**Garanti et testé sur SQLite.** Plusieurs workers contre **une même base** :
-réclamation par compare-and-swap sur `(state, claim_token)`, insertion concurrente
-idempotente, reprise d'un bail expiré par un seul gagnant.
+**Garanti et testé sur SQLite *et* PostgreSQL 16 réel.** Plusieurs workers contre
+**une même base** : réclamation par compare-and-swap sur `(state, claim_token)`,
+`FOR UPDATE SKIP LOCKED` sur PostgreSQL, insertion concurrente idempotente, reprise
+d'un bail expiré par un seul gagnant, refus des acquittements, échecs et
+renouvellements périmés.
 
-**Écrit mais non exercé en CI.** Sur PostgreSQL, la sélection ajoute
-`FOR UPDATE SKIP LOCKED`. Le code est là ; aucun test de la CI ne tourne contre
-PostgreSQL, donc cette voie n'est pas *prouvée*.
+Les tests PostgreSQL utilisent des sessions distinctes et une `threading.Barrier` :
+deux appels séquentiels ne prouvent rien sur la concurrence. Une étape de CI échoue
+si cette suite est *skippée*, parce qu'une suite skippée et une suite verte se
+ressemblent trop dans un résumé.
 
-**Non garanti.** Rien ne coordonne plusieurs bases. Le bail (15 min par défaut) borne
-le temps pendant lequel un worker crashé bloque une occurrence ; il ne fait pas office
-de verrou distribué. `renew_lease()` existe et est protégé par le jeton, mais le runner
-ne l'appelle pas encore : un scan dépassant la durée du bail serait repris.
+Pourquoi SQLite ne suffisait pas : il sérialise **tous** les écrivains derrière un
+verrou global. Un algorithme incorrect y paraît atomique. C'est exactement ce qui
+avait laissé passer un `SELECT SUM(...)` puis `INSERT` pour la comptabilité
+budgétaire.
+
+**Non garanti.** Rien ne coordonne plusieurs bases, et ce n'est pas prévu. Le bail
+(15 min par défaut) borne le temps pendant lequel un worker crashé bloque une
+occurrence ; il ne fait pas office de verrou distribué.
 
 ## Quotas
 

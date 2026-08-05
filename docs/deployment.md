@@ -86,13 +86,27 @@ export BETMAXXING_PROVIDER_BUDGET_PER_DAY=450   # idem, partagé entre workers
 ```
 
 Les deux plafonds sont **appliqués**, pas seulement déclarés : chaque tentative — retry
-compris — réserve son coût estimé dans `provider_budget_ledger` avant d'être émise, et
-la réservation est rapprochée du `x-requests-last` renvoyé. Un en-tête absent laisse
-l'estimation en place (coût inconnu = pire cas) ; une erreur de transport sans réponse
-libère la réservation.
+compris — réserve son coût estimé avant d'être émise, et la réservation est rapprochée
+du `x-requests-last` renvoyé. Un en-tête absent laisse l'estimation en place (coût
+inconnu = pire cas).
 
-La sérialisation repose sur le verrou d'écriture du moteur. Elle est testée sur SQLite ;
-le comportement PostgreSQL n'est pas exercé en CI.
+**Attention à ce que « aucune réponse » ne veut pas dire.** Seul un échec qui prouve
+que la requête n'est jamais partie libère la réservation (erreur ou timeout de
+connexion, épuisement du pool). Un timeout de **lecture** signifie que la requête est
+partie : le fournisseur a peut-être servi et facturé, donc l'estimation reste
+comptabilisée. Table complète dans `docs/source-matrix.md`.
+
+La primitive est une ligne par `(fournisseur, jour UTC)` dans `provider_budget_days`,
+incrémentée par UPDATE conditionnel. C'est atomique sur SQLite **et** sur PostgreSQL, et
+les deux sont testés — PostgreSQL avec des sessions distinctes et une barrière, parce
+que SQLite sérialise tous les écrivains et ne peut donc pas distinguer un algorithme
+atomique d'un algorithme chanceux.
+
+Vérifier la cohérence à tout moment :
+
+```bash
+betmaxxing budget audit --provider the_odds_api
+```
 
 La clé n'apparaît jamais dans une URL journalisée, une exception, une trace ou une
 réponse d'API : le client masque `apiKey=` avant toute sortie.
@@ -112,6 +126,47 @@ C'est le **seul** code du dépôt qui appelle réellement le service. Il n'est n
 collecté par pytest, ni exécuté par la CI, et refuse de démarrer sans les deux
 variables. Il ne touche aucun endpoint historique (payant) et ne modifie aucun statut
 de validation.
+
+## Exploitation de l'identité des événements
+
+Une ambiguïté de rapprochement n'écrit rien d'autre qu'une ligne de revue : ni
+correspondance, ni événement, ni snapshot. Elle s'administre en ligne de commande —
+l'interface web est une tranche ultérieure, et un opérateur ne devrait pas avoir à
+écrire du SQL en attendant.
+
+```bash
+betmaxxing identity reviews list                    # file d'attente
+betmaxxing identity reviews list --json             # même chose, exploitable
+betmaxxing identity reviews show 12                 # détail + candidats
+betmaxxing identity reviews resolve 12 \
+    --event-id evt_9f3b… --operator matthias        # décision humaine
+```
+
+Il n'existe **aucune** résolution automatique, et c'est délibéré : la file existe
+précisément parce que la machine n'a pas pu trancher. `--operator` est obligatoire ;
+la décision, son auteur et sa date sont conservés.
+
+Refusé sans rien écrire : un identifiant qui ne figurait pas parmi les candidats, une
+revue déjà tranchée, une correspondance déjà existante pour cette source.
+
+**Les snapshots déjà enregistrés ne sont pas réattribués.** La décision gouverne la
+suite ; réécrire l'historique changerait ce qu'un scan passé est censé avoir observé.
+
+### Alias de participants
+
+Le rapprochement inter-fournisseurs consulte les alias déclarés. Ils s'importent :
+
+```bash
+betmaxxing identity aliases import aliases.csv      # idempotent
+betmaxxing identity aliases list --sport football
+```
+
+Format : `sport,alias,canonical_participant_id,source`. L'import est idempotent, et une
+ligne inutilisable ou **contradictoire** (le même alias pointant déjà sur un autre
+participant pour la même source) part en quarantaine avec son numéro de ligne — jamais
+écrasée, puisque les alias décident quelles rencontres fusionnent.
+
+Aucun catalogue n'est fourni : le fichier est à constituer.
 
 ## Challenge — Montante
 
@@ -200,7 +255,10 @@ données :
 | Schéma initial vide → `head` | ✅ |
 | **Schéma initial peuplé → `head`** | ✅ challenge + palier, événement avec `source_ids`, snapshot avec ligne, scan, candidat |
 | `3ce123580afa` (commit `f901d6e`) déjà appliqué → `head` | ✅ |
-| `alembic check` sans dérive, sur base peuplée | ✅ |
+| `b7c1e9d24a10` (commit `5d2109f`) déjà appliqué → `head` | ✅ |
+| **Aller-retour `head` → `65c32b5e3f63` → `head`** | ✅ associations fournisseur/événement identiques à chaque étape |
+| PostgreSQL 16 neuf → `head` | ✅ en CI |
+| `alembic check` sans dérive, sur base peuplée et sur PostgreSQL | ✅ |
 
 Une base contenant un Challenge **ne pouvait pas** être migrée avant cette tranche :
 `ADD COLUMN ... NOT NULL` est refusé sur une table non vide. Les colonnes sont désormais
@@ -216,8 +274,18 @@ BETMAXXING_MIGRATION_UNUSABLE_CHALLENGE=quarantine alembic upgrade head
 
 Elles passent alors à l'état `quarantined` avec une banque à zéro et un motif lisible.
 
-**Limite du downgrade.** `b7c1e9d24a10` ne reconstruit pas `events.source_ids` depuis
-`event_source_map` : cette direction exigerait de deviner quelles lignes la migration a
-créées. C'est documenté plutôt que fabriqué.
+**Downgrade sans perte.** `b7c1e9d24a10` repasse chaque ligne d'`event_source_map` dans
+`events.source_ids` **avant** que la révision parente ne supprime la table. Ces lignes
+sont le seul lien entre un prix enregistré et la rencontre pour laquelle il a été coté :
+les perdre en redescendant est une perte de données, pas un nettoyage. Un identifiant
+déjà présent dans la colonne avec une valeur contradictoire **arrête** le downgrade en
+nommant la ligne, plutôt que d'être écrasé.
+
+Le service d'identité écrit désormais les deux emplacements en même temps, donc ils ne
+peuvent plus diverger.
+
+**Arrondi monétaire.** Le backfill de banque importe `betmaxxing.challenge.to_cents` au
+lieu de réimplémenter l'arrondi. Une valeur non finie ou illisible **fait échouer** la
+migration en nommant la ligne ; aucune banque n'est inventée.
 
 Redémarrez l'API **et** le planificateur.

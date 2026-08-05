@@ -28,11 +28,13 @@ What it adds
 * ``participant_aliases`` unique key widened to ``(sport, source, alias)`` so one
   provider's alias cannot evict another's.
 
-Downgrade drops what it added and clears ``line_canonical`` /
-``participant_pair_key``. It deliberately does **not** try to fold
-``event_source_map`` back into ``events.source_ids``: that direction cannot be
-done without guessing which rows this migration created, and a downgrade that
-silently rewrites source attribution is worse than one that declines to.
+Downgrade drops what it added, clears ``line_canonical`` /
+``participant_pair_key``, and **folds every ``event_source_map`` row back into
+``events.source_ids``** before the parent revision drops that table. Those rows
+are the only link between a stored price and the fixture it was quoted for, so
+losing them on the way down is data loss, not a tidy-up. A provider id already
+present in the column with a conflicting value stops the downgrade by name rather
+than being overwritten.
 
 Revision ID: b7c1e9d24a10
 Revises: 3ce123580afa
@@ -146,6 +148,56 @@ def _backfill_line_canonical(connection: sa.Connection) -> None:
         )
 
 
+def _fold_mappings_back_into_source_ids(connection: sa.Connection) -> None:
+    """Downgrade direction: write every mapping back into ``events.source_ids``.
+
+    This revision's parent drops ``event_source_map``, so anything recorded only
+    there would be lost on the way down — and those rows are the only link
+    between a stored price and the fixture it was quoted for. Folding them into
+    the JSON column first makes the round trip lossless in both directions
+    (D-041); the upgrade rebuilds the table from the same column.
+
+    A provider id already present in the column with a *different* value is a
+    genuine contradiction. The downgrade refuses rather than choosing, because
+    picking one silently is how source attribution gets rewritten.
+    """
+    mappings: dict[str, dict[str, str]] = {}
+    for provider, provider_event_id, internal_id in connection.execute(
+        sa.text("SELECT provider, provider_event_id, internal_id FROM event_source_map")
+    ).fetchall():
+        mappings.setdefault(str(internal_id), {})[str(provider)] = str(provider_event_id)
+
+    for internal_id, discovered in mappings.items():
+        raw = connection.execute(
+            sa.text("SELECT source_ids FROM events WHERE canonical_id = :cid"),
+            {"cid": internal_id},
+        ).scalar()
+        try:
+            existing = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except (TypeError, ValueError):
+            existing = {}
+        if not isinstance(existing, dict):
+            existing = {}
+
+        merged = dict(existing)
+        for provider, provider_event_id in discovered.items():
+            current = merged.get(provider)
+            if current is not None and str(current) != provider_event_id:
+                raise RuntimeError(
+                    f"Downgrade refusé : l'événement {internal_id!r} porte "
+                    f"source_ids[{provider!r}]={current!r} alors que event_source_map "
+                    f"indique {provider_event_id!r}. Aucune attribution n'est "
+                    "réécrite au hasard ; tranchez avant de redescendre."
+                )
+            merged[provider] = provider_event_id
+
+        if merged != existing:
+            connection.execute(
+                sa.text("UPDATE events SET source_ids = :ids WHERE canonical_id = :cid"),
+                {"ids": json.dumps(merged), "cid": internal_id},
+            )
+
+
 # ---------------------------------------------------------------------------
 def upgrade() -> None:
     connection = op.get_bind()
@@ -249,8 +301,8 @@ def downgrade() -> None:
         batch_op.drop_column("season")
 
     # `line_canonical` and `participant_pair_key` are derived values; clearing
-    # them restores the previous revision's state exactly. `event_source_map`
-    # rows are deliberately left alone: see the module docstring.
+    # them restores the previous revision's state exactly.
     connection = op.get_bind()
+    _fold_mappings_back_into_source_ids(connection)
     connection.execute(sa.text("UPDATE odds_snapshots SET line_canonical = NULL"))
     connection.execute(sa.text("UPDATE events SET participant_pair_key = NULL"))

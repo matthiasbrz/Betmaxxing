@@ -22,6 +22,10 @@
 # `pytest -W error` passes without exceptions. The application's own provider
 # client still uses `httpx`: the two distributions have different import names
 # and coexist. `httpcore2` and `truststore` are httpx2's dependencies.
+#
+# `psycopg` is pinned here too, not just in the optional extra: CI runs the
+# concurrency suite against a real PostgreSQL, because SQLite serialises every
+# writer and therefore cannot tell an atomic algorithm from a lucky one.
 
 Mako==1.3.12
 MarkupSafe==3.0.3
@@ -54,6 +58,8 @@ mypy_extensions==1.1.0
 packaging==26.2
 pathspec==1.1.1
 pluggy==1.6.0
+psycopg-binary==3.3.4
+psycopg==3.3.4
 pydantic-settings==2.14.2
 pydantic==2.13.4
 pydantic_core==2.46.4

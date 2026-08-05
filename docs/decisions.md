@@ -451,3 +451,137 @@ test passed and proved nothing about that.
 **Limite.** The `b7c1e9d24a10` downgrade does not rebuild `events.source_ids`
 from `event_source_map`: that direction cannot be done without guessing which
 rows the migration created. Documented rather than fabricated.
+
+
+---
+
+## Instruction 02 ter — closing the reliability reservations
+
+Instruction 02 bis was **not** validated: its own report conceded that criterion 8
+held only on SQLite, which by that instruction's rules means the tranche was not
+finished. These records close that and the nine other findings.
+
+### D-040 — The daily budget is one row, updated conditionally
+
+**Decision.** ``provider_budget_days(provider, day_utc)`` holds the authoritative
+counter. Reserving is a single conditional UPDATE:
+``SET reserved_total = reserved_total + :cost WHERE ... AND reserved_total + :cost <= :ceiling``.
+The detail table remains, as the audit trail, but nothing synchronises on it.
+**Raison.** The previous design read ``SELECT SUM(...)`` and then inserted. Under
+SQLite that looks atomic because SQLite serialises every writer behind one
+database-level lock; under PostgreSQL in ``READ COMMITTED`` two transactions read
+the same total and both insert, so two reservations that each fit under the
+ceiling together exceed it. The earlier claim that "insertions alone give the same
+serialisation as SQLite" was simply false. PostgreSQL locks the row for an UPDATE
+and **re-evaluates the WHERE clause against the updated tuple**, which is what
+makes one writer win.
+**Coût.** One extra row per provider per day, and one more statement per
+reservation.
+**Vérification.** Barrier-synchronised threads on a real PostgreSQL: two
+reservations of 3 against a ceiling of 5 yield exactly one grant; ten of 1 against
+4 yield exactly four. ``verify_invariant()`` and ``betmaxxing budget audit`` check
+the counter against the detail.
+
+### D-041 — Only a request that never left is free
+
+**Decision.** ``may_have_been_billed()`` names the transport failures that prove
+the request never reached the provider — connect error, connect timeout, pool
+timeout, local protocol error, unsupported protocol, invalid URL. Those release
+the reservation. Everything else — read timeout, write timeout, read/write error,
+remote protocol error — stays charged at its estimate.
+**Raison.** The previous version released on *every* ``TimeoutException`` and
+``TransportError`` and documented it as "no response arrived, so no credit was
+consumed". A read timeout means the request was sent and the answer was late: the
+provider may well have served and billed it. Under-counting spend is the one
+direction a budget must never err in.
+**Coût.** A flaky network can charge for requests that were never billed. That is
+the safe direction, and the reservation ledger records the ambiguity.
+
+### D-042 — The lease has a heartbeat, and effects have an outbox
+
+**Decision.** ``LeaseGuard`` renews the lease at a third of its duration, starting
+with one synchronous renewal before the work begins and stopping-and-joining in a
+``finally``. A refused renewal marks the guard lost, the runner declines to
+acknowledge, and ``ledger.assert_owns()`` gates anything external.
+``notification_outbox(job_id, alert_key, channel)`` makes a delivery at-most-once.
+**Raison.** ``renew_lease()`` existed and nothing called it, so a scan longer than
+the lease was reclaimed and **executed twice**. Fencing stopped the first worker
+from acknowledging; it could not undo the provider requests, the rows, or the
+messages. Claiming that a fencing token makes a re-executed job safe was true only
+of the bookkeeping.
+**Coût.** One thread per running job, and one row per external effect.
+**Limite.** An effect already delivered cannot be recalled. The outbox prevents a
+*second* one; it does not undo the first.
+
+### D-043 — Budget exhaustion waits for the reset, or admits the job expired
+
+**Decision.** ``BUDGET_EXHAUSTED`` no longer carries a delay. The runner computes
+the next **UTC midnight** plus a deterministic per-job jitter under ten minutes.
+The job goes to ``DEFERRED``, which consumes no attempt and can never become
+``FAILED_FINAL``. A job whose value expires before that boundary — a milestone
+whose event has kicked off, a daily scan past its catch-up grace — becomes
+``SKIPPED_BUDGET`` with a reason and an audit scan.
+**Raison.** A flat six hours was described as "past midnight" and is not: at 08:00
+UTC it lands at 14:00, inside the same exhausted window. And each deferral consumed
+one of the three provider-failure attempts, so three budget refusals parked a
+healthy job as a permanent failure.
+**Coût.** Two more states in the ledger. The jitter is derived from the job id so
+it is stable across restarts; a random one would move the deadline every pass.
+
+### D-044 — Requested markets are decided per sport
+
+**Decision.** ``core_markets_for(sport)`` and ``additional_markets_for(sport)``.
+Football groups ``h2h`` and ``totals`` and adds five per-event markets; tennis
+groups ``h2h`` only and has no additional markets. Tennis ``totals``, ``h2h_s1``
+read as "wins a set", and "wins at least one set" stay refused.
+**Raison.** One global ``CORE_MARKETS`` asked every sport for ``totals``. Tennis
+``totals`` is documented as disabled until the games-versus-sets semantics is
+confirmed — so we were paying for a price the mapper then refused. Not requesting
+it is the only way not to be billed for it.
+**Vérification.** A fixture with both sports active asserts the tennis request
+contains exactly ``h2h`` and reserves one credit, and that all five football
+extras — ``double_chance_h1`` included — are requested, mapped and persisted.
+
+### D-045 — Money conversion is decimal, in one place
+
+**Decision.** ``to_cents`` parses with ``Decimal(str(value))``, rejects non-finite
+input, and quantises with ``ROUND_HALF_UP``. The migration imports it rather than
+reimplementing it.
+**Raison.** ``math.floor(amount * 100 + 0.5)`` claimed half-up and did not deliver
+it: 1.005 is stored as slightly *less* than one and five thousandths, so it floored
+to 100 cents instead of 101. The migration's ``float(...)`` then ``round(...)`` was
+a third rule again — banker's rounding on an already-drifted value. Values sitting
+exactly on a half-cent are where a money rule must be unambiguous, and they were
+the ones every version got wrong.
+**Coût.** ``to_cents`` now raises on unusable input instead of returning nonsense,
+so callers handle it.
+
+### D-046 — The downgrade carries source ids back, or refuses
+
+**Decision.** ``b7c1e9d24a10``'s downgrade folds every ``event_source_map`` row
+into ``events.source_ids`` before the parent revision drops the table. A provider
+id already present with a conflicting value stops the downgrade by name.
+``EventIdentityService`` writes both places at once, so they cannot diverge.
+**Raison.** Cross-provider links created after the upgrade lived only in the table.
+The previous downgrade left them there and the parent revision dropped it, so the
+round trip lost exactly the rows that connect a stored price to its fixture. The
+earlier note calling that "documented rather than fabricated" described a loss, not
+a policy.
+**Vérification.** ``65c32b5e3f63`` populated → head → downgrade → head, with a
+mapping added while at head, asserting the associations are identical at each step.
+
+### D-047 — Reviews and aliases are operable from the CLI
+
+**Decision.** ``betmaxxing identity reviews list|show|resolve`` and
+``betmaxxing identity aliases import|list``, plus ``betmaxxing budget audit``.
+Resolution is one transaction, requires ``--operator``, accepts only an event that
+actually matched, refuses a colliding mapping, and records who decided what and
+when. There is deliberately no automatic resolution. The alias import is
+idempotent and quarantines bad or contradictory lines with their line numbers.
+**Raison.** Both mechanisms shipped with no way to operate them: a queue nobody
+could read, and a table the matcher consulted but nothing could fill. A control
+that requires hand-written SQL is a place where a control could go.
+**Coût.** CLI only — the web interface is a later tranche.
+**Limite.** Resolving a review governs future attribution. Snapshots already
+recorded are **not** re-attributed: a decision today must not rewrite what a past
+scan is supposed to have seen.

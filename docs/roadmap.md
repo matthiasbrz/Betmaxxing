@@ -1,6 +1,6 @@
 # État et feuille de route
 
-**Dernière mise à jour :** 2026-08-05 · **Version :** 0.3.1
+**Dernière mise à jour :** 2026-08-05 · **Version :** 0.3.2
 
 ---
 
@@ -95,16 +95,59 @@
   réellement demandés par événement, estimateur de coût historique **hors ligne**.
 - **804 tests**, dont 114 écrits en rouge avant correction.
 
+> **Cette tranche n'était pas validée non plus.** Son rapport affirmait les 25
+> critères satisfaits puis reconnaissait que le critère 8 ne tenait que sur SQLite —
+> ce qui, par la règle de l'instruction, interdit de déclarer la tranche terminée.
+> Un audit a confirmé dix points : aucun test PostgreSQL réel, une réservation
+> budgétaire non atomique hors SQLite, tout timeout compté à zéro, `renew_lease()`
+> jamais appelé, un report budgétaire de six heures présenté comme « après
+> minuit », `double_chance_h1` non prouvé, `totals` tennis demandé et facturé alors
+> qu'il est déclaré désactivé, revues et alias inexploitables sans SQL, un arrondi
+> monétaire binaire là où le domaine promet `ROUND_HALF_UP`, et un downgrade qui
+> perd `events.source_ids`.
+
+### Tranche 2 quater — Fermeture des réserves de fiabilité (instruction 02 ter)
+- **PostgreSQL réel en CI** : service `postgres:16`, 24 tests de concurrence avec
+  sessions distinctes et barrières. Une étape échoue si la suite est *skippée*.
+- **Budget journalier réellement atomique** : bucket `(provider, day_utc)` mis à
+  jour par UPDATE conditionnel (D-040). Deux réservations concurrentes qui tiennent
+  isolément ne peuvent plus dépasser ensemble le plafond. Invariant vérifiable par
+  `betmaxxing budget audit`.
+- **Comptabilité prudente des erreurs réseau** : seul un envoi *démontrablement*
+  impossible libère la réservation ; un timeout de lecture reste facturé (D-041).
+- **Heartbeat de bail branché** : `LeaseGuard` renouvelle au tiers du bail, s'arrête
+  et se joint dans un `finally`, et une perte de bail empêche tout acquittement. Un
+  travail plus long que deux baux ne s'exécute **qu'une fois** (D-042).
+- **Outbox de notification** : `(job_id, alert_key, channel)` unique, donc une
+  reprise ne peut pas notifier deux fois. Un effet déjà envoyé n'est pas annulable —
+  l'outbox empêche le second, pas le premier.
+- **Sémantique budgétaire honnête** : report au prochain reset **UTC** avec gigue
+  déterministe, aucun attempt consommé, jamais `FAILED_FINAL` ; `SKIPPED_BUDGET`
+  quand l'occurrence perd sa valeur avant le reset (D-043).
+- **Marchés par sport** : tennis groupé = `h2h` seul, `totals` tennis ni demandé ni
+  budgété ; les cinq marchés football additionnels sont demandés, mappés et
+  persistés sur fixture, `double_chance_h1` compris (D-044).
+- **Arrondi monétaire décimal** : `to_cents` en `Decimal` + `ROUND_HALF_UP`, réutilisé
+  par la migration (D-045). Cela corrige aussi un défaut du domaine : `1.005` donnait
+  100 centimes.
+- **Downgrade sans perte** : les correspondances repassent dans `events.source_ids`
+  avant que la table soit supprimée, ou le downgrade refuse (D-046).
+- **Revues et alias administrables** : `betmaxxing identity reviews list|show|resolve`
+  et `identity aliases import|list`, sans résolution automatique (D-047).
+- **972 tests** au total : 948 sur SQLite et **24 sur PostgreSQL 16 réel**. 94 ont été
+  écrits en rouge sur `5d2109f` avant correction.
+
 ---
 
 ## Statuts honnêtes
 
 | Composant | Statut | Ce que cela veut dire |
 |---|---|---|
-| Ordonnanceur | ✅ **fonctionnel** | Ledger durable, anti-starvation et fencing testés. Sûr multi-workers contre **une seule base SQLite** ; le chemin PostgreSQL (`SKIP LOCKED`) est écrit mais **non exercé en CI** |
+| Ordonnanceur | ✅ **fonctionnel** | Ledger durable, anti-starvation, fencing et heartbeat testés sur **SQLite et PostgreSQL 16 réel**. Sûr multi-workers contre une même base ; rien ne coordonne plusieurs bases |
 | Collecte + persistance | ✅ **fonctionnel** | Les trois chemins persistent événements, snapshots et scan, y compris un scan d'erreur |
-| Budget fournisseur | ✅ **appliqué** | Réservation persistante avant chaque tentative ; plafonds scan et jour opposables entre workers d'une même base |
-| Marchés additionnels | ◐ **collectés, non vérifiés** | DNB, double chance et mi-temps sont réellement demandés et persistés **sur fixture** ; aucun appel réel ne l'a confirmé |
+| Budget fournisseur | ✅ **appliqué, atomique** | Bucket journalier par UPDATE conditionnel, prouvé par courses PostgreSQL réelles. Un coût incertain reste facturé |
+| Marchés additionnels | ◐ **collectés, non vérifiés** | Les **cinq** marchés football sont demandés, mappés et persistés **sur fixture**, `double_chance_h1` compris. `totals` tennis n'est pas demandé. Aucun appel réel ne l'a confirmé |
+| Revues d'identité et alias | ✅ **administrables** | CLI `betmaxxing identity …`. Aucune résolution automatique ; l'opérateur et sa décision sont conservés |
 | Historique | ◐ **estimateur seul** | Interface et estimateur de coût hors ligne. Aucun téléchargement implémenté |
 | Modèles football / tennis | ⚠️ `BACKTEST_ONLY` | Produisent des probabilités ; aucune validation |
 | Incertitude | ⛔ `UNAVAILABLE` | Aucune méthode défendable. `SYNTHETIC` en démo seulement |
@@ -150,21 +193,21 @@ Rien ici ne dépend d'un tiers ; ce sont des choix de périmètre de cette tranc
 
 | Limite | Conséquence |
 |---|---|
-| Le chemin `SKIP LOCKED` PostgreSQL n'est pas exercé en CI | La sûreté multi-workers n'est **prouvée** que sur SQLite |
-| Le renouvellement de bail existe mais le runner ne l'appelle pas | Un scan plus long que 15 min serait repris par un autre worker |
-| La file `event_mapping_reviews` n'a ni CLI ni route | Une ambiguïté est enregistrée mais doit être lue en SQL |
-| Les alias participants ne sont alimentés par aucun import | La table est consultée par le rapprochement, mais reste vide en pratique |
-| `double_chance_h1` est demandé mais aucune fixture ne l'exerce | Son mapping reste non prouvé côté collecte |
-| Le downgrade de `b7c1e9d24a10` ne reconstruit pas `events.source_ids` | Documenté plutôt que fabriqué ; un aller-retour perd l'attribution d'origine |
+| Un effet externe déjà envoyé n'est pas annulable | L'outbox empêche un **second** envoi après reprise, pas le premier |
+| Aucun notifieur n'est branché dans le runner | L'outbox et le contrôle de propriété existent et sont testés ; le canal reste à câbler |
+| La revue d'ambiguïté n'a pas de route API | Elle s'administre en CLI ; l'interface web est la tranche 6 |
+| Le fichier d'alias doit être constitué à la main | L'import est prêt et testé ; aucun catalogue n'est fourni |
+| PostgreSQL n'est exercé que sur un seul nœud | Rien ne coordonne plusieurs bases, et ce n'est pas prévu |
 | Aucune sortie web | Tranche 6 |
 
 ---
 
 ## Prochaine action recommandée
 
-1. **Lancer le smoke test** avec votre clé (voir `docs/source-matrix.md`), puis reporter
-   la date et la couverture constatée dans ce même document. C'est ce qui fait passer
-   l'adaptateur de `IMPLEMENTED_UNVERIFIED` à `LIVE_VERIFIED`.
+1. **Exécuter l'instruction d'activation fournisseur, et seulement après validation de
+   cette tranche.** Aucun smoke test, aucune clé et aucun crédit ne doivent être
+   engagés avant. Le socle est prêt ; l'ouverture d'un accès réel est une décision
+   séparée, avec son propre périmètre.
 2. **Lire les CGU de The Odds API** et trancher le droit de rétention des réponses
    brutes. En attendant, seul le normalisé est conservé.
 3. **Constituer un jeu historique** — sans lui, ni entraînement, ni incertitude, ni

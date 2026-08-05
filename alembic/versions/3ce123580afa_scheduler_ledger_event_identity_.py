@@ -29,6 +29,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from betmaxxing.challenge import ChallengeError, to_cents
+
 revision: str = "3ce123580afa"
 down_revision: str | None = "65c32b5e3f63"
 branch_labels: str | Sequence[str] | None = None
@@ -78,12 +80,17 @@ def _bank_cents_from(document_json: str | None, steps: list[str]) -> int:
     config = document.get("config")
     if not isinstance(config, dict) or "initial_bank" not in config:
         raise UnusableChallengeDocument("config.initial_bank absent")
+    # The domain's own conversion, imported rather than reimplemented. A second
+    # rounding rule for the same money is a second answer to "what is the
+    # balance", and `float(...)` then `round(...)` really was a different rule:
+    # it is binary rounding on a value that has already drifted.
+    raw = config["initial_bank"]
+    if isinstance(raw, bool) or raw is None:
+        raise UnusableChallengeDocument(f"config.initial_bank invalide : {raw!r}")
     try:
-        initial = float(config["initial_bank"])
-    except (TypeError, ValueError) as exc:
-        raise UnusableChallengeDocument("config.initial_bank non numérique") from exc
-    # Same half-up rounding as betmaxxing.challenge.to_cents.
-    return round(initial * 100)
+        return to_cents(raw)
+    except ChallengeError as exc:
+        raise UnusableChallengeDocument(f"config.initial_bank inexploitable ({exc})") from exc
 
 
 def _add_challenge_columns_safely() -> None:

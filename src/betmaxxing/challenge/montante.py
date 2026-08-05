@@ -28,6 +28,7 @@ import math
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from betmaxxing.domain.enums import BetOutcome, ChallengeState
 from betmaxxing.domain.models import Candidate
@@ -47,9 +48,25 @@ class ChallengeError(RuntimeError):
     """Illegal transition or configuration."""
 
 
-def to_cents(amount: float) -> int:
-    """Round half-up to the cent — the convention a bookmaker slip uses."""
-    return math.floor(amount * 100 + 0.5)
+def to_cents(amount: float | int | str | Decimal) -> int:
+    """Round half-up to the cent — the convention a bookmaker slip uses.
+
+    Decimal, not float arithmetic. ``math.floor(amount * 100 + 0.5)`` claimed
+    half-up and did not deliver it: ``1.005`` is stored as slightly *less* than
+    one and five thousandths, so the product lands on 100.4999… and floors to
+    100 cents instead of 101. Values sitting exactly on a half-cent are precisely
+    where a money rule has to be unambiguous, and they were the ones it got wrong.
+
+    ``Decimal(str(amount))`` reads the number as written rather than as the
+    nearest binary double, so a document that says ``1.005`` means 1.005.
+    """
+    try:
+        value = Decimal(str(amount).strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise ChallengeError(f"montant illisible : {amount!r}") from exc
+    if not value.is_finite():
+        raise ChallengeError(f"montant non fini : {amount!r}")
+    return int(value.scaleb(2).quantize(Decimal(1), rounding=ROUND_HALF_UP))
 
 
 def from_cents(cents: int) -> float:

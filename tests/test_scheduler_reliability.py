@@ -578,13 +578,21 @@ class TestExecutionTaxonomy:
         outcome = self._run(db_settings, monkeypatch, ProviderUnavailable("401"))
         assert outcome.outcome is ExecutionOutcome.FINAL_FAILURE
 
-    def test_a_budget_ceiling_defers_rather_than_looping(
+    def test_a_budget_ceiling_is_its_own_outcome(
         self, db_settings: Settings, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Budget exhaustion is neither a success nor a provider failure.
+
+        *When* to try again is decided by the runner from the UTC reset boundary
+        and the job's own deadline — see `next_budget_reset` and the
+        `SKIPPED_BUDGET` policy. The result deliberately carries no delay of its
+        own; a flat one is what produced "six hours" and called it "past
+        midnight".
+        """
         outcome = self._run(db_settings, monkeypatch, BudgetExceeded("budget journalier atteint"))
         assert outcome.outcome is ExecutionOutcome.BUDGET_EXHAUSTED
-        assert outcome.retry_after is not None
-        assert outcome.retry_after > timedelta(hours=1)
+        assert not outcome.is_success
+        assert not hasattr(outcome, "retry_after")
 
     def test_an_error_scan_is_persisted_for_every_failure_kind(
         self, db_settings: Settings, monkeypatch: pytest.MonkeyPatch

@@ -47,6 +47,38 @@ HEADER_LAST = "x-requests-last"
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 MAX_BACKOFF_SECONDS = 30.0
 
+#: Transport failures that prove the request never reached the provider: the
+#: connection was never established, or no connection was ever obtained. Nothing
+#: was served, so nothing was billed, and the reservation is released.
+NEVER_SENT: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.LocalProtocolError,
+    httpx.UnsupportedProtocol,
+    httpx.InvalidURL,
+)
+
+
+def may_have_been_billed(error: BaseException) -> bool:
+    """Whether this failure leaves the provider's billing in doubt.
+
+    The previous tranche released the reservation for *every* transport error and
+    described that as "no response arrived, so no credit was consumed". That is
+    only true when the request never left. A **read** timeout means the request
+    was sent and the answer was late — the provider may well have served and
+    billed it. A write error means we stopped mid-send, which the far end may
+    already have completed.
+
+    So the split is by *evidence*, not by exception family: only the failures
+    listed in :data:`NEVER_SENT` are free. Everything else stays charged at its
+    estimate, because under-counting spend is the one direction a budget must
+    never err in.
+    """
+    if isinstance(error, NEVER_SENT):
+        return False
+    return isinstance(error, httpx.TransportError)
+
 
 def redact(text: str) -> str:
     """Replace any ``apiKey=...`` with a placeholder.
@@ -201,18 +233,20 @@ class TheOddsApiClient:
             try:
                 with httpx.Client(timeout=self._timeout, transport=self._transport) as client:
                     response = client.get(url, params=query)
-            except httpx.TimeoutException:
-                self._release(reservation)
+            except httpx.TimeoutException as exc:
+                # A *connect* timeout never reached the provider; a *read* or
+                # *write* timeout may have. Only the former is free.
+                self._settle_failure(reservation, exc, cost)
                 if attempt > self._max_retries:
                     raise TheOddsApiError(
-                        f"timeout après {attempt} tentative(s) sur {redact(url)}"
+                        f"timeout ({type(exc).__name__}) après {attempt} tentative(s) "
+                        f"sur {redact(url)}"
                     ) from None
                 self._backoff(attempt, None)
                 continue
             except httpx.TransportError as exc:
-                # DNS / connection failures: no response, so no credit spent.
-                # The message may contain the URL.
-                self._release(reservation)
+                # The message may contain the URL, so it is redacted.
+                self._settle_failure(reservation, exc, cost)
                 if attempt > self._max_retries:
                     raise TheOddsApiError(
                         f"erreur de transport sur {redact(url)}: {redact(str(exc))}"
@@ -274,6 +308,19 @@ class TheOddsApiClient:
     def _release(self, reservation: int | None) -> None:
         if self._ledger is not None and reservation is not None:
             self._ledger.release(reservation)
+
+    def _settle_failure(self, reservation: int | None, error: BaseException, cost: int) -> None:
+        """Account a failed attempt according to what we can actually prove.
+
+        Charged at the estimate when billing is in doubt, released only when the
+        request demonstrably never left. The per-scan counter follows the same
+        rule, so a run of read timeouts exhausts the scan budget instead of
+        looping for free.
+        """
+        if may_have_been_billed(error):
+            self._spent += cost
+            return
+        self._release(reservation)
 
     def _backoff(self, attempt: int, retry_after: str | None) -> None:
         """Honour ``Retry-After`` when present, else exponential with jitter."""

@@ -37,7 +37,8 @@ overwritten, so a reschedule is visible after the fact.
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
 
@@ -61,6 +62,67 @@ from betmaxxing.storage.tables import (
 #: matching *across providers*. Tight on purpose: a wide window would merge two
 #: legs played on the same day, which is the collision this design removes.
 CROSS_PROVIDER_TOLERANCE = timedelta(hours=6)
+
+
+class ReviewNotFound(LookupError):
+    """No review with that id."""
+
+
+class ReviewAlreadyResolved(RuntimeError):
+    """A decision was already recorded; a second one would overwrite it."""
+
+
+class ReviewResolutionRejected(ValueError):
+    """The operator's choice failed validation. Nothing was written."""
+
+
+@dataclass(frozen=True, slots=True)
+class AliasRow:
+    """One line of an alias import file, with its line number for reporting."""
+
+    line: int
+    sport: str
+    alias: str
+    canonical_participant_id: str
+    source: str
+
+    def validate(self) -> str | None:
+        """``None`` when usable, otherwise why not."""
+        if self.sport not in {str(value) for value in Sport}:
+            supported = ", ".join(sorted(str(value) for value in Sport))
+            return f"sport « {self.sport} » hors périmètre (supportés : {supported})"
+        if not self.alias.strip():
+            return "alias vide"
+        if not self.canonical_participant_id.strip():
+            return "canonical_participant_id vide"
+        if not self.source.strip():
+            return "source vide — un alias appartient toujours à une source"
+        expected = f"{self.sport}:"
+        if not self.canonical_participant_id.startswith(expected):
+            return (
+                f"canonical_participant_id devrait commencer par « {expected} », "
+                f"reçu {self.canonical_participant_id!r}"
+            )
+        return None
+
+
+@dataclass(slots=True)
+class AliasImportReport:
+    """What an import did, line by line. Never a bare success/failure."""
+
+    imported: int = 0
+    unchanged: int = 0
+    quarantined: list[dict[str, object]] = field(default_factory=list)
+
+    def quarantine(self, line: int, reason: str) -> None:
+        self.quarantined.append({"line": line, "reason": reason})
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "imported": self.imported,
+            "unchanged": self.unchanged,
+            "quarantined": list(self.quarantined),
+        }
 
 
 class ResolutionStatus(StrEnum):
@@ -101,6 +163,25 @@ class ResolvedEvent:
     @property
     def usable(self) -> bool:
         return self.internal_id is not None
+
+
+def _review_document(row: EventMappingReviewRow) -> dict[str, object]:
+    """One shape for a review, so listing and showing cannot drift apart."""
+    return {
+        "id": row.id,
+        "provider": row.provider,
+        "provider_event_id": row.provider_event_id,
+        "sport": row.sport,
+        "competition": row.competition,
+        "label": f"{row.home_name} - {row.away_name}",
+        "start_time_utc": row.start_time_utc.isoformat(),
+        "candidate_internal_ids": [str(value) for value in (row.candidate_internal_ids or [])],
+        "detail": row.detail,
+        "resolved": bool(row.resolved),
+        "resolved_at": row.resolved_at.isoformat() if row.resolved_at else None,
+        "resolved_by": row.resolved_by,
+        "resolved_internal_id": row.resolved_internal_id,
+    }
 
 
 def new_internal_id() -> str:
@@ -230,12 +311,11 @@ class EventIdentityService:
 
             if len(candidates) == 1:
                 internal_id = candidates[0].canonical_id
-                session.add(
-                    EventSourceMapRow(
-                        provider=provider,
-                        provider_event_id=provider_event_id,
-                        internal_id=internal_id,
-                    )
+                self._link(
+                    session,
+                    internal_id=internal_id,
+                    provider=provider,
+                    provider_event_id=provider_event_id,
                 )
                 return ResolvedEvent(status=ResolutionStatus.RESOLVED, internal_id=internal_id)
 
@@ -255,6 +335,36 @@ class EventIdentityService:
             )
 
     # -- internals ----------------------------------------------------------
+    def _link(
+        self,
+        session: Session,
+        *,
+        internal_id: str,
+        provider: str,
+        provider_event_id: str,
+    ) -> None:
+        """Record a mapping in **both** places that describe it.
+
+        ``event_source_map`` is the authoritative lookup; ``events.source_ids``
+        is the column a downgrade can still carry. Writing only the table let the
+        two diverge, and a downgrade then lost every cross-provider link created
+        after the upgrade (D-041).
+        """
+        session.add(
+            EventSourceMapRow(
+                provider=provider,
+                provider_event_id=provider_event_id,
+                internal_id=internal_id,
+            )
+        )
+        row = session.get(EventRow, internal_id)
+        if row is None:
+            return
+        source_ids = dict(row.source_ids or {})
+        if source_ids.get(provider) != provider_event_id:
+            source_ids[provider] = provider_event_id
+            row.source_ids = source_ids
+
     def _refresh_mapped(
         self, session: Session, internal_id: str, start: datetime, status: EventStatus
     ) -> ResolvedEvent:
@@ -436,6 +546,162 @@ class EventIdentityService:
         )
         return ResolvedEvent(status=ResolutionStatus.CREATED, internal_id=internal_id)
 
+    # -- operator surface ---------------------------------------------------
+    def resolve_review(
+        self,
+        review_id: int,
+        *,
+        internal_id: str,
+        operator: str,
+        now: datetime | None = None,
+    ) -> ResolvedEvent:
+        """Attach a queued ambiguity to the event an **operator** chose.
+
+        There is deliberately no automatic variant. The whole point of the queue
+        is that the machine could not decide; a ``--best-guess`` flag would put
+        the guess back, just further from the code that refused to make it.
+
+        Validated before anything is written, and all of it in one transaction:
+
+        * the review exists and is still open;
+        * the chosen event is one of the candidates that actually matched — an
+          operator cannot attach a price to an unrelated fixture by typo;
+        * no mapping already exists for ``(provider, provider_event_id)``.
+
+        Existing snapshots are **not** re-attributed. The decision governs what
+        happens next; rewriting recorded history would change what past scans are
+        supposed to have seen.
+        """
+        moment = ensure_utc(now or utc_now())
+        with session_scope(self._settings) as session:
+            review = session.get(EventMappingReviewRow, review_id)
+            if review is None:
+                raise ReviewNotFound(f"aucune revue d'identité {review_id}")
+            if review.resolved:
+                raise ReviewAlreadyResolved(
+                    f"la revue {review_id} a déjà été tranchée par "
+                    f"{review.resolved_by!r} le "
+                    f"{review.resolved_at.isoformat() if review.resolved_at else '?'}"
+                )
+
+            candidates = [str(value) for value in (review.candidate_internal_ids or [])]
+            if internal_id not in candidates:
+                raise ReviewResolutionRejected(
+                    f"{internal_id!r} ne figure pas parmi les événements qui "
+                    f"correspondaient ({', '.join(candidates) or 'aucun'}). "
+                    "Seul un candidat réel peut recevoir ces cotes."
+                )
+            if session.get(EventRow, internal_id) is None:
+                raise ReviewResolutionRejected(f"l'événement {internal_id!r} n'existe plus")
+
+            clash = session.scalar(
+                select(EventSourceMapRow).where(
+                    EventSourceMapRow.provider == review.provider,
+                    EventSourceMapRow.provider_event_id == review.provider_event_id,
+                )
+            )
+            if clash is not None:
+                raise ReviewResolutionRejected(
+                    f"({review.provider}, {review.provider_event_id}) est déjà rattaché à "
+                    f"{clash.internal_id!r}. Aucun rattachement n'est écrasé."
+                )
+
+            self._link(
+                session,
+                internal_id=internal_id,
+                provider=review.provider,
+                provider_event_id=review.provider_event_id,
+            )
+            review.resolved = True
+            review.resolved_at = moment
+            review.resolved_by = operator
+            review.resolved_internal_id = internal_id
+
+        return ResolvedEvent(status=ResolutionStatus.RESOLVED, internal_id=internal_id)
+
+    def review(self, review_id: int) -> dict[str, object]:
+        with session_scope(self._settings) as session:
+            row = session.get(EventMappingReviewRow, review_id)
+            if row is None:
+                raise ReviewNotFound(f"aucune revue d'identité {review_id}")
+            return _review_document(row)
+
+    def import_aliases(self, rows: Iterable[AliasRow]) -> AliasImportReport:
+        """Load participant aliases, idempotently, quarantining what it cannot use.
+
+        A whole file failing because one line is wrong is not helpful; nor is
+        silently importing three quarters of it. Every rejected line is reported
+        with its number and the reason.
+
+        A contradiction — the same ``(sport, source, alias)`` already pointing at
+        a different participant — is quarantined, never overwritten. Aliases feed
+        event matching, so silently repointing one would change which fixtures get
+        merged.
+        """
+        report = AliasImportReport()
+        with session_scope(self._settings) as session:
+            for entry in rows:
+                problem = entry.validate()
+                if problem is not None:
+                    report.quarantine(entry.line, problem)
+                    continue
+
+                existing = session.scalar(
+                    select(ParticipantAliasRow).where(
+                        ParticipantAliasRow.sport == entry.sport,
+                        ParticipantAliasRow.source == entry.source,
+                        ParticipantAliasRow.alias == entry.alias,
+                    )
+                )
+                if existing is not None:
+                    if existing.canonical_participant_id != entry.canonical_participant_id:
+                        report.quarantine(
+                            entry.line,
+                            f"alias contradictoire : « {entry.alias} » pointe déjà sur "
+                            f"{existing.canonical_participant_id!r} pour la source "
+                            f"{entry.source!r}. Aucun alias n'est réécrit.",
+                        )
+                        continue
+                    report.unchanged += 1
+                    continue
+
+                session.add(
+                    ParticipantAliasRow(
+                        sport=entry.sport,
+                        alias=entry.alias,
+                        canonical_participant_id=entry.canonical_participant_id,
+                        source=entry.source,
+                    )
+                )
+                report.imported += 1
+        return report
+
+    def aliases(
+        self, *, sport: str | None = None, source: str | None = None
+    ) -> list[dict[str, str]]:
+        with session_scope(self._settings) as session:
+            statement = select(ParticipantAliasRow)
+            if sport:
+                statement = statement.where(ParticipantAliasRow.sport == sport)
+            if source:
+                statement = statement.where(ParticipantAliasRow.source == source)
+            rows = session.scalars(
+                statement.order_by(
+                    ParticipantAliasRow.sport,
+                    ParticipantAliasRow.source,
+                    ParticipantAliasRow.alias,
+                )
+            ).all()
+            return [
+                {
+                    "sport": row.sport,
+                    "alias": row.alias,
+                    "canonical_participant_id": row.canonical_participant_id,
+                    "source": row.source,
+                }
+                for row in rows
+            ]
+
     # -- inspection ---------------------------------------------------------
     def pending_review(self) -> list[dict[str, object]]:
         """Ambiguities awaiting a human decision."""
@@ -445,19 +711,7 @@ class EventIdentityService:
                 .where(EventMappingReviewRow.resolved.is_(False))
                 .order_by(EventMappingReviewRow.recorded_at)
             ).all()
-            return [
-                {
-                    "provider": row.provider,
-                    "provider_event_id": row.provider_event_id,
-                    "sport": row.sport,
-                    "competition": row.competition,
-                    "label": f"{row.home_name} - {row.away_name}",
-                    "start_time_utc": row.start_time_utc.isoformat(),
-                    "candidate_internal_ids": list(row.candidate_internal_ids),
-                    "detail": row.detail,
-                }
-                for row in rows
-            ]
+            return [_review_document(row) for row in rows]
 
     def schedule_history(self, internal_id: str) -> list[dict[str, object]]:
         """Recorded kick-off and status changes for one event."""

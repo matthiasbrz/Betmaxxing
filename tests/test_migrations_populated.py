@@ -450,3 +450,163 @@ class TestMigrationMatrix:
         run_alembic(populated, "upgrade", "head")
         result = run_alembic(populated, "check")
         assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+
+#: (initial_bank as written in the document, expected cents). Every value sits
+#: exactly on a half-cent, which is where binary rounding and ROUND_HALF_UP part
+#: company.
+HALF_UP_CASES = [
+    (10.005, 1001),
+    (0.005, 1),
+    (2.675, 268),
+    (1.005, 101),
+    (8.045, 805),
+    (1234.565, 123457),
+    (0.145, 15),
+]
+
+
+class TestMoneyRoundingMatchesTheDomain:
+    """`float(x) * 100` then `round()` is not `ROUND_HALF_UP` on a Decimal.
+
+    `round()` is banker's rounding on a float that may already have drifted, so
+    10.005 lands on 1000 or 1001 depending on the binary representation. A bank
+    balance reconstructed by a migration must use exactly the domain's rule, or
+    two code paths disagree about someone's money.
+    """
+
+    @pytest.mark.parametrize(("amount", "cents"), HALF_UP_CASES)
+    def test_the_domain_rounds_half_up(self, amount: float, cents: int) -> None:
+        from betmaxxing.challenge import to_cents
+
+        assert to_cents(amount) == cents
+
+    @pytest.mark.parametrize(("amount", "cents"), HALF_UP_CASES)
+    def test_the_migration_agrees_with_the_domain(
+        self, db_path: Path, amount: float, cents: int
+    ) -> None:
+        document = _legacy_challenge_document()
+        document["config"]["initial_bank"] = amount
+        seed_reference_database(db_path, challenge_document=document, include_step=False)
+
+        result = run_alembic(db_path, "upgrade", "head")
+        assert result.returncode == 0, result.stderr
+        connection = _connect(db_path)
+        try:
+            stored = connection.execute(
+                "SELECT bank_cents FROM challenges WHERE challenge_id = ?", (CHALLENGE_ID,)
+            ).fetchone()["bank_cents"]
+        finally:
+            connection.close()
+        assert stored == cents
+
+    @pytest.mark.parametrize(
+        ("text_amount", "cents"), [("10.005", 1001), ("0.005", 1), ("100", 10000), ("2.5", 250)]
+    )
+    def test_a_textual_amount_rounds_identically(
+        self, db_path: Path, text_amount: str, cents: int
+    ) -> None:
+        """Some legacy documents stored the bank as a JSON string."""
+        document = _legacy_challenge_document()
+        document["config"]["initial_bank"] = text_amount
+        seed_reference_database(db_path, challenge_document=document, include_step=False)
+
+        assert run_alembic(db_path, "upgrade", "head").returncode == 0
+        connection = _connect(db_path)
+        try:
+            stored = connection.execute(
+                "SELECT bank_cents FROM challenges WHERE challenge_id = ?", (CHALLENGE_ID,)
+            ).fetchone()["bank_cents"]
+        finally:
+            connection.close()
+        assert stored == cents
+
+    @pytest.mark.parametrize("amount", ["nan", "inf", "-inf", "abc", ""])
+    def test_a_non_finite_or_unparseable_bank_stops_the_migration(
+        self, db_path: Path, amount: str
+    ) -> None:
+        document = _legacy_challenge_document()
+        document["config"]["initial_bank"] = amount
+        seed_reference_database(db_path, challenge_document=document, include_step=False)
+
+        result = run_alembic(db_path, "upgrade", "head")
+        assert result.returncode != 0, f"bank {amount!r} was silently accepted"
+        assert CHALLENGE_ID in (result.stdout + result.stderr)
+
+
+class TestDowngradePreservesSourceIds:
+    """A downgrade that loses provider/event associations is data loss.
+
+    They are the only thing linking a stored price to the fixture it was quoted
+    for. `event_source_map` holds them after the upgrade; the column holds them
+    before it. Going down must move them back, or refuse.
+    """
+
+    def _source_ids(self, db_path: Path) -> dict[str, dict[str, str]]:
+        connection = _connect(db_path)
+        try:
+            return {
+                row["canonical_id"]: json.loads(row["source_ids"])
+                for row in connection.execute("SELECT canonical_id, source_ids FROM events")
+            }
+        finally:
+            connection.close()
+
+    def _mappings(self, db_path: Path) -> set[tuple[str, str, str]]:
+        connection = _connect(db_path)
+        try:
+            return {
+                (r["provider"], r["provider_event_id"], r["internal_id"])
+                for r in connection.execute(
+                    "SELECT provider, provider_event_id, internal_id FROM event_source_map"
+                )
+            }
+        finally:
+            connection.close()
+
+    def test_the_round_trip_preserves_every_association(self, populated: Path) -> None:
+        assert run_alembic(populated, "upgrade", "head").returncode == 0
+        before_map = self._mappings(populated)
+        before_ids = self._source_ids(populated)
+        assert len(before_map) == 2
+
+        down = run_alembic(populated, "downgrade", REFERENCE_REVISION)
+        assert down.returncode == 0, down.stderr
+        # At the reference revision the mapping table is gone, so the column is
+        # the only carrier. It must still hold everything.
+        assert self._source_ids(populated) == before_ids
+
+        assert run_alembic(populated, "upgrade", "head").returncode == 0
+        assert self._mappings(populated) == before_map
+        assert self._source_ids(populated) == before_ids
+
+    def test_a_mapping_added_after_the_upgrade_survives_the_round_trip(
+        self, populated: Path
+    ) -> None:
+        """The realistic case: a cross-provider link created while at head."""
+        assert run_alembic(populated, "upgrade", "head").returncode == 0
+        connection = _connect(populated)
+        connection.execute(
+            "INSERT INTO event_source_map (provider, provider_event_id, internal_id)"
+            " VALUES ('third_party', 'tp-77', ?)",
+            (EVENT_ID,),
+        )
+        connection.commit()
+        connection.close()
+
+        assert run_alembic(populated, "downgrade", REFERENCE_REVISION).returncode == 0
+        assert self._source_ids(populated)[EVENT_ID].get("third_party") == "tp-77", (
+            "a mapping created after the upgrade was lost by the downgrade"
+        )
+
+        assert run_alembic(populated, "upgrade", "head").returncode == 0
+        assert ("third_party", "tp-77", EVENT_ID) in self._mappings(populated)
+
+    def test_the_intermediate_downgrade_keeps_the_column_authoritative(
+        self, populated: Path
+    ) -> None:
+        """Stopping at b7c1e9d24a10's parent must already be safe."""
+        assert run_alembic(populated, "upgrade", "head").returncode == 0
+        before = self._source_ids(populated)
+        assert run_alembic(populated, "downgrade", "3ce123580afa").returncode == 0
+        assert self._source_ids(populated) == before

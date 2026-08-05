@@ -46,8 +46,9 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
+from typing import Any
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import case, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from betmaxxing.config import Settings
@@ -80,11 +81,27 @@ class JobState(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     FAILED_RETRYABLE = "FAILED_RETRYABLE"
     FAILED_FINAL = "FAILED_FINAL"
+    #: Waiting for an external window to open — today, the provider's daily
+    #: budget reset. Deliberately **not** a failure: it consumes no attempt and
+    #: can never become ``FAILED_FINAL``. Folding "we are out of credits" into the
+    #: provider-failure counter parked healthy jobs after three refusals.
+    DEFERRED = "DEFERRED"
+    #: Terminal: the budget was exhausted and the job will have no value by the
+    #: time the budget returns (its event has started, or its catch-up window has
+    #: closed). Recorded with a reason rather than deferred into irrelevance.
+    SKIPPED_BUDGET = "SKIPPED_BUDGET"
 
 
-#: The only states a claim may transition out of. ``SUCCEEDED`` and
-#: ``FAILED_FINAL`` are terminal and must never enter the selection window.
-CLAIMABLE_STATES = frozenset({JobState.PENDING, JobState.FAILED_RETRYABLE, JobState.RUNNING})
+#: The only states a claim may transition out of. ``SUCCEEDED``, ``FAILED_FINAL``
+#: and ``SKIPPED_BUDGET`` are terminal and must never enter the selection window.
+CLAIMABLE_STATES = frozenset(
+    {
+        JobState.PENDING,
+        JobState.FAILED_RETRYABLE,
+        JobState.RUNNING,
+        JobState.DEFERRED,
+    }
+)
 
 
 class StaleLeaseError(RuntimeError):
@@ -137,6 +154,30 @@ class JobLedger:
         self._settings = settings
         self._lease = lease
         self._retry_backoff = retry_backoff
+
+    @property
+    def lease(self) -> timedelta:
+        """How long a claim is valid. The heartbeat derives its cadence from this."""
+        return self._lease
+
+    def assert_owns(self, job: ClaimedJob) -> None:
+        """Raise unless this claim still owns the job.
+
+        Checked before any **external** effect — a notification, anything that
+        cannot be rolled back. A fencing token can stop a stale worker writing to
+        the ledger; only asking first can stop it sending a message.
+        """
+        with session_scope(self._settings) as session:
+            row = session.get(SchedulerJobRow, job.job_id)
+            if (
+                row is None
+                or row.state != str(JobState.RUNNING)
+                or row.claim_token != job.claim_token
+            ):
+                raise StaleLeaseError(
+                    f"job {job.job_id} n'est plus détenu par ce worker — "
+                    "aucun effet externe n'est autorisé."
+                )
 
     # -- writing ------------------------------------------------------------
     def enqueue(
@@ -240,14 +281,22 @@ class JobLedger:
     def claim_due(self, *, now: datetime, worker: str, limit: int = 10) -> list[ClaimedJob]:
         """Atomically take ownership of up to ``limit`` due occurrences.
 
-        Due means ``scheduled_for <= now`` and either ``PENDING``,
-        ``FAILED_RETRYABLE`` whose backoff has elapsed and which is under the
-        attempt ceiling, or ``RUNNING`` with a genuinely expired lease (the
-        crashed-worker recovery path).
+        Due means ``scheduled_for <= now`` and one of:
+
+        * ``PENDING``;
+        * ``DEFERRED`` whose window has opened — no attempt ceiling applies,
+          because waiting for a budget reset is not a failed attempt;
+        * ``FAILED_RETRYABLE`` whose backoff has elapsed and which is under the
+          attempt ceiling;
+        * ``RUNNING`` with a genuinely expired lease (crashed-worker recovery).
         """
         moment = ensure_utc(now)
         expiry = moment + self._lease
         claimed: list[ClaimedJob] = []
+
+        ready = SchedulerJobRow.next_attempt_at.is_(None) | (
+            SchedulerJobRow.next_attempt_at <= moment
+        )
 
         with session_scope(self._settings) as session:
             statement = (
@@ -257,13 +306,11 @@ class JobLedger:
                     # Filtered here, in SQL, *before* ORDER BY and LIMIT. Doing
                     # it in Python let terminal rows fill the window.
                     or_(
-                        SchedulerJobRow.state == str(JobState.PENDING),
+                        (SchedulerJobRow.state == str(JobState.PENDING)) & ready,
+                        (SchedulerJobRow.state == str(JobState.DEFERRED)) & ready,
                         (SchedulerJobRow.state == str(JobState.FAILED_RETRYABLE))
                         & (SchedulerJobRow.attempts < MAX_ATTEMPTS)
-                        & (
-                            SchedulerJobRow.next_attempt_at.is_(None)
-                            | (SchedulerJobRow.next_attempt_at <= moment)
-                        ),
+                        & ready,
                         (SchedulerJobRow.state == str(JobState.RUNNING))
                         & (SchedulerJobRow.attempts < MAX_ATTEMPTS)
                         & SchedulerJobRow.lease_expires_at.is_not(None)
@@ -399,6 +446,65 @@ class JobLedger:
             },
         )
 
+    def mark_deferred(
+        self,
+        job: ClaimedJob | str,
+        *,
+        reason: str,
+        next_attempt_at: datetime,
+        claim_token: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Park the job until an external window opens, consuming no attempt.
+
+        The attempt counter is *decremented back* to what it was before the
+        claim. That is the point: "the provider's daily budget is gone" is not a
+        provider failure, and three of them in a row must not park a healthy job
+        as ``FAILED_FINAL``.
+        """
+        job_id, token = _identify(job, claim_token)
+        moment = ensure_utc(now or utc_now())
+        self._complete(
+            job_id,
+            token,
+            {
+                "state": str(JobState.DEFERRED),
+                "finished_at": moment,
+                "error": reason[:2000],
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "claim_token": None,
+                "next_attempt_at": ensure_utc(next_attempt_at),
+                "attempts": _decremented_attempts(),
+            },
+        )
+
+    def mark_skipped(
+        self,
+        job: ClaimedJob | str,
+        *,
+        reason: str,
+        claim_token: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Terminal, and explicitly not a failure: the work lost its value."""
+        job_id, token = _identify(job, claim_token)
+        moment = ensure_utc(now or utc_now())
+        self._complete(
+            job_id,
+            token,
+            {
+                "state": str(JobState.SKIPPED_BUDGET),
+                "finished_at": moment,
+                "error": reason[:2000],
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "claim_token": None,
+                "next_attempt_at": None,
+                "attempts": _decremented_attempts(),
+            },
+        )
+
     def renew_lease(self, job: ClaimedJob, *, now: datetime | None = None) -> datetime:
         """Extend a lease that is about to expire while work is still running.
 
@@ -475,3 +581,16 @@ def _identify(job: ClaimedJob | str, claim_token: str | None) -> tuple[str, str 
     if isinstance(job, ClaimedJob):
         return job.job_id, job.claim_token
     return job, claim_token
+
+
+def _decremented_attempts() -> Any:
+    """SQL expression giving back the attempt this claim consumed, floored at 0.
+
+    Expressed in SQL rather than read-then-write so it stays inside the same
+    conditional UPDATE that checks the fencing token: two statements would let a
+    reclaim slip between them.
+    """
+    return case(
+        (SchedulerJobRow.attempts > 0, SchedulerJobRow.attempts - 1),
+        else_=0,
+    )

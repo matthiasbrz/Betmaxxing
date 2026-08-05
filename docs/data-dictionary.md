@@ -158,12 +158,14 @@ Score composite dans [0, 1] avec ses composantes.
 | `rejections` | Codes et détails |
 | `alerts` | Ledger de déduplication des notifications |
 | `challenges` / `challenge_steps` | Challenge — Montante, avec `version` (concurrence optimiste) |
-| `scheduler_jobs` | Occurrences du planificateur ; unique sur `(job_type, scheduled_for, scope_id)`. `claim_token` = jeton de possession exigé pour tout achèvement ; `next_attempt_at` = plancher de reprise après échec |
+| `scheduler_jobs` | Occurrences du planificateur ; unique sur `(job_type, scheduled_for, scope_id)`. `claim_token` = jeton de possession exigé pour tout achèvement ; `next_attempt_at` = plancher de reprise (backoff d'échec **ou** frontière de reset budgétaire). États : `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED_RETRYABLE`, `FAILED_FINAL`, `DEFERRED`, `SKIPPED_BUDGET` |
 | `event_source_map` | `(provider, provider_event_id) → internal_id` — résolution autoritaire |
 | `event_schedule_history` | Trace append-only des changements d'horaire et de statut |
 | `participant_aliases` | Orthographes alternatives, unique sur `(sport, source, alias)` — un fournisseur ne peut plus évincer l'alias d'un autre. Consultée par le rapprochement ; **aucun import ne l'alimente aujourd'hui** |
-| `event_mapping_reviews` | File de revue des identités ambiguës. Une ambiguïté n'écrit **que** ici : ni correspondance, ni événement, ni snapshot |
-| `provider_budget_ledger` | Une ligne par tentative fournisseur : coût réservé, coût constaté (`x-requests-last`), libération, fenêtre journalière UTC |
+| `event_mapping_reviews` | File de revue des identités ambiguës. Une ambiguïté n'écrit **que** ici : ni correspondance, ni événement, ni snapshot. `resolved_by` / `resolved_at` / `resolved_internal_id` conservent la décision humaine |
+| `provider_budget_days` | **La** primitive de synchronisation du budget : une ligne par `(fournisseur, jour UTC)`, incrémentée par UPDATE conditionnel. Le détail ne sert plus de verrou |
+| `provider_budget_ledger` | Journal d'audit : une ligne par tentative — coût réservé, coût constaté (`x-requests-last`), libération |
+| `notification_outbox` | `(job_id, alert_key, channel)` unique. Réserver la ligne autorise **un** envoi ; une reprise du même job n'en autorise pas un second |
 | `collection_batches` | Un lot de collecte, **même sans candidat** |
 | `model_registry` | Statut de validation persistant par `(model_id, version)` |
 

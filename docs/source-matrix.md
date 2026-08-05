@@ -103,13 +103,21 @@ ne prouvaient rien sur la collecte.
 | `double_chance` | football | Double chance | ✅ | ✅ par événement | ✅ |
 | `h2h_3_way_h1` | football | 1X2 première mi-temps | ✅ | ✅ par événement | ✅ |
 | `totals_h1` | football | Total buts première mi-temps | ✅ | ✅ par événement | ✅ |
-| `double_chance_h1` | football | Double chance première mi-temps | ✅ | ✅ par événement | ❌ aucune fixture |
-| `h2h` | tennis | Vainqueur du match | ✅ | ✅ appel groupé | ✅ |
-| `totals` | tennis | Total de jeux | ✅ | ⛔ **désactivé** | — (sémantique jeux/sets non confirmée) |
+| `double_chance_h1` | football | Double chance première mi-temps | ✅ | ✅ par événement | ✅ |
+| `h2h` | tennis | Vainqueur du match | ✅ | ✅ appel groupé (**seul marché tennis**) | ✅ |
+| `totals` | tennis | Total de jeux | ✅ | ⛔ **ni demandé ni facturé** | — (sémantique jeux/sets non confirmée) |
 
-« Persisté sur fixture » veut dire : un test sans réseau vérifie la requête émise
-**puis** le snapshot produit. Aucune de ces lignes n'a été confirmée contre le service
-réel — l'adaptateur reste `IMPLEMENTED_UNVERIFIED`.
+« Persisté sur fixture » veut dire : un test sans réseau vérifie la requête émise,
+**puis** le mapping des sélections, **puis** le snapshot enregistré en base. Aucune de
+ces lignes n'a été confirmée contre le service réel — l'adaptateur reste
+`IMPLEMENTED_UNVERIFIED`.
+
+**La politique est par sport, pas globale.** `core_markets_for(sport)` et
+`additional_markets_for(sport)` décident quoi demander. Une constante unique
+demandait `totals` pour le tennis alors que ce document le déclare désactivé : nous
+payions un prix que le mapper refusait ensuite. Ce qui n'est pas demandé n'est pas
+facturé, et la requête est le seul endroit qui puisse le garantir — un test vérifie
+que la requête tennis contient exactement `h2h` et ne réserve qu'un crédit.
 
 Les marchés par événement coûtent une requête chacun. Ils passent par le même contrôle
 budgétaire que le reste et sont **ignorés avec un motif rapporté** quand la marge
@@ -162,10 +170,59 @@ réservation est ensuite rapprochée de `x-requests-last`. En-tête absent : l'e
 est conservée (coût inconnu = pire cas). Erreur de transport sans réponse : la
 réservation est libérée.
 
-Deux workers d'une même base ne peuvent donc pas dépasser ensemble le plafond
-journalier — ce qui était le cas avec le compteur en mémoire du client. La
-sérialisation repose sur le verrou d'écriture du moteur ; elle est testée sur SQLite,
-pas sur PostgreSQL.
+Deux workers d'une même base ne peuvent pas dépasser ensemble le plafond journalier.
+La primitive de synchronisation est **une ligne par `(fournisseur, jour UTC)`** mise à
+jour par un UPDATE conditionnel :
+
+```sql
+UPDATE provider_budget_days
+   SET reserved_total = reserved_total + :cost
+ WHERE provider = :p AND day_utc = :d
+   AND reserved_total + :cost <= :plafond
+```
+
+PostgreSQL verrouille la ligne et **réévalue la clause WHERE sur le tuple mis à
+jour**, donc le perdant modifie zéro ligne. SQLite sérialise. Les deux sont testés,
+PostgreSQL avec des sessions distinctes et une barrière.
+
+L'ancienne version faisait `SELECT SUM(...)` puis `INSERT`. C'est correct sur SQLite
+pour une mauvaise raison — SQLite sérialise tous les écrivains — et **faux sur
+PostgreSQL** en `READ COMMITTED` : deux transactions lisent le même total et insèrent
+toutes les deux. Deux réservations qui tiennent isolément dépassaient ensemble le
+plafond.
+
+### Erreurs réseau — ce qu'on peut prouver, et ce qu'on facture
+
+Un timeout ne coûte pas forcément zéro. Le partage se fait sur les **preuves** :
+
+| Échec | Requête reçue ? | Réservation |
+|---|---|---|
+| `ConnectError`, `ConnectTimeout`, `PoolTimeout` | impossible | **libérée** |
+| `LocalProtocolError`, `UnsupportedProtocol`, `InvalidURL` | impossible | **libérée** |
+| `ReadTimeout` | envoyée, réponse en retard | **conservée à l'estimation** |
+| `WriteTimeout`, `WriteError` | envoi interrompu | **conservée** |
+| `ReadError`, `RemoteProtocolError` | réponse tronquée | **conservée** |
+| Réponse HTTP, `x-requests-last` présent | oui | rapprochée au coût réel |
+| Réponse HTTP, en-tête absent | oui, coût inconnu | **conservée à l'estimation** |
+| Réponse 4xx/5xx | oui, servie | facturée |
+
+La version précédente libérait sur **tout** `TransportError` et le documentait comme
+« aucune réponse, donc aucun crédit ». Un timeout de lecture signifie que la requête
+est partie et que la réponse a tardé : le fournisseur a peut-être servi et facturé.
+Sous-compter la dépense est la seule direction dans laquelle un budget ne doit jamais
+se tromper.
+
+Conséquence utile : une série de timeouts de lecture épuise le budget du scan au lieu
+de boucler gratuitement, donc les retries ne peuvent dépasser aucun plafond.
+
+### Audit
+
+```bash
+betmaxxing budget audit --provider the_odds_api
+```
+
+Compare le compteur journalier au détail qu'il résume et sort en erreur s'ils
+divergent.
 
 ### Historique (payant) — estimation seule
 

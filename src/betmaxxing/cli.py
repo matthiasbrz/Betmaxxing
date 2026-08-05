@@ -22,6 +22,7 @@ from betmaxxing.domain.models import (
 )
 from betmaxxing.domain.timeutil import format_display, utc_now
 from betmaxxing.engine.acquisition import AcquisitionService
+from betmaxxing.ingestion.identity import EventIdentityService
 from betmaxxing.providers.manual import ManualImportError, load_csv
 from betmaxxing.storage.db import create_all, session_scope
 from betmaxxing.storage.repositories import EventRepository, OddsRepository, ScanRepository
@@ -34,8 +35,16 @@ app = typer.Typer(
 )
 odds_app = typer.Typer(help="Gestion des cotes (import manuel horodaté).")
 db_app = typer.Typer(help="Gestion de la base de données.")
+identity_app = typer.Typer(help="Identité des événements : revues d'ambiguïté et alias.")
+reviews_app = typer.Typer(help="File des rapprochements que la machine a refusé de trancher.")
+aliases_app = typer.Typer(help="Orthographes alternatives des participants, par source.")
+budget_app = typer.Typer(help="Consommation de crédits fournisseur.")
+identity_app.add_typer(reviews_app, name="reviews")
+identity_app.add_typer(aliases_app, name="aliases")
 app.add_typer(odds_app, name="odds")
 app.add_typer(db_app, name="db")
+app.add_typer(identity_app, name="identity")
+app.add_typer(budget_app, name="budget")
 
 console = Console()
 
@@ -375,6 +384,263 @@ def db_scans(limit: Annotated[int, typer.Option()] = 10) -> None:
             row.config_fingerprint,
         )
     console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# Identity: reviews and aliases
+# ---------------------------------------------------------------------------
+# Both mechanisms shipped in the previous tranche with no way to operate them.
+# A review queue nobody can read, and an alias table nothing can populate, are
+# not controls — they are places where a control could go. These commands are
+# deliberately CLI-only: the web interface is a later tranche, and an operator
+# should not have to write SQL in the meantime.
+
+
+def _candidates(review: dict[str, object]) -> list[str]:
+    value = review.get("candidate_internal_ids")
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def _identity_service() -> EventIdentityService:
+    settings = get_settings()
+    create_all(settings)
+    return EventIdentityService(settings)
+
+
+@reviews_app.command("list")
+def identity_reviews_list(
+    as_json: Annotated[bool, typer.Option("--json", help="Sortie JSON brute.")] = False,
+) -> None:
+    """Ambiguïtés en attente d'une décision humaine."""
+    pending = _identity_service().pending_review()
+    if as_json:
+        console.print_json(json.dumps(pending, ensure_ascii=False))
+        return
+    if not pending:
+        console.print("[green]Aucune ambiguïté en attente.[/green]")
+        return
+
+    table = Table(title="Rapprochements à trancher", show_lines=False)
+    table.add_column("ID", justify="right")
+    table.add_column("Fournisseur")
+    table.add_column("Id source")
+    table.add_column("Rencontre")
+    table.add_column("Coup d'envoi")
+    table.add_column("Candidats", justify="right")
+    for review in pending:
+        table.add_row(
+            str(review["id"]),
+            str(review["provider"]),
+            str(review["provider_event_id"]),
+            str(review["label"]),
+            str(review["start_time_utc"]),
+            str(len(_candidates(review))),
+        )
+    console.print(table)
+    console.print(
+        "[yellow]Aucune de ces cotes n'est rattachée.[/yellow] Tranchez avec "
+        "`betmaxxing identity reviews resolve <id> --event-id <internal_id> "
+        "--operator <vous>`."
+    )
+
+
+@reviews_app.command("show")
+def identity_reviews_show(review_id: int) -> None:
+    """Détail d'une revue, avec les événements qui correspondaient."""
+    from betmaxxing.ingestion.identity import ReviewNotFound
+
+    try:
+        review = _identity_service().review(review_id)
+    except ReviewNotFound as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print(
+        Panel(
+            f"[bold]{review['label']}[/bold]\n"
+            f"Fournisseur   : {review['provider']} / {review['provider_event_id']}\n"
+            f"Sport         : {review['sport']}\n"
+            f"Compétition   : {review['competition']}\n"
+            f"Coup d'envoi  : {review['start_time_utc']}\n"
+            f"Statut        : {'tranchée' if review['resolved'] else 'en attente'}",
+            title=f"Revue d'identité {review_id}",
+        )
+    )
+    table = Table(title="Événements existants qui correspondaient")
+    table.add_column("internal_id")
+    for candidate in _candidates(review):
+        table.add_row(str(candidate))
+    console.print(table)
+    console.print(str(review["detail"]))
+    if review["resolved"]:
+        console.print(
+            f"Tranchée par [bold]{review['resolved_by']}[/bold] le {review['resolved_at']} "
+            f"→ {review['resolved_internal_id']}"
+        )
+
+
+@reviews_app.command("resolve")
+def identity_reviews_resolve(
+    review_id: int,
+    event_id: Annotated[
+        str,
+        typer.Option(
+            "--event-id",
+            help="internal_id de l'événement choisi. Doit figurer parmi les candidats.",
+        ),
+    ],
+    operator: Annotated[
+        str, typer.Option("--operator", help="Qui prend la décision (conservé).")
+    ] = "",
+) -> None:
+    """Rattacher une ambiguïté à l'événement que **vous** désignez.
+
+    Il n'existe volontairement aucune résolution automatique : la file existe
+    précisément parce que la machine n'a pas pu trancher.
+    """
+    from betmaxxing.ingestion.identity import (
+        ReviewAlreadyResolved,
+        ReviewNotFound,
+        ReviewResolutionRejected,
+    )
+
+    if not operator.strip():
+        console.print("[red]--operator est requis : une décision a un auteur.[/red]")
+        raise typer.Exit(code=2)
+
+    try:
+        _identity_service().resolve_review(
+            review_id, internal_id=event_id, operator=operator.strip()
+        )
+    except ReviewNotFound as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    except ReviewAlreadyResolved as exc:
+        console.print(f"[red]Revue déjà tranchée : {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    except ReviewResolutionRejected as exc:
+        console.print(f"[red]Refusé : {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print(
+        f"[green]Revue {review_id} tranchée[/green] : les prochaines cotes de cette "
+        f"source iront sur {event_id}."
+    )
+    console.print(
+        "Les snapshots déjà enregistrés ne sont pas réattribués — une décision "
+        "d'aujourd'hui ne réécrit pas ce qu'un scan passé a observé."
+    )
+
+
+@aliases_app.command("import")
+def identity_aliases_import(
+    path: Annotated[Path, typer.Argument(help="CSV : sport,alias,canonical_participant_id,source")],
+    as_json: Annotated[bool, typer.Option("--json", help="Sortie JSON brute.")] = False,
+) -> None:
+    """Charger des alias de participants. Idempotent, lignes fautives en quarantaine."""
+    import csv
+
+    from betmaxxing.ingestion.identity import AliasRow
+
+    if not path.exists():
+        console.print(f"[red]Fichier introuvable : {path}[/red]")
+        raise typer.Exit(code=2)
+
+    rows: list[AliasRow] = []
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        required = {"sport", "alias", "canonical_participant_id", "source"}
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            console.print(f"[red]Colonnes manquantes : {', '.join(sorted(missing))}[/red]")
+            raise typer.Exit(code=2)
+        # Line numbers count the header, so the operator can open the file and
+        # find the offending row directly.
+        for number, record in enumerate(reader, start=2):
+            rows.append(
+                AliasRow(
+                    line=number,
+                    sport=(record.get("sport") or "").strip(),
+                    alias=(record.get("alias") or "").strip(),
+                    canonical_participant_id=(record.get("canonical_participant_id") or "").strip(),
+                    source=(record.get("source") or "").strip(),
+                )
+            )
+
+    report = _identity_service().import_aliases(rows)
+    if as_json:
+        console.print_json(json.dumps(report.as_dict(), ensure_ascii=False))
+        return
+
+    console.print(
+        f"Importés : [green]{report.imported}[/green] · "
+        f"inchangés : {report.unchanged} · "
+        f"en quarantaine : [yellow]{len(report.quarantined)}[/yellow]"
+    )
+    if report.quarantined:
+        table = Table(title="Lignes en quarantaine (aucune n'a été importée)")
+        table.add_column("Ligne", justify="right")
+        table.add_column("Raison")
+        for item in report.quarantined:
+            table.add_row(str(item["line"]), str(item["reason"]))
+        console.print(table)
+
+
+@aliases_app.command("list")
+def identity_aliases_list(
+    sport: Annotated[str, typer.Option("--sport", help="Filtrer par sport.")] = "",
+    source: Annotated[str, typer.Option("--source", help="Filtrer par source.")] = "",
+    as_json: Annotated[bool, typer.Option("--json", help="Sortie JSON brute.")] = False,
+) -> None:
+    """Alias déclarés, consultés par le rapprochement inter-fournisseurs."""
+    rows = _identity_service().aliases(sport=sport or None, source=source or None)
+    if as_json:
+        console.print_json(json.dumps(rows, ensure_ascii=False))
+        return
+    if not rows:
+        console.print("Aucun alias déclaré.")
+        return
+    table = Table(title="Alias de participants")
+    table.add_column("Sport")
+    table.add_column("Alias")
+    table.add_column("Participant canonique")
+    table.add_column("Source")
+    for row in rows:
+        table.add_row(row["sport"], row["alias"], row["canonical_participant_id"], row["source"])
+    console.print(table)
+
+
+@budget_app.command("audit")
+def budget_audit(
+    provider: Annotated[str, typer.Option("--provider", help="Fournisseur à auditer.")] = (
+        "the_odds_api"
+    ),
+) -> None:
+    """Vérifier que le compteur journalier correspond au détail qu'il résume."""
+    from betmaxxing.providers.budget import ProviderBudgetLedger
+
+    settings = get_settings()
+    create_all(settings)
+    ledger = ProviderBudgetLedger(settings)
+    invariant = ledger.verify_invariant(provider, utc_now())
+    console.print(invariant.describe())
+    entries = ledger.entries_for_day(utc_now(), provider)
+    if entries:
+        table = Table(title=f"Tentatives du jour — {provider}")
+        table.add_column("Requête")
+        table.add_column("Réservé", justify="right")
+        table.add_column("Constaté", justify="right")
+        table.add_column("Libéré")
+        for entry in entries:
+            table.add_row(
+                entry.request,
+                str(entry.reserved_cost),
+                "—" if entry.observed_cost is None else str(entry.observed_cost),
+                "oui" if entry.released else "non",
+            )
+        console.print(table)
+    if not invariant:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":  # pragma: no cover

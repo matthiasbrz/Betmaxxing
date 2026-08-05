@@ -21,6 +21,29 @@ env:
 jobs:
   quality:
     runs-on: ubuntu-latest
+
+    services:
+      # A real PostgreSQL, holding nothing but test rows. Concurrency claims that
+      # only hold on SQLite are not concurrency claims: SQLite serialises every
+      # writer behind one database-level lock, so `SELECT SUM(...)` then `INSERT`
+      # looks atomic there and is not under READ COMMITTED. The suite skips
+      # loudly when the URL is unset, and the guard below fails the build if it is.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: betmaxxing
+          POSTGRES_PASSWORD: betmaxxing
+          POSTGRES_DB: betmaxxing_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U betmaxxing"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      BETMAXXING_TEST_POSTGRES_URL: postgresql+psycopg://betmaxxing:betmaxxing@localhost:5432/betmaxxing_test
+
     steps:
       - uses: actions/checkout@v4
 
@@ -32,7 +55,20 @@ jobs:
       - name: Install (pinned resolution)
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]" -c constraints.txt
+          pip install -e ".[dev,postgres]" -c constraints.txt
+
+      - name: The PostgreSQL suite is not silently skipped
+        run: |
+          # A skipped concurrency suite is indistinguishable from a passing one in
+          # the summary, so the presence of the URL is asserted, not assumed.
+          test -n "$BETMAXXING_TEST_POSTGRES_URL"
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+          engine = create_engine(os.environ["BETMAXXING_TEST_POSTGRES_URL"])
+          with engine.connect() as connection:
+              print("PostgreSQL:", connection.execute(text("SHOW server_version")).scalar_one())
+          PY
 
       - name: Lint (whole repository, migrations included)
         run: ruff check .
@@ -43,13 +79,24 @@ jobs:
       - name: Type check
         run: mypy
 
-      - name: Tests (console script, warnings fatal)
+      - name: Tests (console script, warnings fatal, SQLite + PostgreSQL)
         # The console script, not `python -m pytest`: the two resolve imports
         # differently and a suite that only collects under one of them is not a
         # suite. `-W error` is redundant with pyproject's `filterwarnings =
         # ["error"]` and passed anyway, so this step still fails on a warning
         # even if someone loosens the ini file.
         run: pytest -W error --cov=betmaxxing --cov-report=term-missing
+
+      - name: The PostgreSQL concurrency suite actually ran
+        # `-m postgres` with `--strict-markers`: if every one of these skipped,
+        # nothing proved the claims the documentation makes about PostgreSQL.
+        run: |
+          pytest -W error -m postgres -q -rs | tee /tmp/pg.log
+          if grep -qE "^[0-9]+ skipped" /tmp/pg.log; then
+            echo "::error::the PostgreSQL suite was skipped — the cluster was unreachable"
+            exit 1
+          fi
+          grep -qE "[0-9]+ passed" /tmp/pg.log
 
       - name: The two pytest invocations collect the same suite
         run: |
@@ -58,6 +105,9 @@ jobs:
           echo "pytest:          $script_count"
           echo "python -m pytest: $module_count"
           test "$script_count" = "$module_count"
+
+      - name: python -m pytest also passes with warnings fatal
+        run: python -m pytest -W error -q
 
       - name: No warning filter hides the Starlette/httpx deprecation
         run: |
@@ -78,6 +128,14 @@ jobs:
         run: |
           alembic upgrade 65c32b5e3f63
           alembic upgrade head
+
+      - name: Migrations apply to a fresh PostgreSQL
+        env:
+          BETMAXXING_DATABASE_URL: postgresql+psycopg://betmaxxing:betmaxxing@localhost:5432/betmaxxing_migrations
+        run: |
+          PGPASSWORD=betmaxxing createdb -h localhost -U betmaxxing betmaxxing_migrations
+          alembic upgrade head
+          alembic check
 
       - name: Migrations apply from the previous tranche's schema
         env:

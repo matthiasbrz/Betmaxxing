@@ -341,16 +341,80 @@ class EventMappingReviewRow(Base):
     detail: Mapped[str] = mapped_column(Text)
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     resolved: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    #: Audit trail of the human decision. A queue with no record of who decided
+    #: what, and when, is not reviewable after the fact.
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resolved_internal_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class NotificationOutboxRow(Base):
+    """At-most-once external effects, keyed by the job that produced them.
+
+    A fencing token stops a worker that lost its lease from acknowledging. It
+    cannot unsend a message. So the send itself has to be idempotent: claiming a
+    row here is what authorises one delivery, and the unique constraint is what
+    makes a re-executed job silent rather than noisy.
+    """
+
+    __tablename__ = "notification_outbox"
+    __table_args__ = (
+        UniqueConstraint("job_id", "alert_key", "channel", name="uq_notification_effect"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(32), index=True)
+    alert_key: Mapped[str] = mapped_column(String(64))
+    channel: Mapped[str] = mapped_column(String(32))
+    claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ProviderBudgetDayRow(Base):
+    """The **synchronisation point** for one provider's daily spend.
+
+    Exactly one row per ``(provider, day_utc)``. Reserving is a single
+    conditional UPDATE against it:
+
+    .. code-block:: sql
+
+        UPDATE provider_budget_days
+           SET reserved_total = reserved_total + :cost
+         WHERE provider = :p AND day_utc = :d
+           AND reserved_total + :cost <= :ceiling
+
+    That is atomic on both engines. PostgreSQL takes a row lock and
+    **re-evaluates the WHERE clause against the updated row** once the lock is
+    released, so a second transaction sees the first one's increment and its own
+    condition fails. SQLite serialises writers outright.
+
+    The previous design read ``SELECT SUM(...)`` over the detail table and then
+    inserted. Under SQLite that happens to look atomic because every writer is
+    serialised anyway; under PostgreSQL in ``READ COMMITTED`` both transactions
+    read the same total and both insert, so two reservations that each fit alone
+    together overshoot the ceiling. The detail table is still written — it is the
+    audit trail — but it is no longer the primitive anything synchronises on.
+    """
+
+    __tablename__ = "provider_budget_days"
+
+    provider: Mapped[str] = mapped_column(String(64), primary_key=True)
+    #: ``YYYY-MM-DD`` in UTC: the provider's quota window is a UTC calendar day,
+    #: so a local-time window would leak spend across the boundary.
+    day_utc: Mapped[str] = mapped_column(String(10), primary_key=True)
+    #: Authoritative committed spend for the day. Never negative.
+    reserved_total: Mapped[int] = mapped_column(Integer, default=0)
+    #: Sum of costs the provider actually reported, for reconciliation reporting.
+    observed_total: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class ProviderBudgetLedgerRow(Base):
-    """Durable credit reservations, one row per attempted provider request.
+    """Audit detail: one row per attempted provider request.
 
-    A per-process counter cannot bound spending: it resets with the process, and
-    two workers each get a private allowance. Reserving here *before* every
-    attempt — including a retry — is what makes the daily ceiling real, and
-    reconciling ``observed_cost`` against ``x-requests-last`` is what keeps the
-    reservation honest once the response arrives.
+    Reserved cost, the cost the provider reported, and whether the reservation
+    was released because the request demonstrably never arrived. Read for
+    reporting and reconciliation; never used as a lock.
     """
 
     __tablename__ = "provider_budget_ledger"

@@ -56,25 +56,51 @@ logger = logging.getLogger("betmaxxing.the_odds_api")
 
 PROVIDER_NAME = "the_odds_api"
 
-#: Markets requested in the grouped, one-call-per-league request.
-CORE_MARKETS = ("h2h", "totals")
+#: Markets requested in the grouped, one-call-per-league request, **per sport**.
+#:
+#: A single global tuple was wrong: it asked for tennis ``totals``, which the
+#: project documents as disabled until the games-versus-sets semantics is
+#: confirmed. Every market in that call is billed, so we were paying for a price
+#: the mapper then refused — the worst of both worlds. What is not requested is
+#: not billed, and the request is the only place that can enforce it.
+CORE_MARKETS_BY_SPORT: dict[Sport, tuple[str, ...]] = {
+    Sport.FOOTBALL: ("h2h", "totals"),
+    Sport.TENNIS: ("h2h",),
+}
 
-#: Additional football markets. v4 exposes these on the **per-event** endpoint
+#: Additional markets, per sport. v4 exposes these on the **per-event** endpoint
 #: only, so they cost one request per event and are attempted after the core
-#: call, under the same budget gate. Declaring them in ``MARKET_MAP`` is not the
-#: same as collecting them — the previous version did only the former.
-ADDITIONAL_FOOTBALL_MARKETS = (
-    "draw_no_bet",
-    "double_chance",
-    "h2h_3_way_h1",
-    "totals_h1",
-    "double_chance_h1",
-)
+#: call, under the same budget gate. Declaring a key in ``MARKET_MAP`` is not the
+#: same as collecting it — the previous version did only the former.
+ADDITIONAL_MARKETS_BY_SPORT: dict[Sport, tuple[str, ...]] = {
+    Sport.FOOTBALL: (
+        "draw_no_bet",
+        "double_chance",
+        "h2h_3_way_h1",
+        "totals_h1",
+        "double_chance_h1",
+    ),
+    Sport.TENNIS: (),
+}
 
-#: Cost, in credits, this adapter is willing to spend per event on the optional
-#: markets. Beyond it the core prices are kept and the extras are skipped: an
-#: incomplete market set is a normal, reportable outcome.
+#: Kept for callers that still import it; football's grouped set.
+CORE_MARKETS = CORE_MARKETS_BY_SPORT[Sport.FOOTBALL]
+ADDITIONAL_FOOTBALL_MARKETS = ADDITIONAL_MARKETS_BY_SPORT[Sport.FOOTBALL]
+
+#: Credits of daily headroom required before the optional markets are attempted.
+#: Below it the core prices are kept and the extras are skipped: an incomplete
+#: market set is a normal, reportable outcome.
 ADDITIONAL_MARKET_MIN_HEADROOM = 4
+
+
+def core_markets_for(sport: Sport) -> tuple[str, ...]:
+    """Grouped markets to request for one sport. Never a global default."""
+    return CORE_MARKETS_BY_SPORT.get(sport, ())
+
+
+def additional_markets_for(sport: Sport) -> tuple[str, ...]:
+    """Per-event markets to attempt for one sport, budget permitting."""
+    return ADDITIONAL_MARKETS_BY_SPORT.get(sport, ())
 
 
 class TheOddsApiProvider:
@@ -159,14 +185,20 @@ class TheOddsApiProvider:
             sport = classify_sport(sport_key)
             if sport is None:
                 continue
+            markets = core_markets_for(sport)
+            if not markets:
+                batch.partial_errors.append(
+                    f"{sport_key} : aucun marché autorisé pour {sport} — non interrogé."
+                )
+                continue
             attempted += 1
             try:
-                cost = estimate_cost(markets=len(CORE_MARKETS), regions=regions)
+                cost = estimate_cost(markets=len(markets), regions=regions)
                 response = self._client.get(
                     f"sports/{sport_key}/odds",
                     params={
                         "regions": self._settings.the_odds_api_regions,
-                        "markets": ",".join(CORE_MARKETS),
+                        "markets": ",".join(markets),
                         "oddsFormat": "decimal",
                         "dateFormat": "iso",
                         "bookmakers": ",".join(self._bookmakers),
@@ -194,7 +226,7 @@ class TheOddsApiProvider:
                 any_event_seen = True
                 seen = self._ingest_event(raw_event, sport, window, received_at, batch)
                 any_bookmaker_seen = any_bookmaker_seen or seen
-                if seen and sport is Sport.FOOTBALL:
+                if seen and additional_markets_for(sport):
                     self._collect_additional_markets(
                         sport_key, raw_event, sport, window, received_at, batch, regions
                     )
@@ -313,7 +345,8 @@ class TheOddsApiProvider:
         place and is reported, never silently swallowed.
         """
         event_id = str(raw_event.get("id") or "")
-        if not event_id:
+        extra = additional_markets_for(sport)
+        if not event_id or not extra:
             return
         remaining = self._budget.remaining_today(self.name, self._now)
         if remaining is not None and remaining < ADDITIONAL_MARKET_MIN_HEADROOM:
@@ -328,12 +361,12 @@ class TheOddsApiProvider:
                 f"sports/{sport_key}/events/{event_id}/odds",
                 params={
                     "regions": self._settings.the_odds_api_regions,
-                    "markets": ",".join(ADDITIONAL_FOOTBALL_MARKETS),
+                    "markets": ",".join(extra),
                     "oddsFormat": "decimal",
                     "dateFormat": "iso",
                     "bookmakers": ",".join(self._bookmakers),
                 },
-                cost=estimate_cost(markets=len(ADDITIONAL_FOOTBALL_MARKETS), regions=regions),
+                cost=estimate_cost(markets=len(extra), regions=regions),
             )
         except BudgetExceeded as exc:
             batch.partial_errors.append(f"{event_id} : marchés additionnels ignorés — {exc}")
