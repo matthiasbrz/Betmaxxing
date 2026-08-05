@@ -105,11 +105,29 @@ class Settings(BaseSettings):
     max_stake_pct_of_bankroll: float = Field(default=0.01, gt=0, le=0.1)
     max_daily_exposure_pct: float = Field(default=0.05, gt=0, le=0.5)
 
+    # -- challenge (opt-in, simulation only) --------------------------------
+    challenge_enabled: bool = Field(
+        default=False,
+        description="Challenge — Montante. Off by default; mutating endpoints 404 when off.",
+    )
+
     # -- providers ----------------------------------------------------------
     winamax_mode: str = "manual"
     odds_provider: str = "demo"
+    #: Deprecated generic key. Prefer BETMAXXING_THE_ODDS_API_KEY.
     odds_api_key: str = ""
     odds_api_base_url: str = ""
+    the_odds_api_key: str = ""
+    the_odds_api_base_url: str = "https://api.the-odds-api.com/v4"
+    #: Comma-separated bookmaker keys, e.g. "winamax_fr".
+    bookmakers: str = "winamax_fr"
+    the_odds_api_regions: str = "eu,fr"
+    the_odds_api_sport_keys: str = (
+        "soccer_france_ligue_one,soccer_epl,soccer_spain_la_liga,tennis_atp_aus_open_singles"
+    )
+    #: Credit budgets. A request estimated above these is refused before it runs.
+    provider_budget_per_scan: int = 50
+    provider_budget_per_day: int = 450
     sportsdata_provider: str = "demo"
     sportsdata_api_key: str = ""
     provider_timeout_seconds: float = 10.0
@@ -168,6 +186,34 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def bookmaker_list(self) -> list[str]:
+        return [b.strip() for b in self.bookmakers.split(",") if b.strip()]
+
+    @property
+    def the_odds_api_sport_key_list(self) -> list[str]:
+        return [k.strip() for k in self.the_odds_api_sport_keys.split(",") if k.strip()]
+
+    @property
+    def resolved_the_odds_api_key(self) -> str:
+        """The Odds API key, honouring the deprecated generic variable.
+
+        Returns the value only; callers must never log it. The deprecation is
+        surfaced by :meth:`deprecation_warnings`, which names the variable but
+        never its content.
+        """
+        return self.the_odds_api_key or self.odds_api_key
+
+    def deprecation_warnings(self) -> list[str]:
+        out: list[str] = []
+        if not self.the_odds_api_key and self.odds_api_key:
+            out.append(
+                "BETMAXXING_ODDS_API_KEY est déprécié — utilisez "
+                "BETMAXXING_THE_ODDS_API_KEY. La valeur actuelle est reprise "
+                "temporairement."
+            )
+        return out
 
     @property
     def requires_real_providers(self) -> bool:

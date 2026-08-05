@@ -3,6 +3,17 @@
 Les deux modèles sont au statut **`BACKTEST_ONLY`**. Aucun n'a été validé hors
 échantillon. Le mode `live_analysis` refuse structurellement leurs candidats.
 
+> **Méthode d'incertitude : aucune (`UNAVAILABLE`).**
+>
+> Ni l'un ni l'autre ne sait produire une incertitude défendable sur sa
+> probabilité. Conséquence, hors mode démo : `ev_conservative` vaut `null` et
+> tout candidat est rejeté avec `UNCERTAINTY_UNAVAILABLE`.
+>
+> En mode démo, une incertitude **synthétique** étiquetée
+> `SYNTHETIC — NE PAS PARIER` est produite pour exercer l'interface. Elle ne
+> constitue pas une estimation de précision et ne peut pas atteindre `paper` ni
+> `live_analysis`. Voir D-019.
+
 ---
 
 ## `football-dixon-coles-v1`
@@ -47,15 +58,21 @@ exactement la même transformation paramètres → probabilités.
 Les marchés mi-temps reçoivent une taille d'échantillon effective divisée par deux et une
 complétude réduite : ils reposent sur une constante, pas sur un paramètre ajusté.
 
-### `INFORMATION_PER_MATCH = 2.5`
+### `SYNTHETIC_INFORMATION_PER_MATCH = 2.5` — démo uniquement
 
-Un match observé apporte deux *comptages* de buts, pas un bit victoire/défaite, et les
-paramètres attaque/défense sont mutualisés sur toute la ligue. Traiter N matchs comme N
-tirages de Bernoulli élargit excessivement tous les intervalles.
+Anciennement `INFORMATION_PER_MATCH`, présentée comme une incertitude de modèle.
+Elle ne l'était pas : un intervalle de Wilson décrit une proportion binomiale
+observée et ne propage ni l'erreur d'estimation des paramètres, ni la calibration,
+ni les dépendances. Voir D-019.
 
-**Constante provisoire et falsifiable.** Le protocole la teste par couverture
-d'intervalles : un intervalle nominal à 90 % doit couvrir ~90 % du temps. Une valeur trop
-haute se manifeste par une couverture insuffisante.
+Cette constante ne sert plus qu'à donner à la sortie de démonstration la bonne
+*forme*. Elle n'a **aucun effet** hors mode démo.
+
+### Marchés avec remboursement
+
+Le draw-no-bet expose désormais la probabilité de nul comme **push** explicite, et
+l'EV vient de la distribution de règlement. La forme conditionnelle précédente
+surestimait la magnitude de l'EV de `1/(1 − p_nul)`.
 
 ---
 
@@ -103,10 +120,9 @@ Le point le plus important : le modèle **ne prédit pas les abandons**. Un aban
 le règlement selon des règles propres à chaque bookmaker, et inventer une probabilité
 serait exactement ce que ce projet interdit. C'est déclaré, pas dissimulé.
 
-### `INFORMATION_PER_MATCH = 3.0`
+### `SYNTHETIC_INFORMATION_PER_MATCH = 3.0` — démo uniquement
 
-Un match fournit ~150 points de service pour estimer deux paramètres. Valeur supérieure
-au football pour cette raison. Même statut provisoire, même test de couverture.
+Même statut que côté football : superseded par D-019, sans effet hors démo.
 
 ---
 
@@ -117,5 +133,7 @@ au football pour cette raison. Même statut provisoire, même test de couverture
   jamais pour éviter un résultat vide.
 - Les diagnostics (λ, Elo utilisés, probabilités de service, jeux attendus) sont exposés
   et cités comme éléments sourcés dans l'explication.
+- Chaque candidat porte `model_id`, `model_version` et le statut **lu depuis le
+  registre** — plus aucune valeur codée en dur.
 - La complétude des features réduit la taille d'échantillon effective de façon
   quadratique : une entrée partielle pèse plus lourd qu'une remise linéaire.

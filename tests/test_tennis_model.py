@@ -27,7 +27,7 @@ from betmaxxing.models_ml.tennis import (
 )
 
 EVENT = CanonicalEvent(
-    canonical_id="tn-1",
+    internal_id="tn-1",
     sport=Sport.TENNIS,
     competition="ATP Masters 1000",
     surface="hard",
@@ -49,7 +49,7 @@ INPUTS = TennisInputs(
 
 @pytest.fixture
 def model() -> TennisHierarchicalModel:
-    return TennisHierarchicalModel({EVENT.canonical_id: INPUTS})
+    return TennisHierarchicalModel({EVENT.internal_id: INPUTS})
 
 
 class TestElo:
@@ -249,7 +249,7 @@ class TestSurface:
     def test_surface_elo_overrides_global_elo(self) -> None:
         surface_specific = TennisHierarchicalModel(
             {
-                EVENT.canonical_id: TennisInputs(
+                EVENT.internal_id: TennisInputs(
                     elo_home=1800,
                     elo_away=1800,
                     elo_home_surface=1950,

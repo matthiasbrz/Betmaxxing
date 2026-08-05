@@ -52,6 +52,38 @@ class TestScans:
         assert "rejections_summary" in payload
         assert "disclaimer" in payload
 
+    def test_collection_status_is_reported_separately(self, client: TestClient) -> None:
+        """ "No model" and "provider down" both give zero candidates; only one is
+        a fault, and the response has to say which."""
+        payload = client.post("/scans").json()
+        assert payload["collection_status"] in {
+            "OK",
+            "COLLECTED_NO_MODEL",
+            "NO_CANDIDATE",
+            "COVERAGE_MISSING",
+            "DATA_STALE",
+            "PROVIDER_ERROR",
+        }
+
+    def test_a_scan_persists_its_source_data(self, client: TestClient) -> None:
+        payload = client.post("/scans").json()
+        assert payload["data_health"]["snapshots_persisted"] > 0
+        assert payload["data_health"]["events_persisted"] > 0
+        assert payload["batch_id"]
+
+    def test_candidates_report_their_uncertainty_status(self, client: TestClient) -> None:
+        payload = client.post("/scans").json()
+        for candidate in payload["candidates"]:
+            uncertainty = candidate["probability"]["uncertainty"]
+            assert uncertainty["status"] == "SYNTHETIC"
+            assert "SYNTHETIC" in uncertainty["warning"]
+
+    def test_candidates_report_their_settlement_rule(self, client: TestClient) -> None:
+        payload = client.post("/scans").json()
+        for candidate in payload["candidates"]:
+            assert candidate["value"]["settlement_rule"]
+            assert candidate["value"]["payoff_outcomes"]
+
     def test_scan_is_retrievable_afterwards(self, client: TestClient) -> None:
         scan_id = client.post("/scans").json()["scan_id"]
         payload = client.get(f"/scans/{scan_id}").json()
@@ -75,7 +107,15 @@ class TestScans:
         assert response.status_code == 200
         assert "text/csv" in response.headers["content-type"]
         header = response.text.splitlines()[0]
-        for column in ("ev", "ev_conservative", "model_id", "validation_status"):
+        for column in (
+            "ev",
+            "ev_conservative",
+            "model_id",
+            "model_version",
+            "validation_status",
+            "uncertainty_status",
+            "settlement_rule",
+        ):
             assert column in header
 
     def test_unknown_scan_is_a_404(self, client: TestClient) -> None:
@@ -155,6 +195,64 @@ class TestChallengeEndpoints:
         payload = client.get(f"/challenges/{challenge_id}").json()
         assert "Aucune garantie" in payload["note"]
         assert "récupération" in payload["note"]
+
+
+class TestChallengeFeatureFlag:
+    """Off by default: a simulation module reachable by default is a trap."""
+
+    def test_routes_404_when_disabled(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:  # type: ignore[no-untyped-def]
+        from betmaxxing.config import get_settings, reset_settings_cache
+        from betmaxxing.storage.db import reset_engine
+
+        reset_engine()
+        reset_settings_cache()
+        monkeypatch.setenv("BETMAXXING_MODE", "demo")
+        monkeypatch.setenv("BETMAXXING_DATABASE_URL", f"sqlite+pysqlite:///{tmp_path / 'off.db'}")
+        monkeypatch.setenv("BETMAXXING_CHALLENGE_ENABLED", "false")
+        get_settings()
+
+        from betmaxxing.api.main import create_app
+
+        with TestClient(create_app()) as client:
+            response = client.post(
+                "/challenges", json={"initial_bank": 100.0, "target_bank": 200.0}
+            )
+            assert response.status_code == 404
+            assert "BETMAXXING_CHALLENGE_ENABLED" in response.json()["detail"]
+        reset_engine()
+        reset_settings_cache()
+
+
+class TestChallengeRiskControls:
+    def test_a_high_fraction_is_refused_without_acknowledgement(self, client: TestClient) -> None:
+        response = client.post(
+            "/challenges",
+            json={
+                "initial_bank": 100.0,
+                "target_bank": 400.0,
+                "fraction_per_step": 1.0,
+            },
+        )
+        assert response.status_code == 422
+        assert "perte totale" in response.json()["detail"]
+
+    def test_the_total_loss_risk_is_stated(self, client: TestClient) -> None:
+        payload = client.post(
+            "/challenges", json={"initial_bank": 100.0, "target_bank": 400.0}
+        ).json()
+        assert "banque est exposé" in payload["total_loss_risk"]
+
+    def test_a_challenge_survives_a_new_client(self, client: TestClient) -> None:
+        challenge_id = client.post(
+            "/challenges", json={"initial_bank": 100.0, "target_bank": 400.0}
+        ).json()["challenge_id"]
+        client.post(f"/challenges/{challenge_id}/activate")
+
+        from betmaxxing.api.main import create_app
+
+        with TestClient(create_app()) as fresh:
+            payload = fresh.get(f"/challenges/{challenge_id}").json()
+            assert payload["state"] == "WAITING_FOR_CANDIDATE"
 
 
 class TestNoBettingEndpoints:

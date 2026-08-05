@@ -96,11 +96,55 @@ class EventStatus(StrEnum):
 
 
 class ScanStatus(StrEnum):
-    """Top-level answer of a scan. ``NO_BET`` is a normal, expected outcome."""
+    """Top-level answer of a scan. ``NO_BET`` is a normal, expected outcome.
+
+    ``NO_CANDIDATE`` is an alias of ``NO_BET``: same wire value, clearer name at
+    the call site. Fine-grained reasons live in :class:`CollectionStatus`.
+    """
 
     CANDIDATES_FOUND = "CANDIDATES_FOUND"
     NO_BET = "NO_BET"
+    NO_CANDIDATE = "NO_BET"  # alias
     DATA_UNAVAILABLE = "DATA_UNAVAILABLE"
+
+
+class CollectionStatus(StrEnum):
+    """Why a scan produced what it produced.
+
+    Reported alongside ``ScanStatus`` so "we collected real data but have no
+    model" is never confused with "the provider is down". Both yield zero
+    candidates; only one is a fault.
+    """
+
+    OK = "OK"
+    #: Real data was collected and stored, but no model could price it.
+    COLLECTED_NO_MODEL = "COLLECTED_NO_MODEL"
+    #: Models ran; nothing cleared the gate. The normal outcome.
+    NO_CANDIDATE = "NO_CANDIDATE"
+    #: Provider answered correctly, but the configured bookmaker was absent.
+    COVERAGE_MISSING = "COVERAGE_MISSING"
+    #: Data was returned but is too old to act on.
+    DATA_STALE = "DATA_STALE"
+    #: The provider failed. This one *is* a fault.
+    PROVIDER_ERROR = "PROVIDER_ERROR"
+
+
+class UncertaintyStatus(StrEnum):
+    """Provenance of an uncertainty statement.
+
+    The distinction that matters: ``SYNTHETIC`` is a made-up number used to
+    exercise the interface, ``UNAVAILABLE`` is an honest "we cannot say", and
+    only ``VALIDATED`` may gate a real candidate. See D-019.
+    """
+
+    #: Deterministic placeholder, demo mode only. Never a basis for a bet.
+    SYNTHETIC = "SYNTHETIC"
+    #: No defensible method exists yet for this model. `ev_conservative` is null.
+    UNAVAILABLE = "UNAVAILABLE"
+    #: Produced by a real method that has not passed a coverage study.
+    ESTIMATED = "ESTIMATED"
+    #: Produced by a method whose coverage was validated by the protocol.
+    VALIDATED = "VALIDATED"
 
 
 class RejectionCode(StrEnum):
@@ -120,6 +164,11 @@ class RejectionCode(StrEnum):
     NO_MODEL_AVAILABLE = "NO_MODEL_AVAILABLE"
     EVENT_NOT_SCHEDULED = "EVENT_NOT_SCHEDULED"
     MISSING_LINE = "MISSING_LINE"
+    #: No defensible uncertainty method is available, so no conservative EV can
+    #: be computed. Outside demo this blocks publication outright.
+    UNCERTAINTY_UNAVAILABLE = "UNCERTAINTY_UNAVAILABLE"
+    #: The provider answered, but not for the configured bookmaker.
+    BOOKMAKER_COVERAGE_MISSING = "BOOKMAKER_COVERAGE_MISSING"
 
 
 class ValidationStatus(StrEnum):

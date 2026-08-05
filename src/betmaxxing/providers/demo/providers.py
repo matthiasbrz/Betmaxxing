@@ -13,6 +13,7 @@ from betmaxxing.domain.models import (
     SettlementResult,
 )
 from betmaxxing.domain.timeutil import is_in_window, utc_now
+from betmaxxing.providers.base import CollectionBatch, collect_via_listing
 from betmaxxing.providers.demo.world import (
     ALL_FIXTURES,
     DEMO_BOOKMAKER,
@@ -58,16 +59,20 @@ class DemoOddsProvider:
             if fixture.sport not in wanted:
                 continue
             event = build_event(fixture, self._now)
-            self._events[event.canonical_id] = event
+            self._events[event.internal_id] = event
             out.append(event)
         return out
 
+    def collect(self, sports: list[Sport], window: tuple[datetime, datetime]) -> CollectionBatch:
+        """Batch form of the same synthetic data, used by the acquisition path."""
+        return collect_via_listing(self, sports, window, self._now)
+
     def fetch_odds(self, events: list[CanonicalEvent]) -> list[OddsSnapshot]:
-        wanted = {e.canonical_id for e in events}
+        wanted = {e.internal_id for e in events}
         out: list[OddsSnapshot] = []
         for fixture in ALL_FIXTURES:
             event = build_event(fixture, self._now)
-            if event.canonical_id not in wanted:
+            if event.internal_id not in wanted:
                 continue
             out.extend(build_snapshots(fixture, event, self._now))
         return out
@@ -153,7 +158,7 @@ class DemoResultsProvider:
         if event.start_time_utc > utc_now():
             return None
         return SettlementResult(
-            event_canonical_id=event.canonical_id,
+            event_internal_id=event.internal_id,
             selection_key=selection_key,
             outcome=BetOutcome.PENDING,
             settled_at=utc_now(),

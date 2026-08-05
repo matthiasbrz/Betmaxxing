@@ -7,6 +7,7 @@ traced to the input that caused it. Nothing here is a subjective star rating.
 
 from __future__ import annotations
 
+from betmaxxing.domain.enums import UncertaintyStatus
 from betmaxxing.domain.models import DataQuality
 
 #: Component weights for the data-quality score. Must sum to 1.
@@ -85,11 +86,12 @@ def score_data_quality(
 def score_confidence(
     *,
     data_quality: float,
-    probability_half_width: float,
+    probability_half_width: float | None,
     max_half_width: float,
     ev: float,
     min_ev: float,
     model_validated: bool,
+    uncertainty_status: UncertaintyStatus = UncertaintyStatus.UNAVAILABLE,
 ) -> dict[str, object]:
     """Explainable confidence score in ``[0, 1]`` plus its decomposition.
 
@@ -97,7 +99,12 @@ def score_confidence(
     saturating at twice the threshold — being ten times over the bar is far more
     often a data error than a real edge, so it earns no extra confidence.
     """
-    precision = max(0.0, min(1.0, 1.0 - probability_half_width / max_half_width))
+    # No interval means no precision claim. Scoring it as zero is the honest
+    # reading: we cannot say the estimate is precise, so we do not.
+    if probability_half_width is None or uncertainty_status is UncertaintyStatus.UNAVAILABLE:
+        precision = 0.0
+    else:
+        precision = max(0.0, min(1.0, 1.0 - probability_half_width / max_half_width))
     if min_ev > 0:
         edge_margin = max(0.0, min(1.0, (ev - min_ev) / min_ev))
     else:
@@ -126,6 +133,7 @@ def score_confidence(
     return {
         "score": round(score, 4),
         "label": label,
+        "uncertainty_status": str(uncertainty_status),
         "components": {k: round(v, 4) for k, v in components.items()},
         "weights": CONFIDENCE_WEIGHTS,
         "limiting_factors": limiting,

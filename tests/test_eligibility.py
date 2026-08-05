@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 
 from betmaxxing.config import RunMode, Settings
-from betmaxxing.domain.enums import RejectionCode, ValidationStatus
+from betmaxxing.domain.enums import RejectionCode, UncertaintyStatus, ValidationStatus
 from betmaxxing.engine.eligibility import GateInput, evaluate
 
 
@@ -15,6 +15,7 @@ def passing(**overrides: object) -> GateInput:
     base: dict[str, object] = {
         "ev": 0.07,
         "ev_conservative": 0.01,
+        "uncertainty_status": UncertaintyStatus.ESTIMATED,
         "probability_half_width": 0.04,
         "odds": 1.76,
         "odds_age_seconds": 60.0,
@@ -92,6 +93,63 @@ class TestConjunctiveBehaviour:
     def test_primary_code_is_the_first_failure(self, config: Settings) -> None:
         result = evaluate(passing(in_scope=False, ev=0.0001), config)
         assert result.primary_code is RejectionCode.OUT_OF_SCOPE
+
+
+class TestUncertaintyGate:
+    """D-019: no usable uncertainty means no publication, whatever the EV."""
+
+    def test_unavailable_uncertainty_blocks_publication(self, config: Settings) -> None:
+        result = evaluate(
+            passing(
+                uncertainty_status=UncertaintyStatus.UNAVAILABLE,
+                ev_conservative=None,
+                probability_half_width=None,
+            ),
+            config,
+        )
+        assert not result.passed
+        assert RejectionCode.UNCERTAINTY_UNAVAILABLE in result.codes
+
+    def test_a_huge_ev_cannot_compensate_for_missing_uncertainty(self, config: Settings) -> None:
+        result = evaluate(
+            passing(
+                ev=5.0,
+                uncertainty_status=UncertaintyStatus.UNAVAILABLE,
+                ev_conservative=None,
+                probability_half_width=None,
+            ),
+            config,
+        )
+        assert not result.passed
+        assert RejectionCode.UNCERTAINTY_UNAVAILABLE in result.codes
+
+    @pytest.mark.parametrize("mode", [RunMode.PAPER, RunMode.LIVE_ANALYSIS])
+    def test_synthetic_uncertainty_is_refused_outside_demo(self, mode: RunMode) -> None:
+        config = Settings(mode=mode)
+        result = evaluate(
+            passing(
+                uncertainty_status=UncertaintyStatus.SYNTHETIC,
+                mode=mode,
+                validation_status=ValidationStatus.LIVE_ANALYSIS,
+            ),
+            config,
+        )
+        assert not result.passed
+        assert RejectionCode.UNCERTAINTY_UNAVAILABLE in result.codes
+
+    def test_synthetic_uncertainty_is_allowed_in_demo(self, config: Settings) -> None:
+        result = evaluate(passing(uncertainty_status=UncertaintyStatus.SYNTHETIC), config)
+        assert result.passed
+
+    def test_missing_conservative_ev_blocks_even_when_status_looks_fine(
+        self, config: Settings
+    ) -> None:
+        result = evaluate(
+            passing(uncertainty_status=UncertaintyStatus.ESTIMATED, ev_conservative=None),
+            config,
+        )
+        assert not result.passed
+        assert RejectionCode.UNCERTAINTY_UNAVAILABLE in result.codes
 
 
 class TestModelValidationGate:

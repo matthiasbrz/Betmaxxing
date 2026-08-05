@@ -30,6 +30,22 @@ def ensure_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def from_storage(value: datetime) -> datetime:
+    """Normalise a datetime read back from the database.
+
+    SQLite has no timezone-aware type, so a value written as UTC comes back
+    naive. Every timestamp this project writes is UTC by contract, so a naive
+    value read *from storage* is UTC — unlike a naive value arriving from a
+    provider or a user, which :func:`ensure_utc` still rejects.
+
+    Keeping the two cases in separate functions is deliberate: the permissive
+    reading must never be reachable from an ingestion path.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 def to_display(value: datetime, tz: ZoneInfo = PARIS) -> datetime:
     """Convert a UTC instant to the display timezone."""
     return ensure_utc(value).astimezone(tz)

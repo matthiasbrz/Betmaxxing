@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
@@ -35,7 +36,7 @@ def make_snapshot(**overrides: object) -> OddsSnapshot:
     base: dict[str, object] = {
         "provider": "demo",
         "bookmaker": "DEMO_BOOK",
-        "event_canonical_id": "football-20260804-abc123",
+        "event_internal_id": "evt_abc123",
         "event_source_id": "src-1",
         "selection": make_selection(),
         "decimal_odds": 1.63,
@@ -53,7 +54,7 @@ class TestSelectionIdentity:
 
     def test_line_is_forbidden_on_markets_that_have_none(self) -> None:
         with pytest.raises(ValidationError, match="must not carry a line"):
-            make_selection(line=2.5)
+            make_selection(line=Decimal("2.5"))
 
     def test_key_distinguishes_period(self) -> None:
         full = make_selection(period=Period.FULL_TIME)
@@ -156,7 +157,7 @@ class TestCanonicalIds:
 class TestCanonicalEvent:
     def test_label_reads_naturally(self) -> None:
         event = CanonicalEvent(
-            canonical_id="e1",
+            internal_id="e1",
             sport=Sport.FOOTBALL,
             competition="Ligue 1",
             home=Participant(canonical_id="p1", name="Lyon"),

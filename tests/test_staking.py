@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from betmaxxing.config import RunMode, Settings
+from betmaxxing.domain.enums import UncertaintyStatus
 from betmaxxing.engine.staking import compute_stake
 
 
@@ -29,6 +30,7 @@ class TestDisabledByDefault:
             odds=2.0,
             probability_conservative=0.6,
             probability_half_width=0.02,
+            uncertainty_status=UncertaintyStatus.ESTIMATED,
         )
         assert stake.amount == 0.0
         assert stake.capped_by == "staking_disabled"
@@ -39,6 +41,7 @@ class TestDisabledByDefault:
             odds=2.0,
             probability_conservative=0.6,
             probability_half_width=0.02,
+            uncertainty_status=UncertaintyStatus.ESTIMATED,
         )
         assert stake.amount == 0.0
         assert stake.capped_by == "no_bankroll"
@@ -53,6 +56,7 @@ class TestUncertaintyProducesZero:
             odds=2.0,
             probability_conservative=0.6,
             probability_half_width=0.50,
+            uncertainty_status=UncertaintyStatus.ESTIMATED,
         )
         assert stake.amount == 0.0
         assert stake.units == 0.0
@@ -66,6 +70,7 @@ class TestEdgeRequired:
             odds=2.0,
             probability_conservative=0.45,
             probability_half_width=0.02,
+            uncertainty_status=UncertaintyStatus.ESTIMATED,
         )
         assert stake.amount == 0.0
         assert stake.capped_by == "no_edge_conservative"
@@ -78,6 +83,7 @@ class TestEdgeRequired:
             odds=2.0,
             probability_conservative=0.60,
             probability_half_width=0.02,
+            uncertainty_status=UncertaintyStatus.ESTIMATED,
         )
         assert stake.kelly_full_fraction == pytest.approx(0.20)
         assert stake.capped_by == "max_stake_pct_of_bankroll"
@@ -90,6 +96,7 @@ class TestCaps:
             odds=3.0,
             probability_conservative=0.60,
             probability_half_width=0.02,
+            uncertainty_status=UncertaintyStatus.ESTIMATED,
         )
         assert stake.amount == pytest.approx(10.0)
         assert stake.kelly_applied_fraction == pytest.approx(0.01)
@@ -100,6 +107,7 @@ class TestCaps:
             odds=2.0,
             probability_conservative=0.55,
             probability_half_width=0.02,
+            uncertainty_status=UncertaintyStatus.ESTIMATED,
         )
         # Full Kelly 0.10, quarter Kelly 0.025 -> 25 EUR on a 1000 bankroll.
         assert stake.kelly_applied_fraction == pytest.approx(0.025)
@@ -112,6 +120,7 @@ class TestCaps:
             odds=2.0,
             probability_conservative=0.60,
             probability_half_width=0.02,
+            uncertainty_status=UncertaintyStatus.ESTIMATED,
             already_exposed=19.0,
         )
         assert stake.amount == pytest.approx(1.0)
@@ -123,6 +132,7 @@ class TestCaps:
             odds=2.0,
             probability_conservative=0.60,
             probability_half_width=0.02,
+            uncertainty_status=UncertaintyStatus.ESTIMATED,
             already_exposed=20.0,
         )
         assert stake.amount == 0.0
@@ -136,6 +146,7 @@ class TestUnits:
             odds=2.0,
             probability_conservative=0.60,
             probability_half_width=0.02,
+            uncertainty_status=UncertaintyStatus.ESTIMATED,
         )
         # 1 unit == 1% of a 1000 bankroll == 10 EUR; the stake is 20 EUR.
         assert stake.amount == pytest.approx(20.0)
@@ -158,6 +169,7 @@ class TestNoLossChasing:
             "odds",
             "probability_conservative",
             "probability_half_width",
+            "uncertainty_status",
             "already_exposed",
         }
         # `already_exposed` can only ever *reduce* the stake.
@@ -166,12 +178,14 @@ class TestNoLossChasing:
             odds=2.0,
             probability_conservative=0.60,
             probability_half_width=0.02,
+            uncertainty_status=UncertaintyStatus.ESTIMATED,
         )
         after_exposure = compute_stake(
             settings=staking_settings(max_stake_pct_of_bankroll=0.02),
             odds=2.0,
             probability_conservative=0.60,
             probability_half_width=0.02,
+            uncertainty_status=UncertaintyStatus.ESTIMATED,
             already_exposed=45.0,
         )
         assert after_exposure.amount <= base.amount
@@ -189,5 +203,6 @@ class TestRationaleIsAlwaysStated:
                 odds=2.0,
                 probability_conservative=kwargs.get("probability_conservative", 0.6),  # type: ignore[arg-type]
                 probability_half_width=kwargs.get("probability_half_width", 0.02),  # type: ignore[arg-type]
+                uncertainty_status=UncertaintyStatus.ESTIMATED,
             )
             assert stake.rationale

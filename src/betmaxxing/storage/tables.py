@@ -47,6 +47,9 @@ class EventRow(Base):
     away_name: Mapped[str] = mapped_column(String(160))
     home_canonical_id: Mapped[str] = mapped_column(String(160), index=True)
     away_canonical_id: Mapped[str] = mapped_column(String(160), index=True)
+    #: Order-sensitive participant key, used only for cross-provider matching.
+    #: Identity itself is the opaque `canonical_id`, never this key.
+    participant_pair_key: Mapped[str | None] = mapped_column(String(320), nullable=True, index=True)
     start_time_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     status: Mapped[str] = mapped_column(String(32), default="scheduled")
     mapping_ambiguous: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -75,6 +78,9 @@ class OddsSnapshotRow(Base):
     market: Mapped[str] = mapped_column(String(48))
     period: Mapped[str] = mapped_column(String(32))
     line: Mapped[float | None] = mapped_column(Float, nullable=True)
+    #: Canonical decimal text of the line. Identity uses THIS, never `line`:
+    #: a float rendering must not decide whether two prices are the same market.
+    line_canonical: Mapped[str | None] = mapped_column(String(16), nullable=True)
     selection_code: Mapped[str] = mapped_column(String(48))
     selection_label: Mapped[str] = mapped_column(String(200))
     decimal_odds: Mapped[float] = mapped_column(Float)
@@ -86,6 +92,8 @@ class OddsSnapshotRow(Base):
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     source_meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    #: Collection batch that wrote this row, for provenance.
+    batch_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
 
 
 class ScanRunRow(Base):
@@ -98,6 +106,8 @@ class ScanRunRow(Base):
     window_from: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     window_to: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     config_fingerprint: Mapped[str] = mapped_column(String(32), index=True)
+    collection_status: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    batch_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     candidate_count: Mapped[int] = mapped_column(Integer, default=0)
     rejection_count: Mapped[int] = mapped_column(Integer, default=0)
     #: Full ScanResult document, for exact reproduction and audit.
@@ -117,10 +127,13 @@ class CandidateRow(Base):
     decimal_odds: Mapped[float] = mapped_column(Float)
     model_probability: Mapped[float] = mapped_column(Float)
     ev: Mapped[float] = mapped_column(Float, index=True)
-    ev_conservative: Mapped[float] = mapped_column(Float)
+    #: Nullable: no usable uncertainty method means no conservative EV (D-019).
+    ev_conservative: Mapped[float | None] = mapped_column(Float, nullable=True)
     data_quality: Mapped[float] = mapped_column(Float)
     model_id: Mapped[str] = mapped_column(String(64))
+    model_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     validation_status: Mapped[str] = mapped_column(String(32))
+    uncertainty_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     document: Mapped[dict] = mapped_column(JSON)
 
@@ -158,6 +171,11 @@ class ChallengeRow(Base):
     state: Mapped[str] = mapped_column(String(40), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    #: Optimistic concurrency token. Every mutation bumps it conditionally, so a
+    #: rung cannot be settled twice by two concurrent requests.
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    bank_cents: Mapped[int] = mapped_column(Integer, default=0)
+    stop_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     document: Mapped[dict] = mapped_column(JSON)
 
 
@@ -171,3 +189,131 @@ class ChallengeStepRow(Base):
     )
     step_index: Mapped[int] = mapped_column(Integer)
     document: Mapped[dict] = mapped_column(JSON)
+
+
+class EventSourceMapRow(Base):
+    """``(provider, provider_event_id) -> internal_id``.
+
+    The authoritative resolution path. A provider keeping its own id stable
+    across a postponement gives us a stable internal identity for free.
+    """
+
+    __tablename__ = "event_source_map"
+    __table_args__ = (UniqueConstraint("provider", "provider_event_id", name="uq_event_source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(64), index=True)
+    provider_event_id: Mapped[str] = mapped_column(String(128))
+    internal_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("events.canonical_id"), index=True
+    )
+
+
+class EventScheduleHistoryRow(Base):
+    """Append-only trail of kick-off and status changes.
+
+    A reschedule updates the event row *and* appends here, so "this match moved"
+    stays visible instead of being overwritten.
+    """
+
+    __tablename__ = "event_schedule_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    internal_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("events.canonical_id"), index=True
+    )
+    start_time_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    previous_start_time_utc: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(32))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class ParticipantAliasRow(Base):
+    """Alternate spellings of a team or player, per provider."""
+
+    __tablename__ = "participant_aliases"
+    __table_args__ = (UniqueConstraint("sport", "alias", name="uq_participant_alias"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    sport: Mapped[str] = mapped_column(String(32), index=True)
+    alias: Mapped[str] = mapped_column(String(200))
+    canonical_participant_id: Mapped[str] = mapped_column(String(200), index=True)
+    source: Mapped[str] = mapped_column(String(64), default="manual")
+
+
+class SchedulerJobRow(Base):
+    """Durable scheduler ledger.
+
+    Replaces the in-memory ``completed`` set. The unique constraint on
+    ``(job_type, scheduled_for, scope_id)`` is what makes enqueueing idempotent,
+    and ``lease_expires_at`` is what lets a crashed worker's job be recovered.
+    """
+
+    __tablename__ = "scheduler_jobs"
+    __table_args__ = (
+        UniqueConstraint("job_type", "scheduled_for", "scope_id", name="uq_scheduler_occurrence"),
+        Index("ix_scheduler_state_due", "state", "scheduled_for"),
+    )
+
+    job_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    job_type: Mapped[str] = mapped_column(String(32), index=True)
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    #: Event internal id for a milestone; empty string for a global scan
+    #: (SQL treats NULLs as distinct, which would defeat the unique constraint).
+    scope_id: Mapped[str] = mapped_column(String(64), default="")
+    state: Mapped[str] = mapped_column(String(24), default="PENDING", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    scan_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+
+class CollectionBatchRow(Base):
+    """One provider collection, whether or not it produced candidates.
+
+    Recorded even when no model exists: the source data is the irreplaceable
+    part, and "we collected and stored real prices" must be provable.
+    """
+
+    __tablename__ = "collection_batches"
+
+    batch_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(64), index=True)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    mode: Mapped[str] = mapped_column(String(32))
+    events_seen: Mapped[int] = mapped_column(Integer, default=0)
+    snapshots_seen: Mapped[int] = mapped_column(Integer, default=0)
+    events_persisted: Mapped[int] = mapped_column(Integer, default=0)
+    snapshots_persisted: Mapped[int] = mapped_column(Integer, default=0)
+    coverage_status: Mapped[str] = mapped_column(String(32), default="OK")
+    partial_errors: Mapped[dict] = mapped_column(JSON, default=dict)
+    quota: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ModelRegistryRow(Base):
+    """Persistent validation status per model version.
+
+    The source of truth for whether a model's output may be published. A model
+    absent from this table is treated as ``BACKTEST_ONLY``.
+    """
+
+    __tablename__ = "model_registry"
+    __table_args__ = (UniqueConstraint("model_id", "version", name="uq_model_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    model_id: Mapped[str] = mapped_column(String(64), index=True)
+    version: Mapped[str] = mapped_column(String(32))
+    sport: Mapped[str] = mapped_column(String(32), index=True)
+    validation_status: Mapped[str] = mapped_column(String(32), default="BACKTEST_ONLY")
+    uncertainty_method: Mapped[str] = mapped_column(String(64), default="none")
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    evidence_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)

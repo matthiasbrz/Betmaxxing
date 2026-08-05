@@ -25,11 +25,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+from decimal import Decimal
 from functools import lru_cache
 
 from betmaxxing.domain.enums import MarketType, Period, Sport, ValidationStatus
 from betmaxxing.domain.models import CanonicalEvent
-from betmaxxing.models_ml.base import BaseModel, MarketPrediction
+from betmaxxing.models_ml.base import BaseModel, MarketPrediction, lookup_inputs
 
 #: Average probability of winning a point on serve, by surface. Provisional
 #: constants, documented in docs/model-cards.md; they set the baseline around
@@ -45,17 +46,11 @@ DEFAULT_SERVE_BASELINE = 0.635
 _MAX_TIEBREAK_POINTS = 100
 _BISECTION_ITERS = 80
 
-#: Information carried by one observed match, relative to a single Bernoulli
-#: trial on the market outcome. A tennis match supplies ~150 service points and
-#: the model estimates only two serve parameters from them, so a match is worth
-#: considerably more than one win/lose bit. Set above the football value for
-#: that reason.
-#:
-#: PROVISIONAL, and falsifiable the same way: the validation protocol checks
-#: that the nominal 90% interval achieves ~90% empirical coverage. Inflating
-#: this constant would narrow intervals and let under-determined candidates
-#: through the gate, which coverage testing is designed to catch.
-INFORMATION_PER_MATCH = 3.0
+#: Pseudo-count feeding the **demo-mode synthetic** uncertainty only.
+#: Superseded as a statistical claim by D-019 — see the note in
+#: `models_ml/football.py` and `engine/uncertainty.py`. It cannot reach
+#: `paper` or `live_analysis`, where uncertainty is reported as UNAVAILABLE.
+SYNTHETIC_INFORMATION_PER_MATCH = 3.0
 
 
 def elo_win_probability(elo_a: float, elo_b: float) -> float:
@@ -309,9 +304,9 @@ class TennisHierarchicalModel(BaseModel):
         event: CanonicalEvent,
         market: MarketType,
         period: Period,
-        line: float | None = None,
+        line: Decimal | None = None,
     ) -> MarketPrediction | None:
-        inputs = self._inputs.get(event.canonical_id)
+        inputs = lookup_inputs(self._inputs, event)
         if inputs is None or market not in self.supported_markets():
             return None
         # Tennis markets in V1 settle on the full match only.
@@ -341,7 +336,7 @@ class TennisHierarchicalModel(BaseModel):
         elif market is MarketType.TOTAL_GAMES:
             if line is None:
                 return None
-            probs = dist.total_games_probabilities(line)
+            probs = dist.total_games_probabilities(float(line))
         else:  # pragma: no cover - guarded by supported_markets
             return None
 
@@ -351,7 +346,8 @@ class TennisHierarchicalModel(BaseModel):
             period=period,
             line=line,
             probabilities=probs,
-            effective_sample_size=n_eff,
+            push_probabilities={},
+            synthetic_sample_size=n_eff,
             feature_completeness=inputs.feature_completeness,
             diagnostics={
                 "elo_used_home": round(elo_a, 1),
@@ -370,7 +366,7 @@ class TennisHierarchicalModel(BaseModel):
 
     @staticmethod
     def _effective_sample_size(inputs: TennisInputs) -> float:
-        """The less-observed player governs the precision of the estimate."""
+        """Pseudo-count for demo-mode synthetic uncertainty only (D-019)."""
         base = float(min(inputs.matches_home, inputs.matches_away))
-        base = max(base, 1.0) * INFORMATION_PER_MATCH
+        base = max(base, 1.0) * SYNTHETIC_INFORMATION_PER_MATCH
         return max(base * inputs.feature_completeness**2, 1.0)

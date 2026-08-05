@@ -21,6 +21,7 @@ from betmaxxing.domain.enums import (
     MarketType,
     Period,
     Sport,
+    UncertaintyStatus,
     ValidationStatus,
 )
 from betmaxxing.domain.models import (
@@ -30,6 +31,7 @@ from betmaxxing.domain.models import (
     Participant,
     ProbabilityEstimate,
     Selection,
+    UncertaintyEstimate,
     ValueAssessment,
 )
 
@@ -43,6 +45,11 @@ def make_config(**overrides: object) -> ChallengeConfig:
         "min_odds": 1.20,
         "max_odds": 3.00,
         "max_loss": 0.0,
+        # Most of these tests were written against the old implicit 100% stake.
+        # It is no longer the default, so they now ask for it explicitly — which
+        # is exactly the behaviour change being pinned.
+        "fraction_per_step": 1.0,
+        "acknowledged_total_loss_risk": True,
     }
     base.update(overrides)
     return ChallengeConfig(**base)  # type: ignore[arg-type]
@@ -50,7 +57,7 @@ def make_config(**overrides: object) -> ChallengeConfig:
 
 def make_candidate(odds: float = 2.0, sport: Sport = Sport.TENNIS) -> Candidate:
     event = CanonicalEvent(
-        canonical_id="e1",
+        internal_id="e1",
         sport=sport,
         competition="ATP",
         home=Participant(canonical_id="p1", name="A"),
@@ -73,9 +80,11 @@ def make_candidate(odds: float = 2.0, sport: Sport = Sport.TENNIS) -> Candidate:
             implied_probability_raw=1 / odds,
             implied_probability_novig=1 / odds - 0.02,
             devig_method="shin",
-            model_probability=0.56,
-            model_probability_lower=0.52,
-            model_probability_upper=0.60,
+            win_probability=0.56,
+            push_probability=0.0,
+            conditional_win_probability=0.56,
+            settlement_rule="WIN_LOSE",
+            payoff_outcomes=[],
             fair_odds=1 / 0.56,
             ev=0.56 * odds - 1,
             ev_conservative=0.52 * odds - 1,
@@ -85,11 +94,16 @@ def make_candidate(odds: float = 2.0, sport: Sport = Sport.TENNIS) -> Candidate:
         ),
         probability=ProbabilityEstimate(
             probability=0.56,
-            lower=0.52,
-            upper=0.60,
-            effective_sample_size=300.0,
             model_id="m1",
+            model_version="1.0.0",
             validation_status=ValidationStatus.BACKTEST_ONLY,
+            uncertainty=UncertaintyEstimate(
+                method="synthetic_wilson_demo",
+                status=UncertaintyStatus.SYNTHETIC,
+                lower=0.52,
+                upper=0.60,
+                effective_sample_size=300.0,
+            ),
         ),
         data_quality=DataQuality(score=0.95, components={}),
         confidence={"score": 0.7, "label": "moyenne"},
@@ -98,6 +112,7 @@ def make_candidate(odds: float = 2.0, sport: Sport = Sport.TENNIS) -> Candidate:
         missing_information=[],
         invalidation_conditions=[],
         model_id="m1",
+        model_version="1.0.0",
         config_fingerprint="fp",
     )
 
@@ -155,6 +170,23 @@ class TestConfigValidation:
     def test_invalid_configuration_is_refused(self, overrides: dict[str, object]) -> None:
         with pytest.raises(ChallengeError):
             make_config(**overrides)
+
+    def test_default_fraction_is_conservative(self) -> None:
+        """An implicit 100% stake makes total loss the likeliest first outcome."""
+        assert ChallengeConfig(initial_bank=100.0, target_bank=200.0).fraction_per_step < 1.0
+
+    def test_a_high_fraction_requires_explicit_acknowledgement(self) -> None:
+        with pytest.raises(ChallengeError, match="perte totale"):
+            ChallengeConfig(initial_bank=100.0, target_bank=200.0, fraction_per_step=0.9)
+
+    def test_a_high_fraction_is_allowed_once_acknowledged(self) -> None:
+        config = ChallengeConfig(
+            initial_bank=100.0,
+            target_bank=200.0,
+            fraction_per_step=0.9,
+            acknowledged_total_loss_risk=True,
+        )
+        assert config.fraction_per_step == 0.9
 
 
 class TestStateMachine:

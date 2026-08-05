@@ -16,9 +16,12 @@ from sqlalchemy.orm import Session
 from betmaxxing.domain.ids import alert_key as make_alert_key
 from betmaxxing.domain.models import CanonicalEvent, OddsSnapshot, ScanResult
 from betmaxxing.domain.timeutil import ensure_utc
+from betmaxxing.ingestion.identity import participant_pair_key
 from betmaxxing.storage.tables import (
     CandidateRow,
+    CollectionBatchRow,
     EventRow,
+    ModelRegistryRow,
     OddsSnapshotRow,
     RejectionRow,
     ScanRunRow,
@@ -35,9 +38,9 @@ class EventRepository:
         self._session = session
 
     def upsert(self, event: CanonicalEvent) -> None:
-        row = self._session.get(EventRow, event.canonical_id)
+        row = self._session.get(EventRow, event.internal_id)
         if row is None:
-            row = EventRow(canonical_id=event.canonical_id)
+            row = EventRow(canonical_id=event.internal_id)
             self._session.add(row)
         row.sport = str(event.sport)
         row.competition = event.competition
@@ -48,13 +51,19 @@ class EventRepository:
         row.away_name = event.away.name
         row.home_canonical_id = event.home.canonical_id
         row.away_canonical_id = event.away.canonical_id
+        row.participant_pair_key = participant_pair_key(
+            event.sport, event.home.name, event.away.name
+        )
         row.start_time_utc = ensure_utc(event.start_time_utc)
         row.status = str(event.status)
         row.mapping_ambiguous = event.mapping_ambiguous
         row.source_ids = dict(event.source_ids)
 
-    def get(self, canonical_id: str) -> EventRow | None:
-        return self._session.get(EventRow, canonical_id)
+    def get(self, internal_id: str) -> EventRow | None:
+        return self._session.get(EventRow, internal_id)
+
+    def count(self) -> int:
+        return len(list(self._session.scalars(select(EventRow.canonical_id)).all()))
 
 
 class OddsRepository:
@@ -63,7 +72,7 @@ class OddsRepository:
     def __init__(self, session: Session) -> None:
         self._session = session
 
-    def store(self, snapshots: list[OddsSnapshot]) -> int:
+    def store(self, snapshots: list[OddsSnapshot], batch_id: str | None = None) -> int:
         """Insert new snapshots. Returns the number actually written.
 
         Existing fingerprints are skipped, never updated: a recorded price is a
@@ -89,12 +98,13 @@ class OddsRepository:
                     fingerprint=fingerprint,
                     provider=snapshot.provider,
                     bookmaker=snapshot.bookmaker,
-                    event_canonical_id=snapshot.event_canonical_id,
+                    event_canonical_id=snapshot.event_internal_id,
                     event_source_id=snapshot.event_source_id,
                     selection_key=selection.key,
                     market=str(selection.market),
                     period=str(selection.period),
-                    line=selection.line,
+                    line=float(selection.line) if selection.line is not None else None,
+                    line_canonical=selection.line_canonical,
                     selection_code=selection.code,
                     selection_label=selection.label,
                     decimal_odds=snapshot.decimal_odds,
@@ -104,6 +114,7 @@ class OddsRepository:
                     observed_at=snapshot.observed_at,
                     received_at=snapshot.received_at,
                     source_meta=dict(snapshot.source_meta),
+                    batch_id=batch_id,
                 )
             )
             written += 1
@@ -139,6 +150,8 @@ class ScanRepository:
                 window_from=ensure_utc(result.window["from"]),
                 window_to=ensure_utc(result.window["to"]),
                 config_fingerprint=result.config_fingerprint,
+                collection_status=str(result.collection_status),
+                batch_id=result.batch_id,
                 candidate_count=len(result.candidates),
                 rejection_count=len(result.rejections),
                 document=document,
@@ -157,20 +170,22 @@ class ScanRepository:
                     candidate_id=candidate.candidate_id,
                     scan_id=result.scan_id,
                     alert_key=make_alert_key(
-                        candidate.event.canonical_id,
+                        candidate.event.internal_id,
                         candidate.selection.key,
                         candidate.bookmaker,
                     ),
-                    event_canonical_id=candidate.event.canonical_id,
+                    event_canonical_id=candidate.event.internal_id,
                     selection_key=candidate.selection.key,
                     bookmaker=candidate.bookmaker,
                     decimal_odds=candidate.value.decimal_odds,
-                    model_probability=candidate.value.model_probability,
+                    model_probability=candidate.value.conditional_win_probability,
                     ev=candidate.value.ev,
                     ev_conservative=candidate.value.ev_conservative,
                     data_quality=candidate.data_quality.score,
                     model_id=candidate.model_id,
+                    model_version=candidate.model_version,
                     validation_status=str(candidate.probability.validation_status),
+                    uncertainty_status=str(candidate.probability.uncertainty.status),
                     observed_at=ensure_utc(candidate.observed_at),
                     document=_json_safe(candidate.model_dump(mode="json")),
                 )
@@ -179,7 +194,7 @@ class ScanRepository:
             self._session.add(
                 RejectionRow(
                     scan_id=result.scan_id,
-                    event_canonical_id=rejection.event_canonical_id,
+                    event_canonical_id=rejection.event_internal_id,
                     event_label=rejection.event_label,
                     selection_key=rejection.selection_key,
                     code=str(rejection.code),
@@ -205,3 +220,76 @@ class ScanRepository:
     def rejections_for(self, scan_id: str) -> list[RejectionRow]:
         stmt = select(RejectionRow).where(RejectionRow.scan_id == scan_id)
         return list(self._session.scalars(stmt).all())
+
+
+class BatchRepository:
+    """Records every collection, including ones that produced no candidate."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def save(
+        self,
+        batch: object,
+        *,
+        mode: str,
+        events_persisted: int,
+        snapshots_persisted: int,
+    ) -> None:
+        if self._session.get(CollectionBatchRow, batch.batch_id) is not None:  # type: ignore[attr-defined]
+            return
+        self._session.add(
+            CollectionBatchRow(
+                batch_id=batch.batch_id,  # type: ignore[attr-defined]
+                provider=batch.provider,  # type: ignore[attr-defined]
+                collected_at=ensure_utc(batch.collected_at),  # type: ignore[attr-defined]
+                mode=mode,
+                events_seen=len(batch.events),  # type: ignore[attr-defined]
+                snapshots_seen=len(batch.snapshots),  # type: ignore[attr-defined]
+                events_persisted=events_persisted,
+                snapshots_persisted=snapshots_persisted,
+                coverage_status=str(batch.coverage),  # type: ignore[attr-defined]
+                partial_errors={"errors": list(batch.partial_errors)},  # type: ignore[attr-defined]
+                quota=batch.quota.as_dict(),  # type: ignore[attr-defined]
+            )
+        )
+
+    def get(self, batch_id: str) -> CollectionBatchRow | None:
+        return self._session.get(CollectionBatchRow, batch_id)
+
+    def count(self) -> int:
+        return len(list(self._session.scalars(select(CollectionBatchRow.batch_id)).all()))
+
+
+class ModelRegistryRepository:
+    """Persisted validation status. Absent means BACKTEST_ONLY."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+
+    def upsert(
+        self,
+        *,
+        model_id: str,
+        version: str,
+        sport: str,
+        validation_status: str,
+        uncertainty_method: str = "none",
+        notes: str | None = None,
+    ) -> None:
+        row = self._session.scalar(
+            select(ModelRegistryRow).where(
+                ModelRegistryRow.model_id == model_id,
+                ModelRegistryRow.version == version,
+            )
+        )
+        if row is None:
+            row = ModelRegistryRow(model_id=model_id, version=version, sport=sport)
+            self._session.add(row)
+        row.sport = sport
+        row.validation_status = validation_status
+        row.uncertainty_method = uncertainty_method
+        row.notes = notes
+
+    def all(self) -> list[ModelRegistryRow]:
+        return list(self._session.scalars(select(ModelRegistryRow)).all())

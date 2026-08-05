@@ -26,6 +26,21 @@ descendre ses critères jusqu'à trouver quelque chose.
 | Export JSON / CSV | ✅ |
 | Interface web | ⛔ tranche 6 |
 
+## Les trois modes, et ce qu'ils promettent
+
+| Mode | Données | Incertitude | Publie des candidats ? |
+|---|---|---|---|
+| `demo` | **synthétiques** | `SYNTHETIC — NE PAS PARIER` | Oui, à titre d'illustration seulement |
+| `paper` | réelles | `UNAVAILABLE` | **Non** — `UNCERTAINTY_UNAVAILABLE` |
+| `live_analysis` | réelles | `UNAVAILABLE` | **Non** — et exige en plus un modèle validé |
+
+Autrement dit : **aujourd'hui, seul le mode démo produit des candidats, et ils sont
+synthétiques.** C'est l'état honnête du produit, pas une panne. Aucun modèle n'est
+validé et aucune méthode d'incertitude défendable n'existe.
+
+Aucune promesse de gain n'est faite nulle part, et aucune projection de gains n'est
+affichée.
+
 ## Écrans prévus (tranche 6)
 
 Les captures de référence ont servi à calibrer la **densité et la hiérarchie de
@@ -58,7 +73,9 @@ Cotes, prédictions, décisions et résultats. Filtrable par empreinte de config
 comparer des réglages.
 
 ### 5. Challenge — Montante
-Désactivé par défaut. Par palier : banque avant, mise, cote détectée, **cote acceptée**,
+**Désactivé par défaut** (`BETMAXXING_CHALLENGE_ENABLED=false` ; les routes répondent
+404). Une fraction supérieure à 50 % de la banque par palier exige une reconnaissance
+explicite du risque de perte totale. Par palier : banque avant, mise, cote détectée, **cote acceptée**,
 gain potentiel, banque projetée, probabilité, EV, risques, statut, preuve du résultat.
 Le nombre de paliers est présenté comme une estimation recalculée, jamais comme une
 promesse. Bouton d'arrêt toujours visible.
@@ -80,7 +97,8 @@ autorise.
 3. **Les rejets sont du contenu**, pas des déchets.
 4. **Le statut de validation est omniprésent.** `BACKTEST_ONLY` doit être impossible à
    manquer.
-5. **Les données synthétiques sont signalées** à chaque endroit où elles apparaissent.
+5. **Les données synthétiques sont signalées** à chaque endroit où elles apparaissent,
+   et une incertitude synthétique porte la mention `SYNTHETIC — NE PAS PARIER`.
 6. **Aucune étoile subjective.** Le score de confiance est une décomposition pondérée
    dont chaque composante est affichable.
 

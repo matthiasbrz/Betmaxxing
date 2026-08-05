@@ -14,32 +14,63 @@ composant à exploiter et à surveiller.
        │                              │
        └──────────┬───────────────────┘
                   ▼
-        ┌──────────────────┐        ┌──────────────────┐
-        │  engine.scan     │◄───────│  models_ml       │
-        └────────┬─────────┘        │  + registre      │
-                 │                  └──────────────────┘
-   ┌─────────────┼─────────────┐
-   ▼             ▼             ▼
-┌────────┐ ┌───────────┐ ┌──────────┐
-│providers│ │ ingestion │ │  engine  │
-│(interf.)│ │normalize  │ │ margin   │
-└────────┘ └───────────┘ │ ev       │
-                          │ elig.    │
-                          └──────────┘
-                 │
-                 ▼
-          ┌─────────────┐        ┌──────────┐
-          │  storage    │◄───────│   API    │
-          └─────────────┘        └──────────┘
+        ┌──────────────────────────┐     ┌──────────────────┐
+        │  engine.acquisition      │◄────│  models_ml       │
+        │  collecte → persiste →   │     │  + registre      │
+        │  analyse → persiste      │     └──────────────────┘
+        └──────┬──────────┬────────┘
+               │          │
+   ┌───────────┘          └──────────────┐
+   ▼                                     ▼
+┌──────────┐ ┌───────────┐ ┌───────────────────────┐
+│providers │ │ ingestion │ │  engine.scan          │
+│(interf.) │ │normalize  │ │  margin · payoff · ev │
+│the_odds_ │ │identity   │ │  uncertainty · elig.  │
+│api·demo  │ └───────────┘ └───────────────────────┘
+└──────────┘
+               │
+               ▼
+        ┌─────────────┐        ┌──────────┐
+        │  storage    │◄───────│   API    │
+        │ + ledger    │        └──────────┘
+        └─────────────┘
 ```
 
 ## Décisions structurantes
 
-### Le planificateur est un processus distinct
+### Le planificateur est un processus distinct, adossé à un ledger SQL
 
 Un serveur web avec N workers exécuterait chaque tâche N fois, et un scan qui monopolise
-un worker dégrade le service des requêtes. Le planificateur tourne donc seul, avec un
-verrou de processus et des clés d'idempotence par tâche.
+un worker dégrade le service des requêtes. Le planificateur tourne donc seul.
+
+Son état vit dans `scheduler_jobs` : occurrences matérialisées à l'avance, réclamées
+atomiquement avec un bail, acquittées **après** persistance. Un `set()` en mémoire ne
+pouvait offrir ni reprise après redémarrage, ni récupération d'un worker crashé, ni
+sûreté multi-workers (D-020). Détail et limites : `docs/scheduler.md`.
+
+### Un seul chemin de collecte
+
+`AcquisitionService` est utilisé identiquement par l'API, la CLI et le planificateur.
+Il **persiste événements et snapshots avant** de consulter le moindre modèle, puis
+analyse, puis persiste le scan. Les snapshots ne se retéléchargent pas ; une analyse se
+rejoue toujours (D-021).
+
+Frontières transactionnelles : l'appel HTTP se fait **hors transaction** ; la
+persistance du lot est une transaction ; la persistance du scan en est une autre. Un
+crash entre les deux perd l'analyse et garde les prix — le bon compromis. La reprise est
+idempotente par empreinte de snapshot, pas par cache mémoire.
+
+### L'identité d'un événement est opaque
+
+Un identifiant sans sémantique, une table `(provider, provider_event_id) → internal_id`,
+et un historique des horaires. Un report met à jour le même événement ; deux affiches
+distinctes le même jour restent distinctes (D-022).
+
+### Le registre de modèles est la seule autorité sur la publication
+
+`RegisteredModel` porte `model_id`, `version` et un statut lu depuis `model_registry`.
+Un modèle absent de la table est `BACKTEST_ONLY`. La lecture échoue **fermée** : une
+panne de base ne peut jamais élever les privilèges d'un modèle.
 
 ### Les snapshots de cotes sont immuables
 
@@ -63,6 +94,18 @@ Aucun LLM n'intervient dans le calcul d'une probabilité, d'une EV ou d'une déc
 d'éligibilité. Le module `engine/explain.py` est un rendu déterministe par gabarit,
 toujours disponible. Un LLM pourra reformuler un *paquet de preuves déjà validé*, sans
 jamais pouvoir modifier une valeur ni un statut.
+
+### L'incertitude est une affirmation, pas un nombre par défaut
+
+Une probabilité de modèle porte un statut (`SYNTHETIC`, `UNAVAILABLE`, `ESTIMATED`,
+`VALIDATED`). Les bornes et l'EV prudente sont **nullables**. Hors mode démo aucune
+méthode défendable n'existe aujourd'hui, donc le statut est `UNAVAILABLE` et les
+candidats sont rejetés avec `UNCERTAINTY_UNAVAILABLE` (D-019).
+
+### L'EV vient d'une distribution de règlement
+
+`EV = Σ p(issue) × rendement_net(issue)`. `p·o − 1` n'est correct que sans
+remboursement ; le draw-no-bet rembourse la mise sur un nul (D-024).
 
 ### Toute décision est conjonctive
 
@@ -95,6 +138,10 @@ ou 25 heures, la fenêtre non.
 | Module | Rôle |
 |---|---|
 | `config` | seuils centralisés, versionnés, empreinte reproductible, masquage des secrets |
+| `engine.acquisition` | **le** chemin unique collecte → persistance → analyse → persistance |
+| `engine.payoff` | distribution de règlement et EV générale |
+| `ingestion.identity` | résolution d'identité stable des événements |
+| `scheduler.ledger` | occurrences durables, réclamation atomique, baux |
 | `domain` | vocabulaires fermés, entités immuables, identifiants canoniques, temps |
 | `providers` | interfaces + adaptateurs ; le moteur ne connaît aucun vendeur |
 | `ingestion` | déduplication, assemblage des books, quarantaine |
@@ -108,15 +155,30 @@ ou 25 heures, la fenêtre non.
 
 ## Rapprochement des événements
 
-Un identifiant canonique est dérivé de (sport, date UTC, participants normalisés). Deux
-fournisseurs nommant différemment la même rencontre convergent sans clé partagée. Quand
-la normalisation ne tranche pas, l'événement est marqué `mapping_ambiguous` et **rejeté**
-via `EVENT_MAPPING_AMBIGUOUS` — deviner serait pire que s'abstenir.
+Deux étapes, dans cet ordre :
+
+1. **Autoritaire** — `(provider, provider_event_id)` dans `event_source_map`. Un
+   fournisseur qui garde son identifiant stable à travers un report nous donne une
+   identité stable sans effort.
+2. **Inter-fournisseurs** — seulement si la paire est inconnue : même sport, mêmes
+   participants normalisés, coup d'envoi à ±6 h. Une seule correspondance lie ;
+   plusieurs sont **refusées** comme ambiguës.
+
+Deux identifiants du **même** fournisseur ne fusionnent jamais : un fournisseur connaît
+son catalogue, donc deux identifiants signifient deux affiches.
+
+Quand la résolution ne tranche pas, l'événement est marqué `mapping_ambiguous` et
+**rejeté** via `EVENT_MAPPING_AMBIGUOUS` — deviner serait pire que s'abstenir.
 
 ## Limites assumées
 
-- Le verrou du planificateur protège un hôte, pas un cluster. Un verrou consultatif
-  PostgreSQL est le remplacement prévu si le besoin apparaît.
-- L'état des challenges vit en mémoire dans l'API ; les tables existent pour le persister.
+- Le ledger sécurise plusieurs workers contre **une même base**. Rien ne coordonne
+  plusieurs bases.
+- Le rattrapage est borné à 2 h : une panne plus longue ne rejoue pas les occurrences
+  manquées.
 - SQLite convient au développement et aux tests ; PostgreSQL est requis en exploitation
   persistante.
+- Aucune méthode d'incertitude réelle n'existe, donc `paper` et `live_analysis` ne
+  publient rien aujourd'hui.
+- L'adaptateur The Odds API est `IMPLEMENTED_UNVERIFIED` : aucun appel réel n'a validé
+  sa couverture.

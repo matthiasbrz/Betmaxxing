@@ -12,6 +12,7 @@ the LLM's output is treated as prose, never as data.
 
 from __future__ import annotations
 
+from betmaxxing.domain.enums import UncertaintyStatus
 from betmaxxing.domain.models import (
     Candidate,
     CanonicalEvent,
@@ -22,9 +23,6 @@ from betmaxxing.domain.models import (
     ValueAssessment,
 )
 from betmaxxing.domain.timeutil import format_display
-
-#: Sample sizes below this are called out as too thin to lean on.
-THIN_SAMPLE = 30
 
 
 def build_risks(
@@ -43,10 +41,21 @@ def build_risks(
             "Marché non départageable en book complet : la marge n'a pas pu être retirée, "
             "la comparaison utilise la probabilité implicite brute (1/cote)."
         )
-    if probability.effective_sample_size < THIN_SAMPLE:
+    status = probability.uncertainty.status
+    if status is UncertaintyStatus.UNAVAILABLE:
         risks.append(
-            f"Échantillon effectif faible ({probability.effective_sample_size:.0f}) — "
-            "l'estimation est peu contrainte."
+            "Aucune méthode d'incertitude validée : l'EV prudente n'est pas calculable "
+            "et la précision de la probabilité est inconnue (D-019)."
+        )
+    elif status is UncertaintyStatus.SYNTHETIC:
+        risks.append(
+            "Incertitude SYNTHÉTIQUE (mode démo) — ne constitue pas une estimation "
+            "de précision. NE PAS PARIER sur cette base."
+        )
+    if value.push_probability > 0:
+        risks.append(
+            f"Ce marché peut être remboursé ({value.push_probability:.1%} de probabilité "
+            "de nul/annulation) : l'EV tient compte du remboursement."
         )
     drop = value.decimal_odds - value.min_acceptable_odds
     if drop < 0.10:
@@ -126,12 +135,25 @@ def render_explanation(candidate: Candidate) -> str:
             f"Probabilité implicite brute : {value.implied_probability_raw:.1%} "
             "(marge non retirée — book incomplet pour ce marché)"
         )
-    lines.append(
-        f"Probabilité modèle : {probability.probability:.1%} "
-        f"[{probability.lower:.1%} - {probability.upper:.1%}]"
-    )
+    lower, upper = probability.lower, probability.upper
+    if lower is not None and upper is not None:
+        lines.append(
+            f"Probabilité modèle : {probability.probability:.1%} "
+            f"[{lower:.1%} - {upper:.1%}] ({probability.uncertainty.status})"
+        )
+    else:
+        lines.append(
+            f"Probabilité modèle : {probability.probability:.1%} "
+            f"— incertitude {probability.uncertainty.status}"
+        )
     lines.append(f"Fair odds modèle : {value.fair_odds:.2f}")
-    lines.append(f"EV : {value.ev * 100:+.2f}% · EV prudente : {value.ev_conservative * 100:+.2f}%")
+    lines.append(f"Règlement : {value.settlement_rule}")
+    conservative = (
+        f"{value.ev_conservative * 100:+.2f}%"
+        if value.ev_conservative is not None
+        else "indisponible"
+    )
+    lines.append(f"EV : {value.ev * 100:+.2f}% · EV prudente : {conservative}")
     lines.append(
         f"Cote minimale acceptable : {value.min_acceptable_odds:.2f} · "
         f"sensibilité {value.ev_sensitivity_per_odds_tick * 100:+.2f}% par 0,01 de cote"
@@ -141,9 +163,11 @@ def render_explanation(candidate: Candidate) -> str:
         f"confiance : {candidate.confidence['label']} ({candidate.confidence['score']:.2f})"
     )
     lines.append(
-        f"Modèle : {candidate.model_id} ({probability.validation_status}) · "
-        f"config {candidate.config_fingerprint}"
+        f"Modèle : {candidate.model_id} v{candidate.model_version} "
+        f"({probability.validation_status}) · config {candidate.config_fingerprint}"
     )
+    if probability.uncertainty.warning:
+        lines.append(f"!! {probability.uncertainty.warning}")
 
     if candidate.evidence:
         lines.append("")

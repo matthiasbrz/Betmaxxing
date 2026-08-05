@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from betmaxxing.config import RunMode, Settings
-from betmaxxing.domain.enums import RejectionCode, ValidationStatus
+from betmaxxing.domain.enums import RejectionCode, UncertaintyStatus, ValidationStatus
 from betmaxxing.models_ml.registry import is_publishable
 
 
@@ -24,8 +24,10 @@ class GateInput:
     """Everything the gate needs. Assembled by the scorer, never by a provider."""
 
     ev: float
-    ev_conservative: float
-    probability_half_width: float
+    #: ``None`` when no usable uncertainty method exists (D-019).
+    ev_conservative: float | None
+    uncertainty_status: UncertaintyStatus
+    probability_half_width: float | None
     odds: float
     odds_age_seconds: float
     data_quality: float
@@ -113,18 +115,44 @@ def evaluate(candidate: GateInput, settings: Settings) -> GateResult:
             RejectionCode.EV_TOO_LOW,
             f"EV {candidate.ev * 100:+.2f}% < seuil {settings.min_ev * 100:+.2f}%.",
         )
-    if candidate.ev_conservative < settings.min_conservative_ev:
+    # --- uncertainty -------------------------------------------------------
+    # An unavailable uncertainty is not a small problem to be weighed against a
+    # good EV: without it there is no conservative bound at all, so outside demo
+    # the candidate cannot be published. This is the D-019 gate.
+    if candidate.uncertainty_status is UncertaintyStatus.UNAVAILABLE:
         fail(
-            RejectionCode.CONSERVATIVE_EV_NEGATIVE,
-            f"EV prudente {candidate.ev_conservative * 100:+.2f}% "
-            f"< seuil {settings.min_conservative_ev * 100:+.2f}%.",
+            RejectionCode.UNCERTAINTY_UNAVAILABLE,
+            "Aucune méthode d'incertitude validée n'est disponible : "
+            "EV prudente non calculable (voir D-019).",
         )
-    if candidate.probability_half_width > settings.max_prob_half_width:
+    elif candidate.uncertainty_status is UncertaintyStatus.SYNTHETIC and (
+        candidate.mode is not RunMode.DEMO
+    ):
         fail(
-            RejectionCode.UNCERTAINTY_TOO_HIGH,
-            f"Demi-largeur de l'intervalle {candidate.probability_half_width:.3f} "
-            f"> {settings.max_prob_half_width:.3f}.",
+            RejectionCode.UNCERTAINTY_UNAVAILABLE,
+            "Incertitude synthétique interdite hors du mode démo.",
         )
+    elif candidate.ev_conservative is None:
+        fail(
+            RejectionCode.UNCERTAINTY_UNAVAILABLE,
+            "EV prudente indisponible malgré une incertitude annoncée.",
+        )
+    else:
+        if candidate.ev_conservative < settings.min_conservative_ev:
+            fail(
+                RejectionCode.CONSERVATIVE_EV_NEGATIVE,
+                f"EV prudente {candidate.ev_conservative * 100:+.2f}% "
+                f"< seuil {settings.min_conservative_ev * 100:+.2f}%.",
+            )
+        if (
+            candidate.probability_half_width is not None
+            and candidate.probability_half_width > settings.max_prob_half_width
+        ):
+            fail(
+                RejectionCode.UNCERTAINTY_TOO_HIGH,
+                f"Demi-largeur de l'intervalle {candidate.probability_half_width:.3f} "
+                f"> {settings.max_prob_half_width:.3f}.",
+            )
 
     # --- model governance --------------------------------------------------
     if not is_publishable(candidate.validation_status, candidate.mode):

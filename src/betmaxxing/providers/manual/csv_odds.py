@@ -23,6 +23,7 @@ import csv
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 
 from betmaxxing.domain.enums import MarketType, Period, ProviderHealth, Sport
@@ -35,6 +36,7 @@ from betmaxxing.domain.models import (
     Selection,
 )
 from betmaxxing.domain.timeutil import ensure_utc, is_in_window, utc_now
+from betmaxxing.providers.base import CollectionBatch, collect_via_listing
 
 REQUIRED_COLUMNS = (
     "bookmaker",
@@ -98,7 +100,7 @@ def parse_rows(rows: Iterable[dict[str, str]]) -> ImportReport:
             observed = _parse_datetime(row["observed_at_utc"], "observed_at_utc", index)
 
             raw_line = (row.get("line") or "").strip()
-            line = float(raw_line) if raw_line else None
+            line = Decimal(raw_line) if raw_line else None
 
             odds = float(row["decimal_odds"].strip().replace(",", "."))
             if odds <= 1.0:
@@ -110,7 +112,7 @@ def parse_rows(rows: Iterable[dict[str, str]]) -> ImportReport:
 
             if canonical not in events:
                 events[canonical] = CanonicalEvent(
-                    canonical_id=canonical,
+                    internal_id=canonical,
                     sport=sport,
                     competition=row["competition"].strip(),
                     stage=(row.get("stage") or "").strip() or None,
@@ -139,7 +141,7 @@ def parse_rows(rows: Iterable[dict[str, str]]) -> ImportReport:
                 OddsSnapshot(
                     provider=PROVIDER_NAME,
                     bookmaker=row["bookmaker"].strip(),
-                    event_canonical_id=canonical,
+                    event_internal_id=canonical,
                     event_source_id=canonical,
                     selection=selection,
                     decimal_odds=odds,
@@ -213,6 +215,9 @@ class ManualCsvOddsProvider:
             if e.sport in wanted and is_in_window(e.start_time_utc, window)
         ]
 
+    def collect(self, sports: list[Sport], window: tuple[datetime, datetime]) -> CollectionBatch:
+        return collect_via_listing(self, sports, window, utc_now())
+
     def fetch_odds(self, events: list[CanonicalEvent]) -> list[OddsSnapshot]:
-        wanted = {e.canonical_id for e in events}
-        return [s for s in self._report.snapshots if s.event_canonical_id in wanted]
+        wanted = {e.internal_id for e in events}
+        return [s for s in self._report.snapshots if s.event_internal_id in wanted]

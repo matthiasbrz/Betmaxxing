@@ -59,7 +59,7 @@ class TestValidImport:
 
     def test_rows_of_one_event_collapse_to_one_canonical_event(self, tmp_path: Path) -> None:
         report = load_csv(write_csv(tmp_path, ROW_HOME + ROW_DRAW + ROW_AWAY))
-        assert len({s.event_canonical_id for s in report.snapshots}) == 1
+        assert len({s.event_internal_id for s in report.snapshots}) == 1
 
     def test_over_under_line_is_parsed(self, tmp_path: Path) -> None:
         row = (
@@ -70,7 +70,7 @@ class TestValidImport:
         report = load_csv(write_csv(tmp_path, row))
         selection = report.snapshots[0].selection
         assert selection.market is MarketType.TOTAL_GOALS
-        assert selection.line == 2.5
+        assert selection.line_canonical == "2.5"
 
     def test_comma_decimal_separator_is_accepted(self, tmp_path: Path) -> None:
         row = ROW_HOME.replace(",1.63,", ',"1,63",')

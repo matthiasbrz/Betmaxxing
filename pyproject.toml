@@ -40,9 +40,22 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
-filterwarnings = ["error::DeprecationWarning:betmaxxing.*"]
+# Later entries win. "error" first means any warning not explicitly listed
+# below fails the suite, so a new deprecation cannot quietly accumulate. CI runs
+# plain `pytest`: passing -W on the command line would override these and defeat
+# the point.
+filterwarnings = [
+    "error",
+    # Starlette's TestClient announces that it uses httpx rather than httpx2.
+    # It concerns Starlette's own internals, not our usage, and the pinned
+    # FastAPI/Starlette pair has no supported alternative. Matched by message so
+    # only this exact warning is silenced.
+    "ignore:Using `httpx` with `starlette.testclient`",
+]
 
 [tool.ruff]
+# Lints the whole repository, migrations included. Nothing is excluded to make
+# a number go green: `alembic/versions` is generated code that still ships.
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]

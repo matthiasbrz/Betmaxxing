@@ -30,31 +30,28 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from decimal import Decimal
 
 from betmaxxing.domain.enums import MarketType, Period, Sport, ValidationStatus
 from betmaxxing.domain.models import CanonicalEvent
-from betmaxxing.models_ml.base import BaseModel, MarketPrediction
+from betmaxxing.models_ml.base import BaseModel, MarketPrediction, lookup_inputs
 
 #: Empirically ~45% of goals fall in the first half. Provisional until fitted.
 FIRST_HALF_GOAL_SHARE = 0.45
 #: Score matrix truncation. P(goals > 15) is negligible for football rates.
 MAX_GOALS = 15
 
-#: How much information one observed match carries, relative to a single
-#: Bernoulli trial on the market's outcome.
+#: Pseudo-count feeding the **demo-mode synthetic** uncertainty only.
 #:
-#: A match contributes two goal *counts*, not one win/lose bit, and the
-#: attack/defence parameters are pooled across the whole league — so an estimate
-#: built on N matches is better determined than N coin flips would suggest.
-#: Treating it as N flips makes every interval too wide and blocks candidates
-#: that are in fact adequately estimated.
+#: Superseded as a statistical claim by D-019. It was previously multiplied into
+#: a Wilson interval that was presented as the model's predictive uncertainty and
+#: used to gate real candidates; a Wilson interval describes an observed binomial
+#: proportion and cannot carry parameter, calibration or dependence uncertainty.
 #:
-#: PROVISIONAL. The validation protocol tests this directly by interval
-#: coverage: a well-set multiplier makes the nominal 90% interval contain the
-#: realised outcome frequency ~90% of the time. Too high and coverage falls
-#: below nominal, which would mean the gate is being fooled — so this constant
-#: is a falsifiable claim, not a convenience knob.
-INFORMATION_PER_MATCH = 2.5
+#: It survives purely so demo output has a realistic *shape*. It can no longer
+#: reach `paper` or `live_analysis`: `uncertainty_for_mode()` returns
+#: UNAVAILABLE there regardless of this value.
+SYNTHETIC_INFORMATION_PER_MATCH = 2.5
 
 
 def poisson_pmf(k: int, lam: float) -> float:
@@ -196,9 +193,9 @@ class FootballDixonColesModel(BaseModel):
         event: CanonicalEvent,
         market: MarketType,
         period: Period,
-        line: float | None = None,
+        line: Decimal | None = None,
     ) -> MarketPrediction | None:
-        inputs = self._inputs.get(event.canonical_id)
+        inputs = lookup_inputs(self._inputs, event)
         if inputs is None or market not in self.supported_markets():
             return None
 
@@ -210,16 +207,15 @@ class FootballDixonColesModel(BaseModel):
         matrix = score_matrix(lam_home, lam_away, inputs.rho)
         outcomes = outcome_probabilities(matrix)
 
+        pushes: dict[str, float] = {}
         if market is MarketType.MATCH_RESULT_1X2:
             probs = outcomes
         elif market is MarketType.DRAW_NO_BET:
-            decisive = outcomes["home"] + outcomes["away"]
-            if decisive <= 0:  # pragma: no cover - impossible for positive rates
-                return None
-            probs = {
-                "home": outcomes["home"] / decisive,
-                "away": outcomes["away"] / decisive,
-            }
+            # Unconditional win probabilities plus the draw as an explicit push.
+            # The conditional figure is derived from the payoff when needed, so
+            # the EV can account for the refunded stake (see engine/payoff.py).
+            probs = {"home": outcomes["home"], "away": outcomes["away"]}
+            pushes = {"home": outcomes["draw"], "away": outcomes["draw"]}
         elif market is MarketType.DOUBLE_CHANCE:
             probs = {
                 "home_or_draw": outcomes["home"] + outcomes["draw"],
@@ -229,7 +225,7 @@ class FootballDixonColesModel(BaseModel):
         elif market is MarketType.TOTAL_GOALS:
             if line is None:
                 return None
-            probs = total_goals_probabilities(matrix, line)
+            probs = total_goals_probabilities(matrix, float(line))
         else:  # pragma: no cover - guarded by supported_markets
             return None
 
@@ -244,7 +240,8 @@ class FootballDixonColesModel(BaseModel):
             period=period,
             line=line,
             probabilities=probs,
-            effective_sample_size=n_eff,
+            push_probabilities=pushes,
+            synthetic_sample_size=n_eff,
             feature_completeness=completeness,
             diagnostics={
                 "lambda_home": round(lam_home, 4),
@@ -262,14 +259,14 @@ class FootballDixonColesModel(BaseModel):
 
     @staticmethod
     def _effective_sample_size(inputs: FootballInputs, period: Period) -> float:
-        """The weaker-observed side governs the precision of the estimate.
+        """Pseudo-count for demo-mode synthetic uncertainty only (D-019).
 
         Halved for first-half markets: the goal-share split is a fixed constant
         rather than a fitted parameter, so those probabilities are strictly less
         determined than the full-time ones they derive from.
         """
         base = float(min(inputs.home.matches_observed, inputs.away.matches_observed))
-        base = max(base, 1.0) * INFORMATION_PER_MATCH
+        base = max(base, 1.0) * SYNTHETIC_INFORMATION_PER_MATCH
         if period is Period.FIRST_HALF:
             base *= 0.5
         return max(base * inputs.feature_completeness**2, 1.0)

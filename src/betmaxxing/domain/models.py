@@ -1,14 +1,24 @@
 """Canonical domain objects.
 
-Odds snapshots are immutable by construction (``frozen=True``): a price observed
-at an instant is a historical fact and is never edited in place. A new
-observation produces a new snapshot with its own fingerprint.
+Two identity rules drive the shape of this module:
+
+* **Event identity is opaque and stable.** ``internal_id`` carries no temporal or
+  participant semantics, so a postponement across midnight does not mint a new
+  event and two legs on one day cannot collide. Resolution from a provider's own
+  id happens in :mod:`betmaxxing.ingestion.identity`.
+* **Line identity is decimal, never float.** ``2.5``, ``2.50`` and ``2.500`` are
+  one line; ``2.5`` and ``2.75`` are two. Identity uses a canonical decimal
+  string, so it never depends on binary floating-point rendering.
+
+Odds snapshots are immutable by construction: a price observed at an instant is a
+historical fact, and a new observation produces a new snapshot.
 """
 
 from __future__ import annotations
 
 import hashlib
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -16,6 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from betmaxxing.domain.enums import (
     LINE_REQUIRED_MARKETS,
     BetOutcome,
+    CollectionStatus,
     EventStatus,
     MarketType,
     Period,
@@ -23,13 +34,40 @@ from betmaxxing.domain.enums import (
     RejectionCode,
     ScanStatus,
     Sport,
+    UncertaintyStatus,
     ValidationStatus,
 )
 from betmaxxing.domain.timeutil import ensure_utc
 
+#: Maximum decimal places a market line may carry. Covers quarter lines (0.25).
+MAX_LINE_DP = 3
+
 
 class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+def canonical_line(value: Decimal | int | str) -> str:
+    """Canonical text form of a market line.
+
+    Normalises trailing zeros so ``2.50`` and ``2.500`` collapse onto ``2.5``,
+    while keeping genuinely different lines apart. Rejects non-finite values and
+    anything finer than :data:`MAX_LINE_DP`, which would signal a parsing error
+    rather than a real market.
+    """
+    try:
+        dec = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"line is not a valid decimal: {value!r}") from exc
+    if not dec.is_finite():
+        raise ValueError(f"line must be finite, got {value!r}")
+    if -dec.as_tuple().exponent > MAX_LINE_DP:  # type: ignore[operator]
+        raise ValueError(f"line has more than {MAX_LINE_DP} decimal places: {value!r}")
+    normalised = dec.normalize()
+    # normalize() renders integers in exponent form (2E+1); expand them back.
+    if normalised == normalised.to_integral_value():
+        normalised = normalised.quantize(Decimal(1))
+    return format(normalised, "f")
 
 
 class Participant(_Frozen):
@@ -43,7 +81,8 @@ class Participant(_Frozen):
 class CanonicalEvent(_Frozen):
     """One sporting event, reconciled across sources."""
 
-    canonical_id: str
+    #: Opaque, stable identity. Never derived from date or participants.
+    internal_id: str
     sport: Sport
     competition: str
     #: Round / matchday label as published by the source, e.g. "R1", "J3".
@@ -56,6 +95,7 @@ class CanonicalEvent(_Frozen):
     away: Participant
     start_time_utc: datetime
     status: EventStatus = EventStatus.SCHEDULED
+    #: provider -> provider's own event id.
     source_ids: dict[str, str] = Field(default_factory=dict)
     #: Set when two source events could not be reconciled unambiguously.
     mapping_ambiguous: bool = False
@@ -84,7 +124,16 @@ class Selection(_Frozen):
     code: str
     #: Exactly the label the bookmaker shows, kept verbatim for auditability.
     label: str
-    line: float | None = None
+    #: Decimal, never float — identity must not depend on binary rendering.
+    line: Decimal | None = None
+
+    @field_validator("line", mode="before")
+    @classmethod
+    def _coerce_line(cls, v: Any) -> Decimal | None:
+        if v is None:
+            return None
+        # Validate through the canonical form so a bad line fails here, not later.
+        return Decimal(canonical_line(v))
 
     @model_validator(mode="after")
     def _line_consistency(self) -> Self:
@@ -96,9 +145,12 @@ class Selection(_Frozen):
         return self
 
     @property
+    def line_canonical(self) -> str | None:
+        return None if self.line is None else canonical_line(self.line)
+
+    @property
     def key(self) -> str:
-        line = "-" if self.line is None else f"{self.line:g}"
-        return f"{self.market}|{self.period}|{line}|{self.code}"
+        return f"{self.market}|{self.period}|{self.line_canonical or '-'}|{self.code}"
 
 
 class OddsSnapshot(_Frozen):
@@ -106,7 +158,7 @@ class OddsSnapshot(_Frozen):
 
     provider: str
     bookmaker: str
-    event_canonical_id: str
+    event_internal_id: str
     event_source_id: str
     selection: Selection
     decimal_odds: float = Field(gt=1.0)
@@ -126,13 +178,20 @@ class OddsSnapshot(_Frozen):
     def _utc(cls, v: datetime | None) -> datetime | None:
         return None if v is None else ensure_utc(v)
 
+    @field_validator("decimal_odds")
+    @classmethod
+    def _finite_odds(cls, v: float) -> float:
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("decimal odds must be finite")
+        return v
+
     @property
     def fingerprint(self) -> str:
         """Deduplication key: same book, same selection, same price, same instant."""
         parts = [
             self.provider,
             self.bookmaker,
-            self.event_canonical_id,
+            self.event_internal_id,
             self.selection.key,
             f"{self.decimal_odds:.6f}",
             self.observed_at.isoformat(),
@@ -151,11 +210,11 @@ class MarketBook(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    event_canonical_id: str
+    event_internal_id: str
     bookmaker: str
     market: MarketType
     period: Period
-    line: float | None = None
+    line: Decimal | None = None
     snapshots: list[OddsSnapshot] = Field(default_factory=list)
 
     @property
@@ -172,26 +231,71 @@ class MarketBook(BaseModel):
         return next((s for s in self.snapshots if s.selection.code == code), None)
 
 
-class ProbabilityEstimate(_Frozen):
-    """A model probability with its uncertainty, never a bare number."""
+class UncertaintyEstimate(_Frozen):
+    """What the system can honestly say about the precision of a probability.
 
-    probability: float = Field(gt=0.0, lt=1.0)
-    lower: float = Field(ge=0.0, le=1.0)
-    upper: float = Field(ge=0.0, le=1.0)
-    #: Effective sample size behind the estimate; drives the interval width.
-    effective_sample_size: float = Field(gt=0)
-    model_id: str
-    validation_status: ValidationStatus
+    Bounds are optional on purpose. When no defensible method exists the status
+    is ``UNAVAILABLE`` and every bound is ``None`` — the alternative, inventing a
+    plausible-looking interval, is what D-019 supersedes.
+    """
+
+    method: str
+    status: UncertaintyStatus
+    lower: float | None = None
+    upper: float | None = None
+    #: Only meaningful for a genuine binomial proportion or a synthetic stand-in.
+    effective_sample_size: float | None = None
+    warning: str = ""
 
     @model_validator(mode="after")
-    def _ordered(self) -> Self:
-        if not self.lower <= self.probability <= self.upper:
-            raise ValueError("probability must lie inside [lower, upper]")
+    def _bounds_consistent(self) -> Self:
+        has_bounds = self.lower is not None and self.upper is not None
+        if self.status is UncertaintyStatus.UNAVAILABLE and has_bounds:
+            raise ValueError("UNAVAILABLE uncertainty must not carry bounds")
+        if has_bounds and not (0.0 <= self.lower <= self.upper <= 1.0):  # type: ignore[operator]
+            raise ValueError("uncertainty bounds must satisfy 0 <= lower <= upper <= 1")
+        if (self.lower is None) != (self.upper is None):
+            raise ValueError("uncertainty bounds must be given together or not at all")
         return self
 
     @property
-    def half_width(self) -> float:
+    def half_width(self) -> float | None:
+        if self.lower is None or self.upper is None:
+            return None
         return (self.upper - self.lower) / 2.0
+
+    @property
+    def is_usable_for_gating(self) -> bool:
+        """Only a real method may gate a candidate outside demo mode."""
+        return self.status in (UncertaintyStatus.ESTIMATED, UncertaintyStatus.VALIDATED)
+
+
+class ProbabilityEstimate(_Frozen):
+    """A model probability, its provenance, and its uncertainty — kept separate.
+
+    Conflating these three is what made the previous version dishonest: a point
+    estimate carried bounds that described nothing, and a validation status that
+    was hard-coded rather than looked up.
+    """
+
+    probability: float = Field(gt=0.0, lt=1.0)
+    model_id: str
+    model_version: str
+    #: Read from the model registry, never hard-coded at the call site.
+    validation_status: ValidationStatus
+    uncertainty: UncertaintyEstimate
+
+    @property
+    def lower(self) -> float | None:
+        return self.uncertainty.lower
+
+    @property
+    def upper(self) -> float | None:
+        return self.uncertainty.upper
+
+    @property
+    def half_width(self) -> float | None:
+        return self.uncertainty.half_width
 
 
 class ValueAssessment(_Frozen):
@@ -201,12 +305,20 @@ class ValueAssessment(_Frozen):
     implied_probability_raw: float
     implied_probability_novig: float | None
     devig_method: str | None
-    model_probability: float
-    model_probability_lower: float
-    model_probability_upper: float
+    #: Probability the selection wins, unconditional.
+    win_probability: float
+    #: Probability the stake is refunded (draw-no-bet, integer totals).
+    push_probability: float
+    #: ``p_win / (p_win + p_loss)`` — the figure comparable to a de-vigged price.
+    conditional_win_probability: float
+    #: How the market settles, recorded for audit.
+    settlement_rule: str
+    #: Full outcome distribution used to compute the EV.
+    payoff_outcomes: list[dict[str, Any]]
     fair_odds: float
     ev: float
-    ev_conservative: float
+    #: ``None`` whenever no usable uncertainty method exists.
+    ev_conservative: float | None
     min_acceptable_odds: float
     #: dEV per +0.01 of decimal odds.
     ev_sensitivity_per_odds_tick: float
@@ -270,6 +382,7 @@ class Candidate(_Frozen):
     odds_movement: list[dict[str, Any]] = Field(default_factory=list)
     stake: StakeSuggestion | None = None
     model_id: str
+    model_version: str
     config_fingerprint: str
     explanation: str = ""
 
@@ -277,7 +390,7 @@ class Candidate(_Frozen):
 class Rejection(_Frozen):
     """Why one priced selection was dropped. Kept and displayed, never hidden."""
 
-    event_canonical_id: str
+    event_internal_id: str
     event_label: str
     selection_key: str
     code: RejectionCode
@@ -292,6 +405,8 @@ class ProviderStatus(_Frozen):
     events_returned: int = 0
     freshest_observation_age_seconds: float | None = None
     quota_remaining: int | None = None
+    quota_used: int | None = None
+    last_request_cost: int | None = None
 
 
 class DataHealth(_Frozen):
@@ -302,6 +417,9 @@ class DataHealth(_Frozen):
     selections_priced: int
     stale_snapshots: int
     quarantined_records: int
+    #: Source records actually written by this run.
+    events_persisted: int = 0
+    snapshots_persisted: int = 0
 
 
 class ScanResult(_Frozen):
@@ -309,6 +427,8 @@ class ScanResult(_Frozen):
 
     scan_id: str
     status: ScanStatus
+    #: Fine-grained reason. Distinguishes "no model" from "provider down".
+    collection_status: CollectionStatus
     mode: str
     generated_at: datetime
     window: dict[str, datetime]
@@ -319,6 +439,9 @@ class ScanResult(_Frozen):
     thresholds: dict[str, Any]
     config_fingerprint: str
     disclaimer: str
+    #: Identifier of the collection batch whose records back this scan.
+    batch_id: str | None = None
+    warnings: list[str] = Field(default_factory=list)
 
     @field_validator("generated_at")
     @classmethod
@@ -329,7 +452,7 @@ class ScanResult(_Frozen):
 class SettlementResult(_Frozen):
     """Verified outcome of a recorded bet."""
 
-    event_canonical_id: str
+    event_internal_id: str
     selection_key: str
     outcome: BetOutcome
     settled_at: datetime

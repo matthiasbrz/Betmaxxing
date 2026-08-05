@@ -22,9 +22,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 from betmaxxing.domain.enums import EventStatus, MarketType, Period, Sport
-from betmaxxing.domain.ids import event_canonical_id, participant_id
+from betmaxxing.domain.ids import participant_id
 from betmaxxing.domain.models import CanonicalEvent, OddsSnapshot, Participant, Selection
 from betmaxxing.models_ml.football import FootballInputs, TeamStrength
 from betmaxxing.models_ml.tennis import TennisInputs
@@ -39,7 +40,7 @@ class DemoMarket:
 
     market: MarketType
     period: Period
-    line: float | None
+    line: Decimal | None
     #: (code, label, decimal odds)
     prices: tuple[tuple[str, str, float], ...]
     #: How old the observation is at scan time.
@@ -102,7 +103,7 @@ _FOOTBALL: tuple[DemoFixture, ...] = (
             DemoMarket(
                 market=MarketType.TOTAL_GOALS,
                 period=Period.FULL_TIME,
-                line=2.5,
+                line=Decimal("2.5"),
                 prices=(("over", "Plus de 2,5 buts", 1.48), ("under", "Moins de 2,5 buts", 2.67)),
             ),
             DemoMarket(
@@ -254,7 +255,7 @@ _TENNIS: tuple[DemoFixture, ...] = (
             DemoMarket(
                 market=MarketType.TOTAL_GAMES,
                 period=Period.FULL_TIME,
-                line=22.5,
+                line=Decimal("22.5"),
                 prices=(("over", "Plus de 22,5 jeux", 1.72), ("under", "Moins de 22,5 jeux", 2.13)),
             ),
             DemoMarket(
@@ -351,7 +352,9 @@ def build_event(fixture: DemoFixture, now: datetime) -> CanonicalEvent:
         source_ids={DEMO_PROVIDER: f"{fixture.key}-away"},
     )
     return CanonicalEvent(
-        canonical_id=event_canonical_id(sport, fixture.home_name, fixture.away_name, start),
+        # A stable, human-traceable id for the fixture. The acquisition service
+        # re-resolves it onto a real internal id via the identity service.
+        internal_id=f"demo-{fixture.key}",
         sport=fixture.sport,
         competition=fixture.competition,
         stage=fixture.stage,
@@ -385,7 +388,7 @@ def build_snapshots(
                 OddsSnapshot(
                     provider=DEMO_PROVIDER,
                     bookmaker=DEMO_BOOKMAKER,
-                    event_canonical_id=event.canonical_id,
+                    event_internal_id=event.internal_id,
                     event_source_id=fixture.key,
                     selection=selection,
                     decimal_odds=odds,
@@ -401,12 +404,17 @@ def build_snapshots(
 
 
 def football_inputs(now: datetime) -> dict[str, FootballInputs]:
-    return {
-        build_event(f, now).canonical_id: f.football for f in ALL_FIXTURES if f.football is not None
-    }
+    """Keyed by fixture key — the provider's own event id.
+
+    Deliberately not keyed by the canonical event id: identity resolution
+    reassigns that, and a model whose inputs vanish after remapping would report
+    NO_MODEL_AVAILABLE for everything.
+    """
+    del now
+    return {f.key: f.football for f in ALL_FIXTURES if f.football is not None}
 
 
 def tennis_inputs(now: datetime) -> dict[str, TennisInputs]:
-    return {
-        build_event(f, now).canonical_id: f.tennis for f in ALL_FIXTURES if f.tennis is not None
-    }
+    """Keyed by fixture key. See :func:`football_inputs`."""
+    del now
+    return {f.key: f.tennis for f in ALL_FIXTURES if f.tennis is not None}

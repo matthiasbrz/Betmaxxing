@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 
@@ -17,7 +18,7 @@ from betmaxxing.ingestion.normalize import (
 )
 
 NOW = datetime(2026, 8, 4, 9, 0, tzinfo=UTC)
-EVENT_ID = "football-20260804-abc"
+EVENT_ID = "evt_football_abc"
 
 
 def snapshot(
@@ -28,13 +29,13 @@ def snapshot(
     bookmaker: str = "DEMO_BOOK",
     market: MarketType = MarketType.MATCH_RESULT_1X2,
     period: Period = Period.FULL_TIME,
-    line: float | None = None,
+    line: Decimal | None = None,
 ) -> OddsSnapshot:
     moment = observed or NOW
     return OddsSnapshot(
         provider="demo",
         bookmaker=bookmaker,
-        event_canonical_id=EVENT_ID,
+        event_internal_id=EVENT_ID,
         event_source_id="src",
         selection=Selection(market=market, period=period, code=code, label=code.title(), line=line),
         decimal_odds=odds,
@@ -99,14 +100,14 @@ class TestAssembleBooks:
 
     def test_separates_lines(self) -> None:
         totals = [
-            snapshot("over", 1.86, market=MarketType.TOTAL_GOALS, line=2.5),
-            snapshot("under", 1.98, market=MarketType.TOTAL_GOALS, line=2.5),
-            snapshot("over", 2.60, market=MarketType.TOTAL_GOALS, line=3.5),
-            snapshot("under", 1.50, market=MarketType.TOTAL_GOALS, line=3.5),
+            snapshot("over", 1.86, market=MarketType.TOTAL_GOALS, line=Decimal("2.5")),
+            snapshot("under", 1.98, market=MarketType.TOTAL_GOALS, line=Decimal("2.5")),
+            snapshot("over", 2.60, market=MarketType.TOTAL_GOALS, line=Decimal("3.5")),
+            snapshot("under", 1.50, market=MarketType.TOTAL_GOALS, line=Decimal("3.5")),
         ]
         result = assemble_books(totals, NOW)
         assert len(result.books) == 2
-        assert {b.line for b in result.books} == {2.5, 3.5}
+        assert {b.line for b in result.books} == {Decimal("2.5"), Decimal("3.5")}
 
     def test_incomplete_book_is_detected(self) -> None:
         result = assemble_books(FULL_BOOK[:2], NOW)
@@ -127,7 +128,7 @@ class TestQuarantine:
     def test_integer_over_under_line_is_quarantined(self) -> None:
         # An integer line can void; it is a different bet and V1 does not price it.
         result = assemble_books(
-            [snapshot("over", 1.90, market=MarketType.TOTAL_GOALS, line=3.0)], NOW
+            [snapshot("over", 1.90, market=MarketType.TOTAL_GOALS, line=Decimal("3.0"))], NOW
         )
         assert len(result.quarantined) == 1
         assert "ligne entière" in result.quarantined[0].reason

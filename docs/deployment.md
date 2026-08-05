@@ -4,11 +4,15 @@
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-cp .env.example .env          # renseignez ce dont vous avez besoin
-betmaxxing db init
+pip install -e ".[dev]" -c constraints.txt   # résolution reproductible
+cp .env.example .env                          # renseignez ce dont vous avez besoin
+alembic upgrade head
 betmaxxing scan
 ```
+
+`constraints.txt` fige la résolution utilisée par la CI. `pyproject.toml` garde des
+bornes basses lâches pour rester installable ailleurs. Régénérez le fichier
+**délibérément** lors d'une montée de version, jamais par effet de bord.
 
 SQLite convient au développement et aux tests. Il ne convient pas à une exploitation
 persistante avec un planificateur concurrent.
@@ -64,6 +68,48 @@ Processus **séparé** de l'API. Voir `docs/scheduler.md`.
 BETMAXXING_SCHEDULER_ENABLED=true python -m betmaxxing.scheduler.runner
 ```
 
+Son état vit dans `scheduler_jobs` : un redémarrage reprend là où il en était, et un
+worker crashé libère son occurrence à l'expiration du bail. Plusieurs workers contre
+**une même base** sont sûrs ; rien ne coordonne plusieurs bases.
+
+## The Odds API — variables et budgets
+
+```bash
+export BETMAXXING_ODDS_PROVIDER=the_odds_api
+export BETMAXXING_THE_ODDS_API_KEY=...          # jamais dans un fichier versionné
+export BETMAXXING_BOOKMAKERS=winamax_fr
+export BETMAXXING_THE_ODDS_API_REGIONS=eu,fr
+export BETMAXXING_PROVIDER_BUDGET_PER_SCAN=50   # refus AVANT l'appel si dépassé
+export BETMAXXING_PROVIDER_BUDGET_PER_DAY=450
+```
+
+La clé n'apparaît jamais dans une URL journalisée, une exception, une trace ou une
+réponse d'API : le client masque `apiKey=` avant toute sortie.
+
+`BETMAXXING_ODDS_API_KEY` reste accepté par compatibilité mais est **déprécié** ; un
+avertissement le signale, sans jamais afficher la valeur.
+
+### Smoke test (opt-in, consomme des crédits réels)
+
+```bash
+export BETMAXXING_THE_ODDS_API_KEY=...
+export BETMAXXING_SMOKE_TEST=1
+python scripts/smoke_the_odds_api.py
+```
+
+C'est le **seul** code du dépôt qui appelle réellement le service. Il n'est ni
+collecté par pytest, ni exécuté par la CI, et refuse de démarrer sans les deux
+variables. Il ne touche aucun endpoint historique (payant) et ne modifie aucun statut
+de validation.
+
+## Challenge — Montante
+
+```bash
+export BETMAXXING_CHALLENGE_ENABLED=true   # désactivé par défaut
+```
+
+Quand c'est faux, toutes les routes `/challenges` répondent 404.
+
 ## Secrets
 
 - Aucun secret dans Git. `.gitignore` exclut `.env` et les bases locales.
@@ -94,8 +140,11 @@ base jetable avant d'en dépendre.
 | Table | Enjeu |
 |---|---|
 | `odds_snapshots` | **Irremplaçable** — un prix passé ne se re-télécharge pas |
+| `event_source_map` | Sans elle, l'identité des événements doit être reconstruite |
+| `collection_batches` | Provenance et coût de chaque collecte |
 | `scan_runs` | Reproduction et audit des décisions |
 | `challenges` / `challenge_steps` | État des progressions |
+| `model_registry` | Statuts de validation — une perte rétrograderait tout en `BACKTEST_ONLY` |
 
 Les événements et candidats se reconstruisent ; les snapshots, non. Priorisez-les.
 
@@ -106,6 +155,8 @@ Proposition à arbitrer selon l'usage :
 | Donnée | Rétention |
 |---|---|
 | Snapshots de cotes | Illimitée (matière première des backtests) |
+| Lots de collecte | 24 mois |
+| Occurrences du planificateur | 3 mois |
 | Documents de scan | 24 mois |
 | Rejets | 12 mois |
 | Ledger d'alertes | 3 mois |
@@ -124,9 +175,12 @@ et tout passage à `DATA_UNAVAILABLE`.
 
 ```bash
 git pull
-pip install -e ".[dev]"
+pip install -e ".[dev]" -c constraints.txt
 alembic upgrade head
 pytest
 ```
+
+Les migrations sont additives et testées dans les deux sens : sur base neuve et depuis
+le schéma de référence `65c32b5e3f63`. `alembic check` échoue s'il manque une migration.
 
 Redémarrez l'API **et** le planificateur.

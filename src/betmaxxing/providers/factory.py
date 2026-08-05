@@ -13,9 +13,13 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from betmaxxing.config import RunMode, Settings
-from betmaxxing.domain.enums import Sport
+from betmaxxing.domain.enums import Sport, UncertaintyStatus
 from betmaxxing.models_ml.football import FootballDixonColesModel
-from betmaxxing.models_ml.registry import ModelRegistry
+from betmaxxing.models_ml.registry import (
+    ModelRegistry,
+    RegisteredModel,
+    load_status_from_db,
+)
 from betmaxxing.models_ml.tennis import TennisHierarchicalModel
 from betmaxxing.providers.base import ProviderUnavailable
 from betmaxxing.providers.demo import (
@@ -25,6 +29,10 @@ from betmaxxing.providers.demo import (
 )
 from betmaxxing.providers.demo.world import football_inputs, tennis_inputs
 from betmaxxing.providers.manual import ManualCsvOddsProvider, load_csv
+
+#: Model versions recorded on every candidate and looked up in the registry.
+FOOTBALL_VERSION = "1.0.0"
+TENNIS_VERSION = "1.0.0"
 
 
 @dataclass(slots=True)
@@ -78,6 +86,27 @@ def build_providers(
             "utilisez `betmaxxing scan --manual-odds <fichier.csv>`."
         )
 
+    if settings.odds_provider == "the_odds_api":
+        from betmaxxing.providers.the_odds_api import TheOddsApiProvider
+
+        if not settings.resolved_the_odds_api_key:
+            raise ProviderUnavailable(
+                "Fournisseur « the_odds_api » sélectionné mais "
+                "BETMAXXING_THE_ODDS_API_KEY est vide."
+            )
+        warnings.extend(settings.deprecation_warnings())
+        warnings.append(
+            "Adaptateur The Odds API au statut IMPLEMENTED_UNVERIFIED : la couverture "
+            f"de {settings.bookmakers} n'a pas été confirmée par un appel réel."
+        )
+        return ProviderBundle(
+            odds=TheOddsApiProvider(settings, now=now),
+            context=_NoContext(),
+            results=DemoResultsProvider(),
+            models=_models_for(settings, now),
+            warnings=warnings,
+        )
+
     if settings.odds_provider in ("", "demo"):
         raise ProviderUnavailable(
             f"Mode {settings.mode} : aucun fournisseur de cotes réel configuré. "
@@ -104,14 +133,31 @@ def _models_for(settings: Settings, now: datetime) -> ModelRegistry:
     (tranche 4). An empty registry produces ``NO_MODEL_AVAILABLE`` rejections —
     an honest "I cannot price this", not a fabricated probability.
     """
-    if settings.mode is RunMode.DEMO:
-        return ModelRegistry(
-            models={
-                Sport.FOOTBALL: FootballDixonColesModel(football_inputs(now)),
-                Sport.TENNIS: TennisHierarchicalModel(tennis_inputs(now)),
-            }
-        )
-    return ModelRegistry(models={})
+    if settings.mode is not RunMode.DEMO:
+        # No fitted rating store exists yet (tranche 4). An empty registry
+        # produces COLLECTED_NO_MODEL — real data is still collected and stored.
+        return ModelRegistry(models={})
+
+    football = FootballDixonColesModel(football_inputs(now))
+    tennis = TennisHierarchicalModel(tennis_inputs(now))
+    return ModelRegistry(
+        models={
+            Sport.FOOTBALL: RegisteredModel(
+                model=football,
+                version=FOOTBALL_VERSION,
+                validation_status=load_status_from_db(
+                    settings, football.model_id, FOOTBALL_VERSION
+                ),
+                uncertainty_status=UncertaintyStatus.SYNTHETIC,
+            ),
+            Sport.TENNIS: RegisteredModel(
+                model=tennis,
+                version=TENNIS_VERSION,
+                validation_status=load_status_from_db(settings, tennis.model_id, TENNIS_VERSION),
+                uncertainty_status=UncertaintyStatus.SYNTHETIC,
+            ),
+        }
+    )
 
 
 class _NoContext:

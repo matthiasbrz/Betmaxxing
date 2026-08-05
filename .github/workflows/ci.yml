@@ -11,9 +11,12 @@ concurrency:
 
 env:
   # Every job runs in demo mode: deterministic, keyless, and no network calls to
-  # any provider. A CI run must never depend on a bookmaker being reachable.
+  # any provider. A CI run must never depend on a bookmaker being reachable, and
+  # must never consume a provider credit. The opt-in smoke test
+  # (scripts/smoke_the_odds_api.py) is deliberately not invoked here.
   BETMAXXING_MODE: demo
   BETMAXXING_NOTIFICATIONS_ENABLED: "false"
+  BETMAXXING_CHALLENGE_ENABLED: "false"
 
 jobs:
   quality:
@@ -26,27 +29,42 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Install
+      - name: Install (pinned resolution)
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[dev]" -c constraints.txt
 
-      - name: Lint
-        run: ruff check src tests
+      - name: Lint (whole repository, migrations included)
+        run: ruff check .
 
-      - name: Format check
-        run: ruff format --check src tests
+      - name: Format check (whole repository)
+        run: ruff format --check .
 
       - name: Type check
         run: mypy
 
       - name: Tests
+        # pyproject sets `filterwarnings = ["error", ...]`, so any warning that
+        # is not explicitly listed there fails the suite. Passing -W here would
+        # override those filters, so it is deliberately absent.
         run: pytest --cov=betmaxxing --cov-report=term-missing
 
-      - name: Migrations apply from scratch
+      - name: Migrations apply to a fresh database
         env:
-          BETMAXXING_DATABASE_URL: sqlite+pysqlite:///./ci-migrations.db
+          BETMAXXING_DATABASE_URL: sqlite+pysqlite:///./ci-fresh.db
         run: alembic upgrade head
+
+      - name: Migrations apply from the reference schema
+        env:
+          BETMAXXING_DATABASE_URL: sqlite+pysqlite:///./ci-upgrade.db
+        run: |
+          alembic upgrade 65c32b5e3f63
+          alembic upgrade head
+
+      - name: No schema drift between models and migrations
+        env:
+          BETMAXXING_DATABASE_URL: sqlite+pysqlite:///./ci-fresh.db
+        run: alembic check
 
       - name: Demo scan runs end to end
         run: betmaxxing scan --json > /dev/null
@@ -83,3 +101,12 @@ jobs:
             exit 1
           fi
           echo "ok — no secret pattern found"
+
+      - name: The smoke test is never wired into CI
+        run: |
+          # It consumes real provider credits; it must stay opt-in and manual.
+          if grep -rn "smoke_the_odds_api" .github/workflows/ | grep -v "never wired"; then
+            echo "::error::the credit-consuming smoke test must not run in CI"
+            exit 1
+          fi
+          echo "ok — smoke test not invoked by CI"

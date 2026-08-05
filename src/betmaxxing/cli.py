@@ -14,9 +14,14 @@ from rich.table import Table
 from betmaxxing import DISCLAIMER, __version__
 from betmaxxing.config import RunMode, Settings, get_settings
 from betmaxxing.domain.enums import ScanStatus
-from betmaxxing.domain.models import Candidate, ScanResult
+from betmaxxing.domain.models import (
+    Candidate,
+    ScanResult,
+    UncertaintyEstimate,
+    ValueAssessment,
+)
 from betmaxxing.domain.timeutil import format_display, utc_now
-from betmaxxing.engine.scan import run_scan
+from betmaxxing.engine.acquisition import AcquisitionService
 from betmaxxing.providers.manual import ManualImportError, load_csv
 from betmaxxing.storage.db import create_all, session_scope
 from betmaxxing.storage.repositories import EventRepository, OddsRepository, ScanRepository
@@ -35,11 +40,26 @@ app.add_typer(db_app, name="db")
 console = Console()
 
 
+def _probability_line(
+    value: ValueAssessment, uncertainty: UncertaintyEstimate, half_width: float | None
+) -> str:
+    """Probability plus the provenance of its interval — or its absence."""
+    point = f"[bold]{value.conditional_win_probability:.1%}[/]"
+    lower, upper = uncertainty.lower, uncertainty.upper
+    if lower is None or upper is None or half_width is None:
+        return f"p modèle    : {point} · incertitude [yellow]{uncertainty.status}[/]"
+    return (
+        f"p modèle    : {point} [{lower:.1%} - {upper:.1%}] "
+        f"(±{half_width:.1%}) · {uncertainty.status}"
+    )
+
+
 def _candidate_card(candidate: Candidate) -> str:
     """Dense vertical summary — information hierarchy over table width."""
     value = candidate.value
     event = candidate.event
-    half_width = (value.model_probability_upper - value.model_probability_lower) / 2
+    uncertainty = candidate.probability.uncertainty
+    half_width = uncertainty.half_width
 
     header = f"[bold]{event.label}[/]"
     context = f"{event.competition}"
@@ -65,23 +85,30 @@ def _candidate_card(candidate: Candidate) -> str:
         f"Sélection   : [bold]{candidate.selection.label}[/]",
         f"Marché      : {candidate.selection.market} · {candidate.selection.period}"
         + (
-            f" · ligne {candidate.selection.line:g}" if candidate.selection.line is not None else ""
+            f" · ligne {candidate.selection.line_canonical}"
+            if candidate.selection.line is not None
+            else ""
         ),
         f"Cote        : [bold]{value.decimal_odds:.2f}[/] ({candidate.bookmaker}, "
         f"observée il y a {candidate.odds_age_seconds:.0f}s)",
         f"Implicite   : {implied}",
-        f"p modèle    : [bold]{value.model_probability:.1%}[/] "
-        f"[{value.model_probability_lower:.1%} - {value.model_probability_upper:.1%}] "
-        f"(±{half_width:.1%})",
-        f"Fair odds   : {value.fair_odds:.2f}",
-        f"EV          : [green]{value.ev * 100:+.2f}%[/] · "
-        f"prudente [bold]{value.ev_conservative * 100:+.2f}%[/]",
+        _probability_line(value, uncertainty, half_width),
+        f"Fair odds   : {value.fair_odds:.2f} · règlement {value.settlement_rule}",
+        f"EV          : [green]{value.ev * 100:+.2f}%[/] · prudente "
+        + (
+            f"[bold]{value.ev_conservative * 100:+.2f}%[/]"
+            if value.ev_conservative is not None
+            else "[yellow]indisponible[/]"
+        ),
         f"Cote min.   : {value.min_acceptable_odds:.2f} "
         f"[dim](sensibilité {value.ev_sensitivity_per_odds_tick * 100:+.2f}%/0,01)[/]",
         f"Qualité     : {candidate.data_quality.score:.2f} · "
         f"confiance {candidate.confidence['label']} ({candidate.confidence['score']:.2f})",
-        f"Modèle      : {candidate.model_id} [yellow]{candidate.probability.validation_status}[/]",
+        f"Modèle      : {candidate.model_id} v{candidate.model_version} "
+        f"[yellow]{candidate.probability.validation_status}[/]",
     ]
+    if uncertainty.warning:
+        lines.append(f"[bold yellow]!! {uncertainty.warning}[/]")
     if candidate.stake is not None:
         if candidate.stake.amount > 0:
             lines.append(
@@ -108,6 +135,7 @@ def _render(result: ScanResult, settings: Settings) -> None:
     console.print()
     console.rule(f"[bold {colour}]{result.status}[/] · mode {result.mode}")
     console.print(f"Scan       : {result.scan_id}")
+    console.print(f"Collecte   : {result.collection_status}")
     console.print(f"Généré     : {format_display(result.generated_at)}")
     console.print(
         f"Fenêtre    : {format_display(result.window['from'])} "
@@ -122,6 +150,10 @@ def _render(result: ScanResult, settings: Settings) -> None:
     console.print(
         f"Données    : {result.data_health.stale_snapshots} cote(s) périmée(s) · "
         f"{result.data_health.quarantined_records} enregistrement(s) en quarantaine"
+    )
+    console.print(
+        f"Persistées : {result.data_health.events_persisted} événement(s) · "
+        f"{result.data_health.snapshots_persisted} snapshot(s)"
     )
     console.print(f"Config     : {result.config_fingerprint}")
 
@@ -171,20 +203,35 @@ def scan(
         Path | None, typer.Option(help="Fichier CSV de cotes importées manuellement.")
     ] = None,
     as_json: Annotated[bool, typer.Option("--json", help="Sortie JSON brute.")] = False,
-    save: Annotated[bool, typer.Option(help="Enregistre le scan en base.")] = False,
+    save: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "Persiste événements, snapshots et scan. Activé par défaut : les "
+                "snapshots ne se retéléchargent pas. --no-save pour un essai à blanc."
+            )
+        ),
+    ] = True,
 ) -> None:
     """Lance un scan et retourne des candidats, `NO_BET` ou `DATA_UNAVAILABLE`."""
     settings = get_settings()
     if mode:
         settings = settings.model_copy(update={"mode": RunMode(mode)})
 
-    result = run_scan(settings, manual_odds_path=str(manual_odds) if manual_odds else None)
+    # One acquisition path for CLI, API and scheduler: collect, persist the
+    # source data, analyse, persist the scan.
+    outcome = AcquisitionService(settings).run(
+        manual_odds_path=str(manual_odds) if manual_odds else None,
+        persist=save,
+    )
+    result = outcome.scan
 
     if save:
-        create_all(settings)
-        with session_scope(settings) as session:
-            ScanRepository(session).save(result)
-        console.print(f"[dim]Scan {result.scan_id} enregistré.[/]")
+        console.print(
+            f"[dim]Scan {result.scan_id} enregistré · "
+            f"{outcome.events_persisted} événement(s), "
+            f"{outcome.snapshots_persisted} snapshot(s) écrit(s).[/]"
+        )
 
     if as_json:
         console.print_json(result.model_dump_json(indent=2))
@@ -206,7 +253,7 @@ def explain(
     settings = get_settings()
     if mode:
         settings = settings.model_copy(update={"mode": RunMode(mode)})
-    result = run_scan(settings)
+    result = AcquisitionService(settings).run().scan
     if not result.candidates:
         console.print("[yellow]Aucun candidat qualifié à expliquer.[/]")
         raise typer.Exit(code=1)

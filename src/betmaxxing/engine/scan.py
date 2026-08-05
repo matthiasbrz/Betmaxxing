@@ -1,101 +1,107 @@
-"""Scan orchestration — the end-to-end pipeline.
+"""Analysis: turn priced books into candidates or coded rejections.
 
-    discover events -> filter window -> fetch odds -> normalise into books
-      -> de-vig -> price with the model -> compute value -> gate -> explain
+Pure with respect to I/O — it receives already-collected events, books and
+snapshots and returns candidates plus rejections. Collection and persistence live
+in :mod:`betmaxxing.engine.acquisition`, so there is exactly one place that talks
+to providers and exactly one place that decides value.
 
-Every priced selection ends up either in ``candidates`` or in ``rejections``;
-nothing is dropped without a code. The scan returns ``NO_BET`` when no candidate
-survives, which is a normal outcome and not an error, and ``DATA_UNAVAILABLE``
-when the providers could not supply enough to decide.
+Every priced selection ends up either in ``candidates`` or in ``rejections`` with
+a code. Nothing is dropped silently.
 """
 
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-from betmaxxing import DISCLAIMER
-from betmaxxing.config import RunMode, Settings, get_settings
+from betmaxxing.config import RunMode, Settings
 from betmaxxing.domain.enums import (
     EXPECTED_SELECTION_COUNT,
     MARKETS_BY_SPORT,
     PARTITION_MARKETS,
     EventStatus,
+    MarketType,
     RejectionCode,
-    ScanStatus,
-    Sport,
+    UncertaintyStatus,
 )
 from betmaxxing.domain.ids import candidate_id
 from betmaxxing.domain.models import (
     Candidate,
     CanonicalEvent,
-    DataHealth,
     EvidenceItem,
     MarketBook,
     OddsSnapshot,
     ProbabilityEstimate,
-    ProviderStatus,
     Rejection,
-    ScanResult,
     ValueAssessment,
 )
-from betmaxxing.domain.timeutil import age_seconds, is_in_window, scan_window, utc_now
+from betmaxxing.domain.timeutil import age_seconds, is_in_window
 from betmaxxing.engine import eligibility, explain
-from betmaxxing.engine.ev import ValueMath
 from betmaxxing.engine.margin import DevigError, devig
+from betmaxxing.engine.payoff import (
+    PayoffDistribution,
+    PayoffError,
+    draw_no_bet_outcomes,
+    ev_sensitivity,
+    min_acceptable_odds,
+    two_way_outcomes,
+)
 from betmaxxing.engine.quality import score_confidence, score_data_quality
 from betmaxxing.engine.staking import compute_stake
-from betmaxxing.engine.uncertainty import wilson_interval
-from betmaxxing.ingestion.normalize import assemble_books, is_book_complete, odds_movement
+from betmaxxing.engine.uncertainty import uncertainty_for_mode
+from betmaxxing.ingestion.normalize import is_book_complete, odds_movement
 from betmaxxing.models_ml.base import MarketPrediction
-from betmaxxing.models_ml.registry import ModelRegistry
-from betmaxxing.providers.base import ProviderUnavailable
-from betmaxxing.providers.factory import ProviderBundle, build_providers
-
-SPORTS_IN_SCOPE: list[Sport] = [Sport.FOOTBALL, Sport.TENNIS]
+from betmaxxing.models_ml.registry import ModelRegistry, RegisteredModel
 
 
 @dataclass(slots=True)
-class _Workspace:
-    """Mutable bookkeeping for one scan."""
-
+class AnalysisOutput:
     candidates: list[Candidate]
     rejections: list[Rejection]
-    stale: int = 0
     markets_evaluated: int = 0
     selections_priced: int = 0
+    stale: int = 0
 
 
-def run_scan(
-    settings: Settings | None = None,
+@dataclass(slots=True)
+class _BookContext:
+    """Everything resolved once per book, before scoring its selections."""
+
+    novig: dict[str, float] | None
+    devig_method: str | None
+    complete: bool
+    expected_selections: int
+    in_scope: bool
+    prediction: MarketPrediction
+    registered: RegisteredModel
+    evidence: list[EvidenceItem]
+
+
+def analyse(
     *,
-    now: datetime | None = None,
-    manual_odds_path: str | None = None,
-    bundle: ProviderBundle | None = None,
-) -> ScanResult:
-    """Execute one full scan and return its stable result contract."""
-    settings = settings or get_settings()
-    moment = now or utc_now()
-    scan_id = uuid.uuid4().hex[:16]
-    window = scan_window(moment, settings.window_hours)
+    settings: Settings,
+    events: list[CanonicalEvent],
+    all_events: list[CanonicalEvent],
+    books: list[MarketBook],
+    snapshots: list[OddsSnapshot],
+    models: ModelRegistry,
+    context: object,
+    now: datetime,
+    scan_id: str,
+    window: tuple[datetime, datetime],
+) -> AnalysisOutput:
+    """Score every book and return candidates plus coded rejections."""
+    out = AnalysisOutput(candidates=[], rejections=[])
+    in_window_ids = {e.internal_id for e in events}
 
-    try:
-        providers = bundle or build_providers(settings, moment, manual_odds_path)
-    except ProviderUnavailable as exc:
-        return _unavailable(settings, scan_id, moment, window, str(exc))
-
-    events = providers.odds.list_events(SPORTS_IN_SCOPE, window)  # type: ignore[attr-defined]
-    in_window = [e for e in events if is_in_window(e.start_time_utc, window)]
-
-    workspace = _Workspace(candidates=[], rejections=[])
-
-    # Events discovered but outside the window are recorded, not forgotten.
-    for event in events:
-        if event not in in_window:
-            workspace.rejections.append(
+    # Events discovered but out of window are recorded, never forgotten.
+    for event in all_events:
+        if event.internal_id not in in_window_ids and not is_in_window(
+            event.start_time_utc, window
+        ):
+            out.rejections.append(
                 Rejection(
-                    event_canonical_id=event.canonical_id,
+                    event_internal_id=event.internal_id,
                     event_label=event.label,
                     selection_key="-",
                     code=RejectionCode.OUTSIDE_WINDOW,
@@ -106,59 +112,55 @@ def run_scan(
                 )
             )
 
-    snapshots: list[OddsSnapshot] = (
-        providers.odds.fetch_odds(in_window) if in_window else []  # type: ignore[attr-defined]
-    )
-    normalized = assemble_books(snapshots, moment)
+    events_by_id = {e.internal_id: e for e in events}
+    history = _history_index(snapshots)
 
-    if not in_window or not normalized.books:
-        health = _health(
-            providers,
-            events_discovered=len(events),
-            events_in_window=len(in_window),
-            workspace=workspace,
-            quarantined=len(normalized.quarantined),
-        )
-        status = ScanStatus.DATA_UNAVAILABLE if not snapshots and in_window else ScanStatus.NO_BET
-        return _result(settings, scan_id, moment, window, status, health, workspace)
-
-    events_by_id = {e.canonical_id: e for e in in_window}
-    history_by_selection = _history_index(snapshots)
-
-    for book in normalized.books:
-        event = events_by_id.get(book.event_canonical_id)
-        if event is None:
+    for book in books:
+        matched = events_by_id.get(book.event_internal_id)
+        if matched is None:
             continue
-        workspace.markets_evaluated += 1
+        out.markets_evaluated += 1
         _score_book(
             book=book,
-            event=event,
+            event=matched,
             settings=settings,
-            models=providers.models,
-            context=providers.context,
-            moment=moment,
+            models=models,
+            context=context,
+            now=now,
             scan_id=scan_id,
-            workspace=workspace,
-            history=history_by_selection,
+            out=out,
+            history=history,
         )
-
-    health = _health(
-        providers,
-        events_discovered=len(events),
-        events_in_window=len(in_window),
-        workspace=workspace,
-        quarantined=len(normalized.quarantined),
-    )
-    status = ScanStatus.CANDIDATES_FOUND if workspace.candidates else ScanStatus.NO_BET
-    return _result(settings, scan_id, moment, window, status, health, workspace)
+    return out
 
 
-def _history_index(snapshots: list[OddsSnapshot]) -> dict[tuple[str, str, str], list[OddsSnapshot]]:
+def _history_index(
+    snapshots: list[OddsSnapshot],
+) -> dict[tuple[str, str, str], list[OddsSnapshot]]:
     index: dict[tuple[str, str, str], list[OddsSnapshot]] = {}
     for snapshot in snapshots:
-        key = (snapshot.event_canonical_id, snapshot.bookmaker, snapshot.selection.key)
+        key = (snapshot.event_internal_id, snapshot.bookmaker, snapshot.selection.key)
         index.setdefault(key, []).append(snapshot)
     return index
+
+
+def _reject_book(
+    out: AnalysisOutput,
+    book: MarketBook,
+    event: CanonicalEvent,
+    code: RejectionCode,
+    detail: str,
+) -> None:
+    for snapshot in book.snapshots:
+        out.rejections.append(
+            Rejection(
+                event_internal_id=event.internal_id,
+                event_label=event.label,
+                selection_key=snapshot.selection.key,
+                code=code,
+                detail=detail,
+            )
+        )
 
 
 def _score_book(
@@ -168,94 +170,103 @@ def _score_book(
     settings: Settings,
     models: ModelRegistry,
     context: object,
-    moment: datetime,
+    now: datetime,
     scan_id: str,
-    workspace: _Workspace,
+    out: AnalysisOutput,
     history: dict[tuple[str, str, str], list[OddsSnapshot]],
 ) -> None:
-    """Price every selection of one book and gate each one."""
     complete = is_book_complete(book)
     expected = EXPECTED_SELECTION_COUNT.get(book.market, len(book.snapshots))
 
-    # De-vig only complete partition markets. Overlapping markets (double chance)
-    # and one-sided markets (wins-a-set) keep p_novig = None and say so.
     novig: dict[str, float] | None = None
     devig_name: str | None = None
     if complete and book.market in PARTITION_MARKETS:
         try:
-            odds_list = [s.decimal_odds for s in book.snapshots]
-            probs = devig(odds_list, settings.devig_method)
+            probs = devig([s.decimal_odds for s in book.snapshots], settings.devig_method)
             novig = {s.selection.code: p for s, p in zip(book.snapshots, probs, strict=True)}
             devig_name = str(settings.devig_method)
         except DevigError as exc:
-            complete = False
-            for snapshot in book.snapshots:
-                workspace.rejections.append(
-                    Rejection(
-                        event_canonical_id=event.canonical_id,
-                        event_label=event.label,
-                        selection_key=snapshot.selection.key,
-                        code=RejectionCode.MARKET_INCOMPLETE,
-                        detail=f"Retrait de marge impossible : {exc}",
-                    )
-                )
+            _reject_book(
+                out,
+                book,
+                event,
+                RejectionCode.MARKET_INCOMPLETE,
+                f"Retrait de marge impossible : {exc}",
+            )
             return
 
-    model = models.get(event.sport)
-    if model is None:
-        for snapshot in book.snapshots:
-            workspace.rejections.append(
-                Rejection(
-                    event_canonical_id=event.canonical_id,
-                    event_label=event.label,
-                    selection_key=snapshot.selection.key,
-                    code=RejectionCode.NO_MODEL_AVAILABLE,
-                    detail=f"Aucun modèle enregistré pour {event.sport}.",
-                )
-            )
+    registered = models.get(event.sport)
+    if registered is None:
+        _reject_book(
+            out,
+            book,
+            event,
+            RejectionCode.NO_MODEL_AVAILABLE,
+            f"Aucun modèle enregistré pour {event.sport}.",
+        )
         return
 
-    prediction: MarketPrediction | None = model.predict(event, book.market, book.period, book.line)
+    prediction = registered.model.predict(event, book.market, book.period, book.line)
     if prediction is None:
-        for snapshot in book.snapshots:
-            workspace.rejections.append(
-                Rejection(
-                    event_canonical_id=event.canonical_id,
-                    event_label=event.label,
-                    selection_key=snapshot.selection.key,
-                    code=RejectionCode.NO_MODEL_AVAILABLE,
-                    detail=(
-                        f"{model.model_id} ne price pas {book.market}/{book.period}"
-                        + (f" ligne {book.line:g}" if book.line is not None else "")
-                        + "."
-                    ),
-                )
-            )
+        line_note = f" ligne {book.line}" if book.line is not None else ""
+        _reject_book(
+            out,
+            book,
+            event,
+            RejectionCode.NO_MODEL_AVAILABLE,
+            f"{registered.model_id} ne price pas {book.market}/{book.period}{line_note}.",
+        )
         return
 
-    evidence = _evidence_for(context, event, prediction)
-    in_scope = book.market in MARKETS_BY_SPORT.get(event.sport, frozenset())
+    ctx = _BookContext(
+        novig=novig,
+        devig_method=devig_name,
+        complete=complete,
+        expected_selections=expected,
+        in_scope=book.market in MARKETS_BY_SPORT.get(event.sport, frozenset()),
+        prediction=prediction,
+        registered=registered,
+        evidence=_evidence_for(context, event),
+    )
 
     for snapshot in book.snapshots:
-        workspace.selections_priced += 1
+        out.selections_priced += 1
         _score_selection(
             snapshot=snapshot,
             book=book,
             event=event,
-            prediction=prediction,
-            novig=novig,
-            devig_name=devig_name,
-            complete=complete,
-            expected=expected,
-            in_scope=in_scope,
-            model_id=model.model_id,
+            ctx=ctx,
             settings=settings,
-            moment=moment,
+            now=now,
             scan_id=scan_id,
-            workspace=workspace,
-            evidence=evidence,
+            out=out,
             history=history,
         )
+
+
+def _build_payoff(
+    prediction: MarketPrediction, code: str, odds: float
+) -> PayoffDistribution | None:
+    """Build the settlement distribution for one selection.
+
+    Draw-no-bet gets a real push branch. Everything else in V1 is win/lose —
+    integer totals, which could push, are refused upstream.
+    """
+    p_win = prediction.probabilities.get(code)
+    if p_win is None or not (0.0 < p_win < 1.0):
+        return None
+    p_push = prediction.push_for(code)
+    try:
+        if p_push > 0.0:
+            p_loss = 1.0 - p_win - p_push
+            if p_loss < -1e-9:
+                return None
+            return draw_no_bet_outcomes(
+                p_win=p_win, p_push=p_push, p_loss=max(p_loss, 0.0), decimal_odds=odds
+            )
+        return two_way_outcomes(p_win=p_win, decimal_odds=odds)
+    except PayoffError:
+        return None
 
 
 def _score_selection(
@@ -263,26 +274,19 @@ def _score_selection(
     snapshot: OddsSnapshot,
     book: MarketBook,
     event: CanonicalEvent,
-    prediction: MarketPrediction,
-    novig: dict[str, float] | None,
-    devig_name: str | None,
-    complete: bool,
-    expected: int,
-    in_scope: bool,
-    model_id: str,
+    ctx: _BookContext,
     settings: Settings,
-    moment: datetime,
+    now: datetime,
     scan_id: str,
-    workspace: _Workspace,
-    evidence: list[EvidenceItem],
+    out: AnalysisOutput,
     history: dict[tuple[str, str, str], list[OddsSnapshot]],
 ) -> None:
     selection = snapshot.selection
-    probability = prediction.probabilities.get(selection.code)
-    if probability is None or not (0.0 < probability < 1.0):
-        workspace.rejections.append(
+    payoff = _build_payoff(ctx.prediction, selection.code, snapshot.decimal_odds)
+    if payoff is None:
+        out.rejections.append(
             Rejection(
-                event_canonical_id=event.canonical_id,
+                event_internal_id=event.internal_id,
                 event_label=event.label,
                 selection_key=selection.key,
                 code=RejectionCode.NO_MODEL_AVAILABLE,
@@ -294,45 +298,54 @@ def _score_selection(
         )
         return
 
-    age = age_seconds(snapshot.observed_at, moment)
+    age = age_seconds(snapshot.observed_at, now)
     if age > settings.max_odds_age_seconds:
-        workspace.stale += 1
+        out.stale += 1
 
-    interval = wilson_interval(
-        probability, prediction.effective_sample_size, settings.prob_interval_z
+    # The comparable figure: conditional on a decisive outcome, like a de-vigged
+    # market price. Not the same thing as the unconditional win probability.
+    p_comparable = payoff.conditional_win_probability
+    uncertainty = uncertainty_for_mode(
+        mode=settings.mode,
+        probability=p_comparable,
+        effective_sample_size=ctx.prediction.synthetic_sample_size,
+        z=settings.prob_interval_z,
     )
-    value_math = ValueMath(
-        odds=snapshot.decimal_odds,
-        probability=probability,
-        probability_lower=interval.lower,
-        probability_upper=interval.upper,
-        ev_threshold=settings.min_ev,
-    )
+
+    ev = payoff.expected_value
+    ev_conservative: float | None = None
+    if uncertainty.lower is not None:
+        try:
+            conservative = _rebuild_at_probability(payoff, uncertainty.lower)
+            ev_conservative = conservative.expected_value
+        except PayoffError:
+            ev_conservative = None
 
     quality = score_data_quality(
         odds_age_seconds=age,
         max_odds_age_seconds=float(settings.max_odds_age_seconds),
         selections_present=len(book.snapshots),
-        selections_expected=expected,
+        selections_expected=ctx.expected_selections,
         mapping_ambiguous=event.mapping_ambiguous,
-        feature_completeness=prediction.feature_completeness,
+        feature_completeness=ctx.prediction.feature_completeness,
         source_agreement=1.0,
     )
 
     gate = eligibility.evaluate(
         eligibility.GateInput(
-            ev=value_math.ev,
-            ev_conservative=value_math.ev_conservative,
-            probability_half_width=interval.half_width,
+            ev=ev,
+            ev_conservative=ev_conservative,
+            uncertainty_status=uncertainty.status,
+            probability_half_width=uncertainty.half_width,
             odds=snapshot.decimal_odds,
             odds_age_seconds=age,
             data_quality=quality.score,
-            market_complete=complete,
+            market_complete=ctx.complete,
             mapping_ambiguous=event.mapping_ambiguous,
             in_window=True,
-            in_scope=in_scope,
+            in_scope=ctx.in_scope,
             event_scheduled=event.status is EventStatus.SCHEDULED,
-            validation_status=prediction_status(model_id, settings),
+            validation_status=ctx.registered.validation_status,
             mode=settings.mode,
         ),
         settings,
@@ -340,9 +353,9 @@ def _score_selection(
 
     if not gate.passed:
         for code, detail in zip(gate.codes, gate.details, strict=True):
-            workspace.rejections.append(
+            out.rejections.append(
                 Rejection(
-                    event_canonical_id=event.canonical_id,
+                    event_internal_id=event.internal_id,
                     event_label=event.label,
                     selection_key=selection.key,
                     code=code,
@@ -352,48 +365,52 @@ def _score_selection(
         return
 
     estimate = ProbabilityEstimate(
-        probability=probability,
-        lower=interval.lower,
-        upper=interval.upper,
-        effective_sample_size=prediction.effective_sample_size,
-        model_id=model_id,
-        validation_status=prediction_status(model_id, settings),
+        probability=p_comparable,
+        model_id=ctx.registered.model_id,
+        model_version=ctx.registered.version,
+        validation_status=ctx.registered.validation_status,
+        uncertainty=uncertainty,
     )
     assessment = ValueAssessment(
         decimal_odds=snapshot.decimal_odds,
-        implied_probability_raw=value_math.implied_raw,
-        implied_probability_novig=(novig or {}).get(selection.code),
-        devig_method=devig_name,
-        model_probability=probability,
-        model_probability_lower=interval.lower,
-        model_probability_upper=interval.upper,
-        fair_odds=value_math.fair,
-        ev=value_math.ev,
-        ev_conservative=value_math.ev_conservative,
-        min_acceptable_odds=value_math.min_odds,
-        ev_sensitivity_per_odds_tick=value_math.sensitivity,
-        overround=book.overround if complete else None,
+        implied_probability_raw=snapshot.implied_probability_raw,
+        implied_probability_novig=(ctx.novig or {}).get(selection.code),
+        devig_method=ctx.devig_method,
+        win_probability=payoff.win_probability,
+        push_probability=payoff.push_probability,
+        conditional_win_probability=p_comparable,
+        settlement_rule=str(payoff.rule),
+        payoff_outcomes=[
+            {"name": o.name, "probability": o.probability, "net_return": o.net_return}
+            for o in payoff.outcomes
+        ],
+        fair_odds=payoff.fair_odds,
+        ev=ev,
+        ev_conservative=ev_conservative,
+        min_acceptable_odds=min_acceptable_odds(payoff, settings.min_ev),
+        ev_sensitivity_per_odds_tick=ev_sensitivity(payoff),
+        overround=book.overround if ctx.complete else None,
     )
     confidence = score_confidence(
         data_quality=quality.score,
-        probability_half_width=interval.half_width,
+        probability_half_width=uncertainty.half_width,
         max_half_width=settings.max_prob_half_width,
-        ev=value_math.ev,
+        ev=ev,
         min_ev=settings.min_ev,
-        model_validated=prediction_status(model_id, settings).value != "BACKTEST_ONLY",
+        model_validated=ctx.registered.validation_status.value != "BACKTEST_ONLY",
+        uncertainty_status=uncertainty.status,
     )
     stake = compute_stake(
         settings=settings,
         odds=snapshot.decimal_odds,
-        probability_conservative=interval.lower,
-        probability_half_width=interval.half_width,
+        probability_conservative=uncertainty.lower,
+        probability_half_width=uncertainty.half_width,
+        uncertainty_status=uncertainty.status,
     )
 
-    model_evidence = _model_evidence(prediction, moment)
-    all_evidence = (model_evidence + evidence)[:5]
-
+    evidence = (_model_evidence(ctx.prediction, now) + ctx.evidence)[:5]
     candidate = Candidate(
-        candidate_id=candidate_id(scan_id, event.canonical_id, selection.key, snapshot.bookmaker),
+        candidate_id=candidate_id(scan_id, event.internal_id, selection.key, snapshot.bookmaker),
         event=event,
         selection=selection,
         bookmaker=snapshot.bookmaker,
@@ -404,7 +421,7 @@ def _score_selection(
         probability=estimate,
         data_quality=quality,
         confidence=confidence,
-        evidence=all_evidence,
+        evidence=evidence,
         risks=explain.build_risks(
             event=event,
             selection=selection,
@@ -412,51 +429,56 @@ def _score_selection(
             value=assessment,
             data_quality=quality,
         ),
-        missing_information=explain.build_missing_information(all_evidence),
+        missing_information=explain.build_missing_information(evidence),
         invalidation_conditions=explain.build_invalidation_conditions(assessment, event),
         odds_movement=odds_movement(
-            history.get((event.canonical_id, snapshot.bookmaker, selection.key), [])
+            history.get((event.internal_id, snapshot.bookmaker, selection.key), [])
         ),
         stake=stake,
-        model_id=model_id,
+        model_id=ctx.registered.model_id,
+        model_version=ctx.registered.version,
         config_fingerprint=settings.fingerprint(),
     )
-    workspace.candidates.append(
+    out.candidates.append(
         candidate.model_copy(update={"explanation": explain.render_explanation(candidate)})
     )
 
 
-def prediction_status(model_id: str, settings: Settings):  # type: ignore[no-untyped-def]
-    """Validation status attached to a produced probability.
+def _rebuild_at_probability(
+    payoff: PayoffDistribution, conditional_lower: float
+) -> PayoffDistribution:
+    """Recompute the payoff at a pessimistic conditional probability.
 
-    Kept as a function so the promotion rules stay in one place once a model
-    registry backed by the validation protocol replaces the hard-coded default.
+    The push mass is held fixed and the decisive mass redistributed, so a
+    conservative EV on a refundable market stays a valid settlement description
+    rather than a rescaled point estimate.
     """
-    from betmaxxing.domain.enums import ValidationStatus
-
-    del model_id, settings
-    return ValidationStatus.BACKTEST_ONLY
+    decisive = 1.0 - payoff.push_probability
+    p_win = conditional_lower * decisive
+    p_loss = decisive - p_win
+    if payoff.push_probability > 0.0:
+        return draw_no_bet_outcomes(
+            p_win=p_win,
+            p_push=payoff.push_probability,
+            p_loss=p_loss,
+            decimal_odds=payoff.decimal_odds,
+        )
+    return two_way_outcomes(p_win=p_win, decimal_odds=payoff.decimal_odds)
 
 
 def _model_evidence(prediction: MarketPrediction, moment: datetime) -> list[EvidenceItem]:
-    """Turn model diagnostics into sourced evidence items."""
-    items: list[EvidenceItem] = []
-    for key, value in list(prediction.diagnostics.items())[:3]:
-        items.append(
-            EvidenceItem(
-                text=f"{key} = {value}",
-                source="betmaxxing:model-diagnostics",
-                as_of=moment,
-                kind="fact",
-            )
+    return [
+        EvidenceItem(
+            text=f"{key} = {value}",
+            source="betmaxxing:model-diagnostics",
+            as_of=moment,
+            kind="fact",
         )
-    return items
+        for key, value in list(prediction.diagnostics.items())[:3]
+    ]
 
 
-def _evidence_for(
-    context: object, event: CanonicalEvent, prediction: MarketPrediction
-) -> list[EvidenceItem]:
-    del prediction
+def _evidence_for(context: object, event: CanonicalEvent) -> list[EvidenceItem]:
     getter = getattr(context, "context_for", None)
     if getter is None:
         return []
@@ -466,91 +488,19 @@ def _evidence_for(
         return []
 
 
-def _health(
-    providers: ProviderBundle,
-    *,
-    events_discovered: int,
-    events_in_window: int,
-    workspace: _Workspace,
-    quarantined: int,
-) -> DataHealth:
-    statuses: list[ProviderStatus] = []
-    for provider in (providers.odds, providers.context, providers.results):
-        health = getattr(provider, "health", None)
-        if health is not None:
-            statuses.append(health())
-    return DataHealth(
-        providers=statuses,
-        events_discovered=events_discovered,
-        events_in_window=events_in_window,
-        markets_evaluated=workspace.markets_evaluated,
-        selections_priced=workspace.selections_priced,
-        stale_snapshots=workspace.stale,
-        quarantined_records=quarantined,
-    )
+#: Markets whose settlement can refund the stake, for documentation and tests.
+REFUNDABLE_MARKETS = frozenset({MarketType.DRAW_NO_BET})
 
 
-def _result(
-    settings: Settings,
-    scan_id: str,
-    moment: datetime,
-    window: tuple[datetime, datetime],
-    status: ScanStatus,
-    health: DataHealth,
-    workspace: _Workspace,
-) -> ScanResult:
-    summary: dict[str, int] = {}
-    for rejection in workspace.rejections:
-        summary[rejection.code.value] = summary.get(rejection.code.value, 0) + 1
-    return ScanResult(
-        scan_id=scan_id,
-        status=status,
-        mode=str(settings.mode),
-        generated_at=moment,
-        window={"from": window[0], "to": window[1]},
-        data_health=health,
-        candidates=sorted(workspace.candidates, key=lambda c: c.value.ev, reverse=True),
-        rejections=workspace.rejections,
-        rejections_summary=dict(sorted(summary.items())),
-        thresholds=settings.eligibility_thresholds(),
-        config_fingerprint=settings.fingerprint(),
-        disclaimer=DISCLAIMER,
-    )
-
-
-def _unavailable(
-    settings: Settings,
-    scan_id: str,
-    moment: datetime,
-    window: tuple[datetime, datetime],
-    reason: str,
-) -> ScanResult:
-    health = DataHealth(
-        providers=[
-            ProviderStatus(
-                name=settings.odds_provider or "none",
-                kind="odds",
-                health="unavailable",  # type: ignore[arg-type]
-                detail=reason,
-            )
-        ],
-        events_discovered=0,
-        events_in_window=0,
-        markets_evaluated=0,
-        selections_priced=0,
-        stale_snapshots=0,
-        quarantined_records=0,
-    )
-    return _result(
-        settings,
-        scan_id,
-        moment,
-        window,
-        ScanStatus.DATA_UNAVAILABLE,
-        health,
-        _Workspace(candidates=[], rejections=[]),
-    )
-
-
-def scan_is_demo(settings: Settings) -> bool:
+def demo_uncertainty_is_synthetic(settings: Settings) -> bool:
+    """True when this run's uncertainty is a labelled placeholder."""
     return settings.mode is RunMode.DEMO
+
+
+__all__ = [
+    "REFUNDABLE_MARKETS",
+    "AnalysisOutput",
+    "UncertaintyStatus",
+    "analyse",
+    "demo_uncertainty_is_synthetic",
+]

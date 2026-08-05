@@ -39,25 +39,54 @@ Le planificateur **ne doit pas** tourner dans le serveur web :
 - un serveur à N workers déclencherait chaque tâche N fois ;
 - un scan qui occupe un worker dégrade le service des requêtes.
 
-## Idempotence
+## Sémantique exacte
 
-Chaque tâche porte un `job_key` déterministe, dérivé de (type, minute d'exécution, sujet).
-Les clés déjà exécutées sont conservées et ne sont jamais rejouées, donc :
+Une passe (`tick`) fait exactement ceci :
 
-- un redémarrage en cours de passe ne réexécute pas ce qui est fait ;
-- une passe partiellement terminée reprend exactement là où elle en était.
+1. **matérialiser** — insérer dans `scheduler_jobs` les occurrences qui devraient
+   exister dans les deux prochains jours ;
+2. **réclamer** — prendre atomiquement les occurrences dues, avec un bail ;
+3. **exécuter** — un jalon tourne **cadré sur son événement** (`scope_id`) ;
+4. **acquitter** — marquer `SUCCEEDED` **après** la persistance du lot.
 
-## Verrou
+L'ordre du point 4 est ce qui compte : acquitter avant la persistance ferait croire
+au ledger qu'un lot est collecté alors qu'un crash l'a perdu.
 
-Un verrou par fichier (`O_CREAT | O_EXCL`, `/tmp/betmaxxing-scheduler.lock` par défaut,
-surchargeable par `BETMAXXING_LOCK_PATH`) empêche deux planificateurs de coexister.
+> **Historique.** L'implémentation précédente ne pouvait jamais déclencher : la
+> planification écartait les occurrences `run_at <= now` et la sélection ne gardait
+> que `run_at <= now`. L'intersection était vide par construction. Voir D-020.
 
-**Limite explicite :** il protège contre deux processus sur **un même hôte**, pas contre
-deux machines. Un verrou consultatif PostgreSQL est le remplacement prévu si un
-déploiement multi-hôtes devient nécessaire.
+## États
 
-Si un processus s'est arrêté brutalement, le fichier peut subsister. Le message d'erreur
-le dit et indique de le supprimer après avoir vérifié qu'aucun planificateur ne tourne.
+`PENDING` → `RUNNING` → `SUCCEEDED`, ou `FAILED_RETRYABLE` (réessayable jusqu'à
+3 tentatives) → `FAILED_FINAL`.
+
+## Idempotence et reprise
+
+Une contrainte unique sur `(job_type, scheduled_for, scope_id)` rend l'insertion
+idempotente : deux passes identiques ne créent pas de doublon. L'état vit **en base**,
+pas en mémoire, donc :
+
+- un redémarrage ne rejoue pas une occurrence déjà réussie ;
+- une occurrence `PENDING` en retard est reprise ;
+- une occurrence `RUNNING` dont le bail a expiré (worker crashé) est récupérable.
+
+## Rattrapage borné
+
+Les occurrences antérieures à `DEFAULT_CATCHUP_GRACE` (2 h) ne sont pas matérialisées.
+Rejouer une journée de scans manqués après une panne consommerait du quota fournisseur
+pour produire des analyses périmées.
+
+## Concurrence — ce qui est garanti, et ce qui ne l'est pas
+
+**Garanti.** La réclamation est un `UPDATE` conditionnel (`WHERE job_id = … AND
+state = …`) ; « 0 ligne modifiée » signifie « quelqu'un d'autre l'a prise ». PostgreSQL
+sérialise par verrou de ligne, SQLite par verrou d'écriture global. Plusieurs workers
+contre **une même base** sont donc sûrs, et c'est testé.
+
+**Non garanti.** Rien ne coordonne plusieurs bases. Le bail (15 min par défaut) borne
+le temps pendant lequel un worker crashé bloque une occurrence ; il ne fait pas office
+de verrou distribué.
 
 ## Quotas
 

@@ -7,7 +7,7 @@ uniquement à l'affichage.
 
 | Champ | Type | Description |
 |---|---|---|
-| `canonical_id` | str | Dérivé de (sport, date UTC, participants normalisés) |
+| `internal_id` | str | **Opaque et stable** (`evt_…`). Aucune sémantique temporelle : un report ne le change pas |
 | `sport` | enum | `football`, `tennis` |
 | `competition` | str | Libellé de la compétition tel que publié |
 | `stage` | str? | Tour ou journée (« R64 », « J3 ») |
@@ -30,8 +30,9 @@ correspondent.
 | `period` | enum | `full_time`, `first_half` |
 | `code` | str | Clé machine : `home`, `draw`, `away`, `over`, `under`, `home_or_draw`, … |
 | `label` | str | Libellé **exact** du bookmaker, conservé verbatim |
-| `line` | float? | Obligatoire sur over/under, interdit ailleurs. Lignes entières refusées |
-| `key` | str | `market|period|line|code` — dérivé |
+| `line` | Decimal? | Obligatoire sur over/under, interdit ailleurs. Lignes entières refusées |
+| `line_canonical` | str? | Texte décimal normalisé : `2.5`, `2.50`, `2.500` → `2.5` |
+| `key` | str | `market\|period\|line_canonical\|code` — **jamais** un rendu de float |
 
 ## `OddsSnapshot` (immuable, append-only)
 
@@ -39,7 +40,7 @@ correspondent.
 |---|---|---|
 | `provider` | str | Adaptateur ayant fourni la donnée |
 | `bookmaker` | str | Book effectivement coté — jamais mélangé avec un autre |
-| `event_canonical_id` | str | Rapprochement canonique |
+| `event_internal_id` | str | Identité interne résolue |
 | `event_source_id` | str | Identifiant chez la source |
 | `selection` | Selection | Voir ci-dessus |
 | `decimal_odds` | float | > 1.0, strictement |
@@ -66,11 +67,21 @@ Prix d'un même (événement, marché, période, ligne) chez **un seul** bookmak
 | Champ | Description |
 |---|---|
 | `probability` | Probabilité du modèle, dans (0, 1) |
-| `lower` / `upper` | Bornes de l'intervalle (Wilson) |
-| `effective_sample_size` | Information effective derrière l'estimation |
-| `model_id` | Identifiant et version du modèle |
-| `validation_status` | `BACKTEST_ONLY`, `PAPER_VALIDATED`, `LIVE_ANALYSIS` |
-| `half_width` | `(upper − lower) / 2` — comparé à `max_prob_half_width` |
+| `model_id` | Identifiant du modèle |
+| `model_version` | Version enregistrée |
+| `validation_status` | Lu depuis `model_registry`, jamais codé en dur |
+| `uncertainty` | Objet `UncertaintyEstimate` — voir ci-dessous |
+
+## `UncertaintyEstimate` (D-019)
+
+| Champ | Description |
+|---|---|
+| `method` | `none`, `synthetic_wilson_demo`, … |
+| `status` | `SYNTHETIC` \| `UNAVAILABLE` \| `ESTIMATED` \| `VALIDATED` |
+| `lower` / `upper` | **Nullables.** Absents quand le statut est `UNAVAILABLE` |
+| `effective_sample_size` | **Nullable.** Uniquement pour une vraie proportion ou un substitut synthétique |
+| `warning` | Texte visible, ex. `SYNTHETIC — NE PAS PARIER` |
+| `half_width` | `None` sans bornes |
 
 ## `ValueAssessment`
 
@@ -79,9 +90,14 @@ Prix d'un même (événement, marché, période, ligne) chez **un seul** bookmak
 | `implied_probability_raw` | `1 / o` |
 | `implied_probability_novig` | Après retrait de marge, ou `None` si le marché n'est pas une partition complète |
 | `devig_method` | Méthode appliquée, ou `None` |
-| `fair_odds` | `1 / p` |
-| `ev` | `p · o − 1` |
-| `ev_conservative` | `p_borne_basse · o − 1` |
+| `win_probability` | Probabilité **inconditionnelle** de gagner |
+| `push_probability` | Probabilité de remboursement (nul en DNB, ligne entière) |
+| `conditional_win_probability` | `p_win / (p_win + p_loss)` — comparable au prix sans marge |
+| `settlement_rule` | `WIN_LOSE`, `STAKE_REFUNDED_ON_PUSH`, … |
+| `payoff_outcomes` | Distribution complète `(nom, probabilité, rendement net)` |
+| `fair_odds` | `(p_win + p_loss) / p_win` — se réduit à `1/p` sans remboursement |
+| `ev` | `Σ p(issue) × rendement_net(issue)` |
+| `ev_conservative` | **Nullable.** `None` sans méthode d'incertitude utilisable |
 | `min_acceptable_odds` | `(1 + seuil) / p` |
 | `ev_sensitivity_per_odds_tick` | `p × 0,01` |
 | `overround` | Overround du book, ou `None` si incomplet |
@@ -117,7 +133,10 @@ Score composite dans [0, 1] avec ses composantes.
 
 | Champ | Description |
 |---|---|
-| `status` | `CANDIDATES_FOUND`, `NO_BET`, `DATA_UNAVAILABLE` |
+| `status` | `CANDIDATES_FOUND`, `NO_BET` (= `NO_CANDIDATE`), `DATA_UNAVAILABLE` |
+| `collection_status` | `OK`, `COLLECTED_NO_MODEL`, `NO_CANDIDATE`, `COVERAGE_MISSING`, `DATA_STALE`, `PROVIDER_ERROR` |
+| `batch_id` | Lot de collecte dont proviennent les enregistrements |
+| `warnings` | Avertissements fournisseur et erreurs partielles |
 | `window` | `{from, to}` en UTC |
 | `data_health` | État des fournisseurs et compteurs |
 | `candidates` | Triés par EV décroissante |
@@ -137,4 +156,18 @@ Score composite dans [0, 1] avec ses composantes.
 | `candidates` | Vue aplatie + document |
 | `rejections` | Codes et détails |
 | `alerts` | Ledger de déduplication des notifications |
-| `challenges` / `challenge_steps` | Challenge — Montante |
+| `challenges` / `challenge_steps` | Challenge — Montante, avec `version` (concurrence optimiste) |
+| `scheduler_jobs` | Occurrences du planificateur ; unique sur `(job_type, scheduled_for, scope_id)` |
+| `event_source_map` | `(provider, provider_event_id) → internal_id` — résolution autoritaire |
+| `event_schedule_history` | Trace append-only des changements d'horaire et de statut |
+| `participant_aliases` | Orthographes alternatives par fournisseur |
+| `collection_batches` | Un lot de collecte, **même sans candidat** |
+| `model_registry` | Statut de validation persistant par `(model_id, version)` |
+
+## Contrat de stockage des dates
+
+Tout est écrit en UTC. SQLite n'a pas de type conscient du fuseau, donc une valeur
+relue est naïve : `from_storage()` la réattache à UTC. `ensure_utc()` continue de
+**refuser** un datetime naïf venant d'un fournisseur ou d'un utilisateur — les deux
+cas sont volontairement dans des fonctions distinctes pour que la lecture permissive
+ne soit jamais atteignable depuis un chemin d'ingestion.

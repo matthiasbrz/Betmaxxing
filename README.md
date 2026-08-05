@@ -17,7 +17,7 @@ Le résultat normal d'un scan peut être **`NO_BET`**. C'est une réponse, pas u
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev]" -c constraints.txt   # résolution reproductible
 
 betmaxxing scan            # scan complet en mode démo
 betmaxxing scan --json     # sortie JSON brute
@@ -36,9 +36,9 @@ uvicorn betmaxxing.api.main:app --reload
 Tests, lint, types :
 
 ```bash
-pytest            # 474 tests
-ruff check src tests
-ruff format --check src tests
+pytest                 # 670 tests
+ruff check .           # tout le dépôt, migrations comprises
+ruff format --check .
 mypy
 ```
 
@@ -51,13 +51,13 @@ confondue avec une donnée réelle.
 ## Ce que fait un scan
 
 ```
-découverte des événements
+collecte fournisseur (hors transaction)
+  → résolution d'identité + PERSISTANCE des événements et snapshots
   → filtre fenêtre ]maintenant, +24 h]
-  → récupération des cotes
   → normalisation en books immuables (déduplication, quarantaine)
   → retrait de la marge (shin par défaut)
-  → probabilité du modèle + intervalle d'incertitude
-  → EV, EV prudente, cote minimale acceptable, sensibilité
+  → probabilité du modèle + statut d'incertitude
+  → distribution de règlement → EV, EV prudente, cote min., sensibilité
   → grille d'éligibilité (conjonctive)
   → explication déterministe sourcée
 ```
@@ -72,7 +72,8 @@ Statuts possibles : `CANDIDATES_FOUND`, `NO_BET`, `DATA_UNAVAILABLE`.
 `EV_TOO_LOW`, `CONSERVATIVE_EV_NEGATIVE`, `ODDS_STALE`, `MARKET_INCOMPLETE`,
 `UNCERTAINTY_TOO_HIGH`, `LOW_DATA_QUALITY`, `OUT_OF_SCOPE`, `EVENT_MAPPING_AMBIGUOUS`,
 `MODEL_NOT_VALIDATED`, `OUTSIDE_WINDOW`, `ODDS_OUT_OF_RANGE`, `NO_MODEL_AVAILABLE`,
-`EVENT_NOT_SCHEDULED`, `MISSING_LINE`.
+`EVENT_NOT_SCHEDULED`, `MISSING_LINE`, `UNCERTAINTY_UNAVAILABLE`,
+`BOOKMAKER_COVERAGE_MISSING`.
 
 ---
 
@@ -84,14 +85,30 @@ Pour une cote décimale `o` et une probabilité estimée `p` :
 |---|---|
 | Probabilité implicite brute | `p_raw = 1 / o` |
 | Probabilité sans marge | méthode de de-vig configurable |
-| Fair odds du modèle | `1 / p` |
-| Espérance de valeur | `EV = p · o − 1` |
-| EV prudente | `EV = p_borne_basse · o − 1` |
+| Fair odds du modèle | `(p_win + p_perte) / p_win`, soit `1/p` sans remboursement |
+| Espérance de valeur | `EV = Σ p(issue) × rendement_net(issue)` |
+| EV prudente | recalculée à la borne basse — **`null` sans méthode d'incertitude** |
 | Cote minimale acceptable | `(1 + seuil) / p` |
 | Sensibilité | `dEV/do = p` |
 
-L'**EV prudente** est le filtre qui compte : elle recalcule l'EV à la borne basse de
-l'intervalle de probabilité. Un point estimé flatteur avec un intervalle large ne passe pas.
+`p · o − 1` n'est correct que pour un pari sans remboursement. Le draw-no-bet rembourse
+la mise sur un nul, donc son EV vient d'une **distribution de règlement** ; la forme
+conditionnelle surestimait la magnitude de `1/(1 − p_nul)` (D-024). Les marchés sans
+remboursement reproduisent exactement l'ancienne arithmétique.
+
+### Incertitude — lisez ceci avant d'interpréter une EV prudente
+
+L'incertitude porte un **statut** : `SYNTHETIC`, `UNAVAILABLE`, `ESTIMATED` ou
+`VALIDATED`. Aujourd'hui, **aucun modèle ne dispose d'une méthode défendable**.
+
+| Mode | Statut | `ev_conservative` | Candidats publiés |
+|---|---|---|---|
+| `demo` | `SYNTHETIC — NE PAS PARIER` | calculée, **fabriquée** | oui, illustratifs |
+| `paper` / `live_analysis` | `UNAVAILABLE` | `null` | **aucun** (`UNCERTAINTY_UNAVAILABLE`) |
+
+Un intervalle de Wilson décrit une proportion binomiale observée, pas la précision d'une
+prédiction de modèle. La version précédente s'en servait pour filtrer de vrais candidats ;
+D-019 supprime cette possibilité. Voir `docs/decisions.md`.
 
 ### Retrait de la marge
 
@@ -135,6 +152,25 @@ publication d'un candidat en mode `live_analysis`. La promotion suit
 `paper` et `live_analysis` **ne retombent jamais** sur les données de démonstration. Une
 clé manquante produit `DATA_UNAVAILABLE` en nommant la variable absente.
 
+Un scan rapporte aussi un `collection_status` : `OK`, `COLLECTED_NO_MODEL`,
+`NO_CANDIDATE`, `COVERAGE_MISSING`, `DATA_STALE` ou `PROVIDER_ERROR`. « Aucun modèle » et
+« fournisseur en panne » donnent tous deux zéro candidat ; un seul est une panne.
+
+## The Odds API — `IMPLEMENTED_UNVERIFIED`
+
+L'adaptateur est implémenté et testé sur contrats locaux (aucun appel réseau en CI).
+**Aucun appel réel n'a été effectué**, donc la couverture de `winamax_fr` n'est pas
+confirmée. Pour la vérifier vous-même :
+
+```bash
+export BETMAXXING_THE_ODDS_API_KEY=...   # votre clé, jamais versionnée
+export BETMAXXING_SMOKE_TEST=1
+python scripts/smoke_the_odds_api.py
+```
+
+Une réponse valide sans Winamax est `COVERAGE_MISSING`, pas une panne — et ne déclenche
+jamais le mode démo. Détails et marchés refusés : `docs/source-matrix.md`.
+
 ---
 
 ## Cotes Winamax
@@ -160,13 +196,13 @@ sans décalage UTC est mis en quarantaine plutôt que deviné. Voir `docs/source
 src/betmaxxing/
   config.py          seuils centralisés, versionnés, empreinte reproductible
   domain/            vocabulaires, entités, identifiants canoniques, temps
-  providers/         adaptateurs (demo, import manuel, notifications) + interfaces
-  ingestion/         déduplication, assemblage des books, quarantaine
-  engine/            marge, EV, incertitude, mise, éligibilité, explication, scan
+  providers/         demo, the_odds_api, import manuel, notifications + interfaces
+  ingestion/         identité des événements, déduplication, books, quarantaine
+  engine/            acquisition, marge, payoff, EV, incertitude, éligibilité, scan
   models_ml/         baselines football et tennis, registre + garde de validation
   evaluation/        métriques du protocole de validation
-  challenge/         Challenge — Montante (désactivé par défaut)
-  scheduler/         planification (processus séparé)
+  challenge/         Challenge — Montante (désactivé par défaut, persistant)
+  scheduler/         ledger d'occurrences + runner (processus séparé)
   storage/           schéma, sessions, dépôts
   api/               FastAPI (aucune route ne place de pari)
   cli.py
@@ -202,7 +238,7 @@ doit être vérifiée auprès de l'ANJ avant diffusion plutôt qu'affichée pér
 | `docs/model-cards.md` | model cards, hypothèses, limites |
 | `docs/scheduler.md` | exploitation du planificateur |
 | `docs/deployment.md` | déploiement et sauvegarde |
-| `docs/decisions.md` | journal des décisions |
+| `docs/decisions.md` | journal des décisions (D-019 supersède D-008) |
 | `docs/roadmap.md` | état, en cours, blocages, prochaine action |
 
 ---
@@ -214,5 +250,8 @@ doit être vérifiée auprès de l'ANJ avant diffusion plutôt qu'affichée pér
 - Aucun adaptateur de fournisseur de cotes réel n'est implémenté (tranche 3).
 - Aucun entraînement : les forces d'équipe et Elo sont fournis en entrée (tranche 4).
 - Interface web React non commencée (tranche 6) ; CLI et API couvrent les usages actuels.
-- L'état des challenges vit en mémoire dans l'API.
-- Le verrou du planificateur protège un hôte, pas un cluster.
+- **Aucune méthode d'incertitude défendable** : `paper` et `live_analysis` ne publient
+  rien aujourd'hui.
+- `TheOddsApiProvider` est `IMPLEMENTED_UNVERIFIED` — aucun appel réel.
+- Le Challenge est `PARTIAL` : persistant et testé, mais désactivé par défaut.
+- Le planificateur est sûr multi-workers contre **une seule** base, pas un cluster.

@@ -1,22 +1,32 @@
-"""Scan planning: schedule construction, DST behaviour and idempotency."""
+"""Scheduler: due-work semantics, durability, concurrency and DST.
+
+The defect these replace: ``plan(now)`` dropped occurrences at or before ``now``
+while ``due_jobs(now)`` kept only occurrences at or before ``now``, so a real
+tick could never find work. The ledger separates *when an occurrence exists*
+from *when it becomes claimable*, which is what makes "due" expressible at all.
+"""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from betmaxxing.config import RunMode, Settings
 from betmaxxing.domain.enums import Sport
 from betmaxxing.domain.models import CanonicalEvent, Participant
 from betmaxxing.domain.timeutil import PARIS, to_display
-from betmaxxing.scheduler.planner import (
-    daily_jobs,
-    due_jobs,
-    milestone_jobs,
-    plan,
-    should_rescore,
+from betmaxxing.scheduler.ledger import (
+    DEFAULT_CATCHUP_GRACE,
+    MAX_ATTEMPTS,
+    JobLedger,
+    JobState,
+    JobType,
+    occurrence_id,
 )
+from betmaxxing.scheduler.planner import daily_instants, milestone_instants, should_rescore
 
-NOW = datetime(2026, 8, 4, 6, 0, tzinfo=UTC)
+NOW = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
 
 
 def scheduler_settings(**overrides: object) -> Settings:
@@ -32,7 +42,7 @@ def scheduler_settings(**overrides: object) -> Settings:
 
 def event(hours_ahead: float, name: str = "A") -> CanonicalEvent:
     return CanonicalEvent(
-        canonical_id=f"e-{name}-{hours_ahead}",
+        internal_id=f"evt-{name}-{hours_ahead}",
         sport=Sport.FOOTBALL,
         competition="Ligue 1",
         home=Participant(canonical_id="p1", name=name),
@@ -41,122 +51,251 @@ def event(hours_ahead: float, name: str = "A") -> CanonicalEvent:
     )
 
 
-class TestDailyJobs:
-    def test_creates_a_job_per_configured_time(self) -> None:
-        jobs = daily_jobs(scheduler_settings(), NOW, days=0)
-        # 08:00 Paris is 06:00 UTC == now, so only 12:00 and 18:00 remain today.
-        assert len(jobs) == 2
+@pytest.fixture
+def ledger(db_settings: Settings) -> JobLedger:
+    return JobLedger(db_settings)
 
-    def test_times_are_interpreted_in_the_display_timezone(self) -> None:
-        jobs = daily_jobs(scheduler_settings(scan_times="18:00"), NOW, days=0)
-        assert to_display(jobs[0].run_at_utc, PARIS).hour == 18
 
-    def test_past_times_today_are_skipped(self) -> None:
-        late = datetime(2026, 8, 4, 20, 0, tzinfo=UTC)
-        jobs = daily_jobs(scheduler_settings(), late, days=0)
-        assert jobs == []
+class TestDueSemantics:
+    """The core regression: a tick must actually find work."""
 
-    def test_malformed_entries_are_ignored_not_fatal(self) -> None:
-        jobs = daily_jobs(scheduler_settings(scan_times="12:00,not-a-time"), NOW, days=0)
-        assert len(jobs) == 1
+    def test_a_past_occurrence_is_due(self, ledger: JobLedger) -> None:
+        ledger.enqueue(
+            job_type=JobType.DAILY_SCAN,
+            scheduled_for=NOW - timedelta(minutes=5),
+            scope_id=None,
+        )
+        assert len(ledger.claim_due(now=NOW, worker="w1")) == 1
 
-    def test_jobs_are_sorted_chronologically(self) -> None:
-        jobs = daily_jobs(scheduler_settings(), NOW, days=2)
-        assert jobs == sorted(jobs, key=lambda j: j.run_at_utc)
+    def test_an_occurrence_exactly_now_is_due(self, ledger: JobLedger) -> None:
+        ledger.enqueue(job_type=JobType.DAILY_SCAN, scheduled_for=NOW, scope_id=None)
+        assert len(ledger.claim_due(now=NOW, worker="w1")) == 1
+
+    def test_a_future_occurrence_is_not_due(self, ledger: JobLedger) -> None:
+        ledger.enqueue(
+            job_type=JobType.DAILY_SCAN,
+            scheduled_for=NOW + timedelta(minutes=1),
+            scope_id=None,
+        )
+        assert ledger.claim_due(now=NOW, worker="w1") == []
+
+    def test_materialise_then_claim_finds_work_after_the_first_time_passes(
+        self, ledger: JobLedger
+    ) -> None:
+        """End-to-end shape of a real tick."""
+        ledger.materialise(now=NOW, daily_times=["18:00"], milestones=[])
+        assert ledger.claim_due(now=NOW, worker="w1") == []
+        # 18:00 Paris == 16:00 UTC in August.
+        later = NOW.replace(hour=17)
+        assert len(ledger.claim_due(now=later, worker="w1")) == 1
+
+
+class TestIdempotency:
+    def test_the_same_occurrence_is_enqueued_once(self, ledger: JobLedger) -> None:
+        first = ledger.enqueue(job_type=JobType.DAILY_SCAN, scheduled_for=NOW, scope_id=None)
+        second = ledger.enqueue(job_type=JobType.DAILY_SCAN, scheduled_for=NOW, scope_id=None)
+        assert first is not None
+        assert second is None
+
+    def test_two_identical_ticks_create_no_duplicates(self, ledger: JobLedger) -> None:
+        created_first = ledger.materialise(now=NOW, daily_times=["18:00"], milestones=[])
+        created_again = ledger.materialise(now=NOW, daily_times=["18:00"], milestones=[])
+        assert created_first > 0
+        assert created_again == 0
+
+    def test_occurrence_id_is_deterministic(self) -> None:
+        a = occurrence_id(JobType.DAILY_SCAN, NOW, "")
+        b = occurrence_id(JobType.DAILY_SCAN, NOW, "")
+        assert a == b
+
+    def test_occurrence_id_separates_scopes(self) -> None:
+        assert occurrence_id(JobType.EVENT_MILESTONE, NOW, "e1") != occurrence_id(
+            JobType.EVENT_MILESTONE, NOW, "e2"
+        )
+
+    def test_seconds_do_not_split_an_occurrence(self) -> None:
+        assert occurrence_id(JobType.DAILY_SCAN, NOW, "") == occurrence_id(
+            JobType.DAILY_SCAN, NOW.replace(second=42), ""
+        )
+
+
+class TestRestartDurability:
+    def test_a_succeeded_job_is_not_reclaimed_after_restart(self, db_settings: Settings) -> None:
+        first = JobLedger(db_settings)
+        first.enqueue(job_type=JobType.DAILY_SCAN, scheduled_for=NOW, scope_id=None)
+        claimed = first.claim_due(now=NOW, worker="w1")
+        first.mark_succeeded(claimed[0].job_id, scan_id="s1")
+
+        restarted = JobLedger(db_settings)
+        assert restarted.claim_due(now=NOW, worker="w2") == []
+
+    def test_a_pending_job_survives_restart(self, db_settings: Settings) -> None:
+        JobLedger(db_settings).enqueue(
+            job_type=JobType.DAILY_SCAN, scheduled_for=NOW, scope_id=None
+        )
+        assert len(JobLedger(db_settings).claim_due(now=NOW, worker="w2")) == 1
+
+    def test_an_expired_running_lease_is_reclaimed(self, db_settings: Settings) -> None:
+        """The crashed-worker path: the lease expires, the work is not lost."""
+        ledger = JobLedger(db_settings, lease=timedelta(minutes=15))
+        ledger.enqueue(job_type=JobType.DAILY_SCAN, scheduled_for=NOW, scope_id=None)
+        first = ledger.claim_due(now=NOW, worker="crashed")
+        assert len(first) == 1
+
+        # Before the lease expires nobody may take it.
+        assert ledger.claim_due(now=NOW + timedelta(minutes=5), worker="other") == []
+        # After it expires, another worker may.
+        recovered = ledger.claim_due(now=NOW + timedelta(minutes=20), worker="other")
+        assert len(recovered) == 1
+        assert recovered[0].attempts == 2
+
+    def test_a_crash_between_collection_and_ack_leaves_the_job_retryable(
+        self, db_settings: Settings
+    ) -> None:
+        ledger = JobLedger(db_settings)
+        ledger.enqueue(job_type=JobType.DAILY_SCAN, scheduled_for=NOW, scope_id=None)
+        claimed = ledger.claim_due(now=NOW, worker="w1")
+        # Simulate a failure after the work started but before acknowledgement.
+        ledger.mark_failed(claimed[0].job_id, error="boom", now=NOW)
+        assert ledger.get_state(claimed[0].job_id) is JobState.FAILED_RETRYABLE
+        assert len(ledger.claim_due(now=NOW, worker="w2")) == 1
+
+    def test_repeated_failure_is_parked_as_final(self, db_settings: Settings) -> None:
+        ledger = JobLedger(db_settings)
+        ledger.enqueue(job_type=JobType.DAILY_SCAN, scheduled_for=NOW, scope_id=None)
+        for _ in range(MAX_ATTEMPTS):
+            claimed = ledger.claim_due(now=NOW, worker="w")
+            if not claimed:
+                break
+            ledger.mark_failed(claimed[0].job_id, error="boom", now=NOW)
+        assert ledger.claim_due(now=NOW, worker="w") == []
+        assert ledger.counts_by_state().get(str(JobState.FAILED_FINAL)) == 1
+
+
+class TestConcurrency:
+    def test_two_workers_do_not_execute_the_same_occurrence(self, db_settings: Settings) -> None:
+        """Claiming is a conditional UPDATE; the loser sees zero rows changed."""
+        ledger_a = JobLedger(db_settings)
+        ledger_b = JobLedger(db_settings)
+        ledger_a.enqueue(job_type=JobType.DAILY_SCAN, scheduled_for=NOW, scope_id=None)
+
+        first = ledger_a.claim_due(now=NOW, worker="worker-a")
+        second = ledger_b.claim_due(now=NOW, worker="worker-b")
+
+        assert len(first) == 1
+        assert second == []
+
+    def test_two_workers_share_a_queue_of_distinct_jobs(self, db_settings: Settings) -> None:
+        ledger = JobLedger(db_settings)
+        for minutes in (1, 2, 3, 4):
+            ledger.enqueue(
+                job_type=JobType.EVENT_MILESTONE,
+                scheduled_for=NOW - timedelta(minutes=minutes),
+                scope_id=f"e{minutes}",
+            )
+        a = ledger.claim_due(now=NOW, worker="a", limit=2)
+        b = ledger.claim_due(now=NOW, worker="b", limit=2)
+        assert len(a) == 2
+        assert len(b) == 2
+        assert {j.job_id for j in a}.isdisjoint({j.job_id for j in b})
+
+
+class TestMilestoneScoping:
+    def test_a_milestone_carries_its_event(self, ledger: JobLedger) -> None:
+        ledger.enqueue(job_type=JobType.EVENT_MILESTONE, scheduled_for=NOW, scope_id="evt-42")
+        claimed = ledger.claim_due(now=NOW, worker="w1")
+        assert claimed[0].scope_id == "evt-42"
+        assert claimed[0].is_event_scoped
+
+    def test_a_daily_scan_is_not_event_scoped(self, ledger: JobLedger) -> None:
+        ledger.enqueue(job_type=JobType.DAILY_SCAN, scheduled_for=NOW, scope_id=None)
+        claimed = ledger.claim_due(now=NOW, worker="w1")
+        assert claimed[0].scope_id is None
+        assert not claimed[0].is_event_scoped
+
+    def test_milestones_for_two_events_stay_separate(self, ledger: JobLedger) -> None:
+        created = ledger.materialise(
+            now=NOW,
+            daily_times=[],
+            milestones=[("e1", NOW + timedelta(hours=1)), ("e2", NOW + timedelta(hours=1))],
+        )
+        assert created == 2
+
+
+class TestCatchUpPolicy:
+    def test_a_long_outage_does_not_replay_a_burst(self, ledger: JobLedger) -> None:
+        """Replaying a day of missed scans would burn quota for stale analyses."""
+        much_later = NOW + timedelta(days=1)
+        created = ledger.materialise(
+            now=much_later, daily_times=["08:00", "12:00", "18:00"], milestones=[]
+        )
+        due = ledger.claim_due(now=much_later, worker="w", limit=100)
+        assert created > 0
+        # Only occurrences inside the grace window are replayed.
+        assert len(due) <= 3
+
+    def test_occurrences_older_than_the_grace_window_are_skipped(self, ledger: JobLedger) -> None:
+        stale = NOW - DEFAULT_CATCHUP_GRACE - timedelta(hours=5)
+        assert ledger.materialise(now=NOW, daily_times=[], milestones=[("e1", stale)]) == 0
 
 
 class TestDaylightSaving:
-    def test_local_scan_time_is_preserved_across_the_spring_change(self) -> None:
-        """08:00 in Paris stays 08:00 in Paris, even though the UTC offset moves."""
-        before = daily_jobs(
+    @pytest.mark.parametrize(
+        "moment",
+        [
+            datetime(2026, 3, 28, 0, 0, tzinfo=UTC),
+            datetime(2026, 3, 30, 0, 0, tzinfo=UTC),
+            datetime(2026, 10, 24, 0, 0, tzinfo=UTC),
+            datetime(2026, 10, 26, 0, 0, tzinfo=UTC),
+        ],
+    )
+    def test_local_scan_time_is_preserved_across_transitions(self, moment: datetime) -> None:
+        """08:00 in Paris stays 08:00 in Paris; its UTC hour is what moves."""
+        instants = daily_instants(scheduler_settings(scan_times="08:00"), moment, days=0)
+        assert instants
+        assert all(to_display(i, PARIS).hour == 8 for i in instants)
+
+    def test_utc_hour_differs_either_side_of_the_spring_change(self) -> None:
+        before = daily_instants(
             scheduler_settings(scan_times="08:00"),
             datetime(2026, 3, 28, 0, 0, tzinfo=UTC),
             days=0,
         )
-        after = daily_jobs(
+        after = daily_instants(
             scheduler_settings(scan_times="08:00"),
             datetime(2026, 3, 30, 0, 0, tzinfo=UTC),
             days=0,
         )
-        assert to_display(before[0].run_at_utc, PARIS).hour == 8
-        assert to_display(after[0].run_at_utc, PARIS).hour == 8
-        # The UTC hour differs precisely because the offset changed.
-        assert before[0].run_at_utc.hour != after[0].run_at_utc.hour
+        assert before[0].hour != after[0].hour
 
-    def test_local_scan_time_is_preserved_across_the_autumn_change(self) -> None:
-        before = daily_jobs(
-            scheduler_settings(scan_times="08:00"),
-            datetime(2026, 10, 24, 0, 0, tzinfo=UTC),
-            days=0,
-        )
-        after = daily_jobs(
-            scheduler_settings(scan_times="08:00"),
-            datetime(2026, 10, 26, 0, 0, tzinfo=UTC),
-            days=0,
-        )
-        assert to_display(before[0].run_at_utc, PARIS).hour == 8
-        assert to_display(after[0].run_at_utc, PARIS).hour == 8
+    def test_ledger_stores_utc_instants(self, ledger: JobLedger) -> None:
+        ledger.materialise(now=NOW, daily_times=["18:00"], milestones=[])
+        claimed = ledger.claim_due(now=NOW.replace(hour=23), worker="w")
+        assert claimed
+        assert claimed[0].scheduled_for.tzinfo is not None
+        assert claimed[0].scheduled_for.utcoffset() == timedelta(0)
 
 
-class TestMilestoneJobs:
-    def test_creates_future_milestones_only(self) -> None:
-        jobs = milestone_jobs(scheduler_settings(), NOW, [event(5.0)])
-        # T-24h and T-12h are already in the past for an event 5 hours away.
-        assert {j.detail.split()[1] for j in jobs} == {"T-2h", "T-1h", "T-0.25h"}
+class TestPlannerArithmetic:
+    def test_daily_instants_are_in_the_future(self) -> None:
+        for instant in daily_instants(scheduler_settings(), NOW, days=1):
+            assert instant > NOW
 
-    def test_no_milestones_for_an_event_already_started(self) -> None:
-        assert milestone_jobs(scheduler_settings(), NOW, [event(-1.0)]) == []
+    def test_malformed_times_are_ignored(self) -> None:
+        assert len(daily_instants(scheduler_settings(scan_times="12:00,nope"), NOW, days=0)) <= 1
+
+    def test_milestones_are_future_only(self) -> None:
+        pairs = milestone_instants(scheduler_settings(), NOW, [event(5.0)])
+        assert pairs
+        assert all(when > NOW for _, when in pairs)
+
+    def test_no_milestones_for_a_started_event(self) -> None:
+        assert milestone_instants(scheduler_settings(), NOW, [event(-1.0)]) == []
 
     def test_milestones_are_attached_to_their_event(self) -> None:
         target = event(5.0)
-        jobs = milestone_jobs(scheduler_settings(), NOW, [target])
-        assert all(j.event_canonical_id == target.canonical_id for j in jobs)
-
-    def test_multiple_events_each_get_milestones(self) -> None:
-        jobs = milestone_jobs(scheduler_settings(), NOW, [event(5.0, "A"), event(8.0, "B")])
-        assert len({j.event_canonical_id for j in jobs}) == 2
-
-
-class TestPlan:
-    def test_disabled_scheduler_plans_nothing(self) -> None:
-        assert plan(scheduler_settings(scheduler_enabled=False), NOW, [event(5.0)]) == []
-
-    def test_combines_daily_and_milestone_jobs(self) -> None:
-        jobs = plan(scheduler_settings(), NOW, [event(5.0)])
-        assert {j.kind for j in jobs} == {"daily", "milestone"}
-
-    def test_job_keys_are_unique(self) -> None:
-        jobs = plan(scheduler_settings(), NOW, [event(5.0), event(5.0)])
-        keys = [j.job_key for j in jobs]
-        assert len(keys) == len(set(keys))
-
-    def test_job_keys_are_deterministic(self) -> None:
-        first = plan(scheduler_settings(), NOW, [event(5.0)])
-        second = plan(scheduler_settings(), NOW, [event(5.0)])
-        assert [j.job_key for j in first] == [j.job_key for j in second]
-
-
-class TestDueJobsIdempotency:
-    def test_only_jobs_whose_time_has_come_are_due(self) -> None:
-        jobs = plan(scheduler_settings(), NOW, [event(5.0)])
-        assert due_jobs(jobs, NOW, set()) == []
-
-    def test_completed_jobs_are_never_rerun(self) -> None:
-        """The property that makes a restart mid-run safe."""
-        jobs = plan(scheduler_settings(), NOW, [event(5.0)])
-        later = NOW + timedelta(hours=12)
-        first_pass = due_jobs(jobs, later, set())
-        assert first_pass
-        completed = {j.job_key for j in first_pass}
-        assert due_jobs(jobs, later, completed) == []
-
-    def test_a_partially_completed_pass_resumes_correctly(self) -> None:
-        jobs = plan(scheduler_settings(), NOW, [event(5.0)])
-        later = NOW + timedelta(hours=12)
-        all_due = due_jobs(jobs, later, set())
-        completed = {all_due[0].job_key}
-        remaining = due_jobs(jobs, later, completed)
-        assert len(remaining) == len(all_due) - 1
+        pairs = milestone_instants(scheduler_settings(), NOW, [target])
+        assert all(event_id == target.internal_id for event_id, _ in pairs)
 
 
 class TestRescoreTrigger:

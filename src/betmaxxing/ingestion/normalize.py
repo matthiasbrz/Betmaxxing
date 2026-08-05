@@ -18,12 +18,13 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 
 from betmaxxing.domain.enums import EXPECTED_SELECTION_COUNT, MarketType, Period
 from betmaxxing.domain.models import MarketBook, OddsSnapshot
 from betmaxxing.domain.timeutil import ensure_utc
 
-BookKey = tuple[str, str, MarketType, Period, float | None]
+BookKey = tuple[str, str, MarketType, Period, Decimal | None]
 
 
 @dataclass(slots=True)
@@ -66,7 +67,7 @@ def latest_per_selection(snapshots: list[OddsSnapshot]) -> list[OddsSnapshot]:
     """
     best: dict[tuple[str, str, str], OddsSnapshot] = {}
     for snapshot in snapshots:
-        key = (snapshot.bookmaker, snapshot.event_canonical_id, snapshot.selection.key)
+        key = (snapshot.bookmaker, snapshot.event_internal_id, snapshot.selection.key)
         current = best.get(key)
         if current is None or snapshot.observed_at > current.observed_at:
             best[key] = snapshot
@@ -85,7 +86,7 @@ def _validate(snapshot: OddsSnapshot, now: datetime) -> str | None:
         line = snapshot.selection.line
         if line is None:
             return "ligne manquante sur un marché over/under"
-        if abs(line - round(line)) < 1e-9:
+        if line == line.to_integral_value():
             return f"ligne entière ({line}) non supportée en V1 — remboursement possible"
     return None
 
@@ -108,7 +109,7 @@ def assemble_books(snapshots: list[OddsSnapshot], now: datetime) -> Normalizatio
     grouped: dict[BookKey, list[OddsSnapshot]] = defaultdict(list)
     for snapshot in current:
         key: BookKey = (
-            snapshot.event_canonical_id,
+            snapshot.event_internal_id,
             snapshot.bookmaker,
             snapshot.selection.market,
             snapshot.selection.period,
@@ -118,7 +119,7 @@ def assemble_books(snapshots: list[OddsSnapshot], now: datetime) -> Normalizatio
 
     books = [
         MarketBook(
-            event_canonical_id=event_id,
+            event_internal_id=event_id,
             bookmaker=bookmaker,
             market=market,
             period=period,

@@ -14,6 +14,7 @@ Design constraints, in priority order:
 from __future__ import annotations
 
 from betmaxxing.config import Settings
+from betmaxxing.domain.enums import UncertaintyStatus
 from betmaxxing.domain.models import StakeSuggestion
 from betmaxxing.engine.ev import kelly_fraction
 
@@ -26,8 +27,9 @@ def compute_stake(
     *,
     settings: Settings,
     odds: float,
-    probability_conservative: float,
-    probability_half_width: float,
+    probability_conservative: float | None,
+    probability_half_width: float | None,
+    uncertainty_status: UncertaintyStatus = UncertaintyStatus.UNAVAILABLE,
     already_exposed: float = 0.0,
 ) -> StakeSuggestion:
     """Suggest a simulated stake for one candidate.
@@ -59,6 +61,19 @@ def compute_stake(
             update={
                 "capped_by": "no_bankroll",
                 "rationale": "Aucune bankroll configurée — aucune mise suggérée.",
+            }
+        )
+    if (
+        uncertainty_status is UncertaintyStatus.UNAVAILABLE
+        or probability_conservative is None
+        or probability_half_width is None
+    ):
+        return zero.model_copy(
+            update={
+                "capped_by": "uncertainty_unavailable",
+                "rationale": (
+                    "Aucune borne prudente disponible pour cette probabilité — mise nulle (D-019)."
+                ),
             }
         )
     if probability_half_width > settings.max_prob_half_width:

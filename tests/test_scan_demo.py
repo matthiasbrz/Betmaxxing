@@ -12,8 +12,13 @@ from datetime import datetime, timedelta
 import pytest
 
 from betmaxxing.config import RunMode, Settings
-from betmaxxing.domain.enums import RejectionCode, ScanStatus
-from betmaxxing.engine.scan import run_scan
+from betmaxxing.domain.enums import (
+    CollectionStatus,
+    RejectionCode,
+    ScanStatus,
+    UncertaintyStatus,
+)
+from betmaxxing.engine.acquisition import run_scan
 
 
 @pytest.fixture
@@ -39,9 +44,12 @@ class TestDemoScan:
         second = run_scan(settings, now=now)
 
         def decisions(scan):  # type: ignore[no-untyped-def]
+            # Keyed on content, not on the opaque internal id: identity is
+            # assigned by the identity service and is deliberately not derived
+            # from the fixture, so it varies across fresh databases.
             return [
                 (
-                    c.event.canonical_id,
+                    c.event.label,
                     c.selection.key,
                     c.value.decimal_odds,
                     round(c.value.ev, 12),
@@ -128,10 +136,15 @@ class TestCandidateContent:
     def test_ev_matches_the_definition(self, result) -> None:  # type: ignore[no-untyped-def]
         for candidate in result.candidates:
             value = candidate.value
-            assert value.ev == pytest.approx(value.model_probability * value.decimal_odds - 1.0)
+            # No V1 demo market can push, so the payoff reduces to p*o - 1.
+            assert value.push_probability == pytest.approx(0.0)
+            assert value.ev == pytest.approx(
+                value.conditional_win_probability * value.decimal_odds - 1.0
+            )
 
     def test_conservative_ev_is_below_central_ev(self, result) -> None:  # type: ignore[no-untyped-def]
         for candidate in result.candidates:
+            assert candidate.value.ev_conservative is not None
             assert candidate.value.ev_conservative < candidate.value.ev
 
     def test_current_odds_clear_the_minimum_acceptable_odds(self, result) -> None:  # type: ignore[no-untyped-def]
@@ -169,6 +182,27 @@ class TestCandidateContent:
         assert evs == sorted(evs, reverse=True)
 
 
+class TestUncertaintyContract:
+    """D-019: demo uncertainty is labelled synthetic and never silent."""
+
+    def test_demo_candidates_carry_synthetic_uncertainty(self, result) -> None:  # type: ignore[no-untyped-def]
+        for candidate in result.candidates:
+            uncertainty = candidate.probability.uncertainty
+            assert uncertainty.status is UncertaintyStatus.SYNTHETIC
+            assert "SYNTHETIC" in uncertainty.warning
+            assert any("SYNTH" in risk.upper() for risk in candidate.risks)
+
+    def test_model_version_is_recorded(self, result) -> None:  # type: ignore[no-untyped-def]
+        for candidate in result.candidates:
+            assert candidate.model_version
+            assert candidate.probability.model_version == candidate.model_version
+
+    def test_settlement_rule_is_recorded(self, result) -> None:  # type: ignore[no-untyped-def]
+        for candidate in result.candidates:
+            assert candidate.value.settlement_rule
+            assert candidate.value.payoff_outcomes
+
+
 class TestNoBetIsANormalOutcome:
     def test_strict_thresholds_produce_no_bet_rather_than_a_forced_pick(
         self, settings: Settings, now: datetime
@@ -191,6 +225,7 @@ class TestRealModesRefuseWithoutASource:
         assert result.candidates == []
         detail = " ".join(p.detail for p in result.data_health.providers)
         assert "démo n'est jamais" in detail or "aucun fournisseur de cotes réel" in detail.lower()
+        assert result.collection_status is CollectionStatus.PROVIDER_ERROR
 
     def test_live_mode_names_the_missing_configuration(
         self, settings: Settings, now: datetime

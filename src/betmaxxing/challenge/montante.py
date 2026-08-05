@@ -33,6 +33,10 @@ from betmaxxing.domain.enums import BetOutcome, ChallengeState
 from betmaxxing.domain.models import Candidate
 from betmaxxing.domain.timeutil import utc_now
 
+#: Above this fraction of bank per rung, the user must acknowledge the risk of
+#: losing everything before the configuration is accepted.
+HIGH_RISK_FRACTION = 0.50
+
 #: Outcomes that end the progression under the default policy.
 LOSING_OUTCOMES = frozenset({BetOutcome.LOST, BetOutcome.HALF_LOST})
 #: Outcomes that leave the bank unchanged and do not consume a step.
@@ -68,7 +72,12 @@ class ChallengeConfig:
     #: Hard floor: the run stops if the bank falls to or below this.
     max_loss: float = 0.0
     #: Fraction of the *current* bank exposed on one step.
-    fraction_per_step: float = 1.0
+    #: Never defaults to the whole bank: an implicit 100% stake makes total loss
+    #: the single most likely outcome of the very first rung.
+    fraction_per_step: float = 0.25
+    #: Required acknowledgement above HIGH_RISK_FRACTION. Not a formality — it
+    #: is the difference between a chosen risk and an accidental one.
+    acknowledged_total_loss_risk: bool = False
     #: True = the whole progression ends on the first loss (default, recommended).
     stop_on_first_loss: bool = True
     max_steps: int = 20
@@ -84,6 +93,12 @@ class ChallengeConfig:
             raise ChallengeError("odds range is invalid")
         if self.max_loss < 0 or self.max_loss >= self.initial_bank:
             raise ChallengeError("max_loss must lie in [0, initial_bank)")
+        if self.fraction_per_step > HIGH_RISK_FRACTION and not self.acknowledged_total_loss_risk:
+            raise ChallengeError(
+                f"une fraction de {self.fraction_per_step:.0%} par palier expose à une "
+                "perte totale rapide : `acknowledged_total_loss_risk` doit être vrai "
+                "pour la choisir explicitement"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +161,15 @@ class Challenge:
     @property
     def bank(self) -> float:
         return from_cents(self.bank_cents)
+
+    @property
+    def total_loss_risk_note(self) -> str:
+        """Plain statement of what the chosen fraction risks."""
+        return (
+            f"{self.config.fraction_per_step:.0%} de la banque est exposé à chaque palier. "
+            f"Une seule défaite fait perdre cette fraction, et {self.config.max_steps} "
+            "paliers consécutifs gagnants ne sont jamais garantis."
+        )
 
     @property
     def is_terminal(self) -> bool:
@@ -231,7 +255,7 @@ class Challenge:
             candidate_id=candidate.candidate_id,
             event_label=candidate.event.label,
             selection_label=candidate.selection.label,
-            model_probability=candidate.value.model_probability,
+            model_probability=candidate.value.conditional_win_probability,
             ev=candidate.value.ev,
             risks=tuple(candidate.risks),
             proposed_at=utc_now(),
@@ -390,5 +414,13 @@ def propose_step(challenge: Challenge, candidates: list[Candidate]) -> Step | No
     eligible = [c for c in candidates if challenge.rejects_candidate(c) is None]
     if not eligible:
         return None
-    best = max(eligible, key=lambda c: c.value.ev_conservative)
+    # Rank on the conservative EV when it exists. A candidate with no
+    # conservative bound sorts last rather than being treated as infinitely
+    # good — it should not have reached the gate at all outside demo.
+    best = max(
+        eligible,
+        key=lambda c: (
+            c.value.ev_conservative if c.value.ev_conservative is not None else float("-inf")
+        ),
+    )
     return challenge.propose(best)

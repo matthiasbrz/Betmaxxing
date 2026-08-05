@@ -38,6 +38,7 @@ def settings(tmp_path: Path) -> Iterator[Settings]:
         database_url=f"sqlite+pysqlite:///{tmp_path / 'test.db'}",
         notifications_enabled=False,
         staking_enabled=False,
+        challenge_enabled=True,
     )
     reset_engine()
     reset_settings_cache()
@@ -58,6 +59,7 @@ def env_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Se
     monkeypatch.setenv("BETMAXXING_DATABASE_URL", f"sqlite+pysqlite:///{tmp_path / 'api.db'}")
     monkeypatch.setenv("BETMAXXING_NOTIFICATIONS_ENABLED", "false")
     monkeypatch.setenv("BETMAXXING_STAKING_ENABLED", "false")
+    monkeypatch.setenv("BETMAXXING_CHALLENGE_ENABLED", "true")
     from betmaxxing.config import get_settings
 
     yield get_settings()

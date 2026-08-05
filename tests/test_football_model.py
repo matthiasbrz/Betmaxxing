@@ -7,6 +7,7 @@ score matrix, so the derived markets cannot contradict the 1X2 prices.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
 
@@ -25,7 +26,7 @@ from betmaxxing.models_ml.football import (
 )
 
 EVENT = CanonicalEvent(
-    canonical_id="fb-1",
+    internal_id="fb-1",
     sport=Sport.FOOTBALL,
     competition="Ligue 1",
     home=Participant(canonical_id="p1", name="Lyon"),
@@ -41,7 +42,7 @@ INPUTS = FootballInputs(
 
 @pytest.fixture
 def model() -> FootballDixonColesModel:
-    return FootballDixonColesModel({EVENT.canonical_id: INPUTS})
+    return FootballDixonColesModel({EVENT.internal_id: INPUTS})
 
 
 class TestPoisson:
@@ -134,10 +135,12 @@ class TestModelCoherence:
         dnb = model.predict(EVENT, MarketType.DRAW_NO_BET, Period.FULL_TIME)
         assert one_x_two is not None and dnb is not None
         decisive = one_x_two.probabilities["home"] + one_x_two.probabilities["away"]
-        assert dnb.probabilities["home"] == pytest.approx(
-            one_x_two.probabilities["home"] / decisive
-        )
-        assert sum(dnb.probabilities.values()) == pytest.approx(1.0)
+        # Unconditional win probability plus the draw as an explicit push.
+        assert dnb.probabilities["home"] == pytest.approx(one_x_two.probabilities["home"])
+        assert dnb.push_for("home") == pytest.approx(one_x_two.probabilities["draw"])
+        # Conditional form is recovered from the payoff, not stored twice.
+        conditional = dnb.probabilities["home"] / decisive
+        assert 0.0 < conditional < 1.0
 
     def test_double_chance_matches_1x2_pairs(self, model: FootballDixonColesModel) -> None:
         one_x_two = model.predict(EVENT, MarketType.MATCH_RESULT_1X2, Period.FULL_TIME)
@@ -159,8 +162,8 @@ class TestFirstHalf:
     def test_first_half_has_fewer_goals_than_full_time(
         self, model: FootballDixonColesModel
     ) -> None:
-        full = model.predict(EVENT, MarketType.TOTAL_GOALS, Period.FULL_TIME, 2.5)
-        half = model.predict(EVENT, MarketType.TOTAL_GOALS, Period.FIRST_HALF, 2.5)
+        full = model.predict(EVENT, MarketType.TOTAL_GOALS, Period.FULL_TIME, Decimal("2.5"))
+        half = model.predict(EVENT, MarketType.TOTAL_GOALS, Period.FIRST_HALF, Decimal("2.5"))
         assert full is not None and half is not None
         assert half.probabilities["over"] < full.probabilities["over"]
 
@@ -178,7 +181,7 @@ class TestFirstHalf:
         full = model.predict(EVENT, MarketType.MATCH_RESULT_1X2, Period.FULL_TIME)
         half = model.predict(EVENT, MarketType.MATCH_RESULT_1X2, Period.FIRST_HALF)
         assert full is not None and half is not None
-        assert half.effective_sample_size < full.effective_sample_size
+        assert half.synthetic_sample_size < full.synthetic_sample_size
         assert half.feature_completeness < full.feature_completeness
 
 
@@ -187,7 +190,7 @@ class TestModelContract:
         assert model.validation_status is ValidationStatus.BACKTEST_ONLY
 
     def test_returns_none_for_an_unknown_event(self, model: FootballDixonColesModel) -> None:
-        other = EVENT.model_copy(update={"canonical_id": "unknown"})
+        other = EVENT.model_copy(update={"internal_id": "unknown", "source_ids": {}})
         assert model.predict(other, MarketType.MATCH_RESULT_1X2, Period.FULL_TIME) is None
 
     def test_returns_none_for_an_unsupported_market(self, model: FootballDixonColesModel) -> None:
@@ -201,13 +204,13 @@ class TestModelContract:
     def test_effective_sample_size_shrinks_with_incomplete_features(self) -> None:
         partial = FootballDixonColesModel(
             {
-                EVENT.canonical_id: FootballInputs(
+                EVENT.internal_id: FootballInputs(
                     home=INPUTS.home, away=INPUTS.away, feature_completeness=0.5
                 )
             }
         )
-        full = FootballDixonColesModel({EVENT.canonical_id: INPUTS})
+        full = FootballDixonColesModel({EVENT.internal_id: INPUTS})
         partial_prediction = partial.predict(EVENT, MarketType.MATCH_RESULT_1X2, Period.FULL_TIME)
         full_prediction = full.predict(EVENT, MarketType.MATCH_RESULT_1X2, Period.FULL_TIME)
         assert partial_prediction is not None and full_prediction is not None
-        assert partial_prediction.effective_sample_size < full_prediction.effective_sample_size
+        assert partial_prediction.synthetic_sample_size < full_prediction.synthetic_sample_size
