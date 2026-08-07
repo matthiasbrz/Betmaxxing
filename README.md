@@ -191,9 +191,9 @@ Ce qu'il fait, et ce que « fait » veut dire ici :
 La distinction est le sujet de tout ce paragraphe.
 
 Pour vérifier la couverture réelle vous-même — **statut : `PREPARED_NOT_EXECUTED`**,
-aucun appel n'a encore été émis. Quatre étapes indépendantes, plafonnées et
-autorisées séparément (`plan` 0, `discover` 0, `core` 1 crédit, `additional`
-5 crédits) :
+aucun appel n'a encore été émis. Quatre étapes indépendantes, chaînées par reçu
+signé et autorisées séparément (`plan` 0, `discover` 0, `core` 1 crédit,
+`additional` 5 crédits au tarif publié) :
 
 ```bash
 export BETMAXXING_THE_ODDS_API_KEY=...   # votre clé, jamais versionnée, jamais en argument
@@ -204,6 +204,10 @@ python -m betmaxxing.providers.the_odds_api.activation plan \
 Runbook complet : **`docs/provider-activation.md`**. L'ancien script `smoke` est une
 redirection : il demandait un booléen puis appelait `collect([FOOTBALL, TENNIS],
 window)`, un éventail dont personne ne pouvait annoncer le coût.
+
+Une exécution verte sera une **preuve limitée** — cet endpoint, ce bookmaker, cette
+compétition, cet événement, ce marché, cet instant — et non une promotion :
+l'adaptateur reste `IMPLEMENTED_UNVERIFIED` jusqu'à une décision séparée.
 
 Une réponse valide sans Winamax est `COVERAGE_MISSING`, pas une panne — et ne déclenche
 jamais le mode démo. Détails et marchés refusés : `docs/source-matrix.md`.

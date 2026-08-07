@@ -154,7 +154,7 @@
 | Mode `paper` / `live_analysis` | ⚠️ **ne publie rien** | Conséquence directe de la ligne précédente. C'est correct |
 | Challenge — Montante | ⚠️ `PARTIAL`, désactivé | Persistant et testé, mais **désactivé par défaut** ; aucune validation d'usage réel |
 | `TheOddsApiProvider` | ⚠️ `IMPLEMENTED_UNVERIFIED` | Contrats locaux verts ; **aucun appel réel** |
-| Activation fournisseur | ⚠️ `PREPARED_NOT_EXECUTED` | Quatre commandes plafonnées (0/0/1/5 crédits), reçus expurgés, garde de socket global. **Aucun appel émis, aucune clé lue, aucun crédit consommé** |
+| Activation fournisseur | ⚠️ `PREPARED_NOT_EXECUTED` | Quatre commandes bornées localement et chiffrées 0/0/1/5 au tarif publié, chaînées par reçu signé (HMAC), reçu écrit pour **toute** tentative réseau, garde de socket global. **Aucun appel émis, aucune clé lue, aucun crédit consommé** |
 | Couverture Winamax | ❓ **non vérifiée** | Annoncée par la documentation officielle (lue le 2026-08-05) ; non confirmée par un appel |
 | Migrations historiques | ✅ **figées** | `3ce123580afa` et `b7c1e9d24a10` n'importent plus le paquet applicatif ; rejouables à l'identique et équivalence testée |
 | Interface web | ⛔ non commencée | Tranche 6 |
@@ -165,7 +165,8 @@
 
 | Élément | Raison |
 |---|---|
-| Vérification réelle de The Odds API | Nécessite la clé de l'utilisateur et trois accords explicites et distincts. L'outillage est prêt et **plafonné** : `plan` (0), `discover` (0), `core` (1 crédit), `additional` (5). Statut : `PREPARED_NOT_EXECUTED`. Runbook : `docs/provider-activation.md` |
+| Vérification réelle de The Odds API | Nécessite la clé de l'utilisateur et trois accords explicites et distincts. L'outillage est prêt, borné localement et chiffré au tarif publié : `plan` (0), `discover` (0), `core` (1 crédit), `additional` (5). Statut : `PREPARED_NOT_EXECUTED`. Runbook : `docs/provider-activation.md` |
+| Promotion de l'adaptateur en `VERIFIED` | Une activation réussie est une preuve **limitée** (un endpoint, un bookmaker, une compétition, un événement, un marché, un instant). Les critères de promotion globale — nombre d'événements, de compétitions, de jours, taux de couverture — restent à écrire |
 | Méthode d'incertitude réelle | Nécessite des données historiques : bootstrap paramétrique/clusterisé + étude de couverture (D-019) |
 | Endpoints historiques (payants) | Hors périmètre : aucun appel payant sans action de l'utilisateur |
 | Pipeline d'entraînement | Nécessite des données historiques ; les modèles consomment des paramètres fournis |

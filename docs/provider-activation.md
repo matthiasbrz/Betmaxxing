@@ -5,8 +5,8 @@
 > lue, validée ou affichée. Aucun crédit n'a été consommé. L'adaptateur reste
 > `IMPLEMENTED_UNVERIFIED`, les modèles restent `BACKTEST_ONLY`.
 
-Ce document décrit **comment** l'activation se fera, ce qu'elle coûtera au
-maximum, et ce qu'elle prouvera. Il ne l'exécute pas.
+Ce document décrit **comment** l'activation se fera, ce qu'elle coûtera, ce
+qu'elle prouvera — et surtout ce qu'elle ne prouvera pas. Il ne l'exécute pas.
 
 ---
 
@@ -24,25 +24,50 @@ par défaut), puis un appel **par événement football trouvé** pour les march�
 additionnels. Le seul plafond était le budget de scan (50 crédits). Personne ne
 pouvait annoncer, avant de lancer, ce que ce script allait coûter.
 
-Un booléen n'est pas une limite de dépense. Le remplacement l'est.
+Un booléen n'est pas une limite de dépense.
+
+---
+
+## Quatre mots de coût, tenus séparés
+
+Les confondre est la manière dont un relevé de dépense se met à mentir. Le
+programme en distingue quatre, et n'en garantit que les deux premiers.
+
+| Terme | Ce que c'est | Qui le garantit |
+|---|---|---|
+| **Borne technique locale** | nombre de requêtes, endpoints, événements, bookmakers et marchés | **ce programme**, avant toute socket |
+| **Plafond contractuel estimé** | ce que ces requêtes *devraient* coûter selon la règle publiée (`marchés × unités régionales effectives`) | ce programme refuse d'aller au-delà, sur la base du tarif relu le 2026-08-05 |
+| **Coût observé** | `x-requests-last` — ce que le fournisseur déclare avoir facturé | le fournisseur ; `null` s'il ne le déclare pas |
+| **Coût comptabilisé** | ce qui est retenu : l'observation si elle existe, l'estimation sinon | ce programme, par prudence |
+
+**Ce programme ne peut pas empêcher un fournisseur externe de modifier sa
+tarification et de facturer autrement une requête qu'il a déjà servie.** Il peut
+seulement le constater dans les en-têtes et s'arrêter (`COST_MISMATCH`). Le mot
+« plafond » désigne ici les deux premières lignes, pas une garantie sur la
+facture de quelqu'un d'autre.
+
+Un coût absent ne devient **jamais** zéro. Un en-tête manquant, illisible ou
+négatif donne `observed_credits = null`, `accounted_credits = estimation`, et le
+statut `COST_UNVERIFIED` — qui n'autorise aucune étape suivante.
 
 ---
 
 ## Les quatre étapes
 
-| Commande | Réseau | Plafond | Endpoints |
-|---|---|---|---|
-| `plan` | non | **0** | aucun — aucun client HTTP n'est même construit |
-| `discover` | oui | **0** | `/v4/sports`, `/v4/sports/{sport}/events` |
-| `core` | oui | **1** | `/v4/sports/{sport}/odds?eventIds=…` |
-| `additional` | oui | **5** | `/v4/sports/{sport}/events/{id}/odds` |
+| Commande | Réseau | Borne locale | Plafond contractuel estimé | Endpoints |
+|---|---|---|---|---|
+| `plan` | non | aucun client HTTP n'est construit | **0** | aucun |
+| `discover` | oui | 2 requêtes | **0** | `/v4/sports`, `/v4/sports/{sport}/events` |
+| `core` | oui | 1 requête, 1 événement, 1 marché | **1** | `/v4/sports/{sport}/odds?eventIds=…` |
+| `additional` | oui | 1 requête, 1 événement, 5 marchés | **5** | `/v4/sports/{sport}/events/{id}/odds` |
 
-Total de la séquence complète : **6 crédits**, plafond vérifié avant chaque appel.
+Total de la séquence complète : **6 crédits** au tarif publié.
 
-Chaque étape s'autorise séparément. Aucune n'en déclenche une autre — un test
-statique le vérifie sur le source du module.
+Chaque étape s'autorise séparément et exige le **reçu signé** de la précédente,
+fourni en argument. Aucune n'en déclenche une autre — un test statique le vérifie
+sur le source du module.
 
-### Faits officiels sur lesquels reposent ces plafonds
+### Faits officiels sur lesquels reposent ces chiffres
 
 Relevés sur <https://the-odds-api.com/liveapi/guides/v4/> le **2026-08-05** :
 
@@ -77,18 +102,20 @@ que soient les régions configurées.
   `--api-key` : un argument finit dans l'historique du shell, dans `ps` et dans
   les journaux de CI. Une tentative de la passer en argument échoue.
 * **Zéro réessai.** `max_retries=0` partout. Un réessai est une seconde requête
-  facturée ; une étape plafonnée à un crédit ne fait qu'une tentative.
+  facturée ; une étape dont la borne locale est une requête n'en fait qu'une.
 * **Portée singulière.** Une compétition, un bookmaker, un événement, une fenêtre
   d'au plus 24 h. Toute valeur plurielle est refusée **avant** le réseau.
 * **Double confirmation chiffrée.** `--max-credits` doit valoir exactement le
-  plafond publié de l'étape, et `--acknowledge-credits` doit le répéter. Deux
+  plafond contractuel de l'étape, et `--acknowledge-credits` doit le répéter. Deux
   nombres identiques tapés à la main restent une preuve d'intention faible, mais
   incomparablement plus forte qu'un booléen : on ne peut pas les fournir sans
   savoir ce que l'étape coûte.
+* **Chaîne explicite.** `core` exige `--discovery-receipt`, `additional` exige
+  `--core-receipt`. L'outil ne parcourt plus le répertoire de reçus pour se
+  choisir une preuve à la place de l'opérateur.
 * **Aucun endpoint historique ou payant** n'est joignable depuis cet outil.
-* **`additional` exige un reçu `CORE_LIVE_VERIFIED`** portant sur le même
-  événement. Cinq crédits ne sont engagés qu'après qu'un seul a démontré que
-  l'endpoint, l'authentification et le parseur fonctionnent.
+* **Toute tentative réseau laisse un reçu**, quel que soit son statut terminal.
+  Un refus **avant** le réseau n'en crée aucun.
 * **La suite de tests ne peut joindre aucun fournisseur.** `tests/conftest.py`
   installe un garde de socket global : seules la boucle locale et `AF_UNIX`
   (le PostgreSQL de test) sont autorisés. Trois tests le vérifient.
@@ -97,43 +124,80 @@ que soient les régions configurées.
 
 ## Vocabulaire des statuts
 
-| Statut | Signification |
-|---|---|
-| `PREPARED_NOT_EXECUTED` | rien n'a été exécuté ; c'est aussi le statut de tout refus en amont du réseau |
-| `DISCOVERY_VERIFIED` | les deux endpoints gratuits ont répondu, des événements existent dans la fenêtre |
-| `CORE_LIVE_VERIFIED` | un prix réel a été obtenu et cartographié pour le bookmaker demandé |
-| `ADDITIONAL_LIVE_VERIFIED` | l'endpoint par événement a répondu et le parseur a lu les horodatages par marché |
-| `COVERAGE_MISSING` | réponse valide, mais rien d'exploitable : compétition inactive, aucun événement, ou bookmaker absent. **Ce n'est pas une panne.** |
-| `SCHEMA_MISMATCH` | la réponse n'a pas la forme documentée |
-| `COST_MISMATCH` | le fournisseur annonce un coût supérieur au plafond autorisé — arrêt immédiat |
-| `AUTH_FAILED` | 401/403 : clé absente, invalide, ou plan insuffisant |
-| `PROVIDER_UNAVAILABLE` | erreur réseau ou HTTP non authentification |
+| Statut | Signification | Autorise la suite ? |
+|---|---|---|
+| `PREPARED_NOT_EXECUTED` | rien n'a été exécuté ; statut de tout refus en amont du réseau | non |
+| `DISCOVERY_VERIFIED` | les deux endpoints gratuits ont répondu, coût observé nul, des événements existent | oui |
+| `CORE_LIVE_VERIFIED` | un prix réel a été obtenu et cartographié pour le bookmaker demandé | oui |
+| `ADDITIONAL_LIVE_VERIFIED` | les cinq marchés sont revenus, horodatés et cartographiés | terminal |
+| `ADDITIONAL_PARTIAL_COVERAGE` | au moins un marché correct, couverture incomplète | terminal |
+| `COVERAGE_MISSING` | réponse valide, rien d'exploitable : compétition inactive, aucun événement, bookmaker absent, ou aucun marché demandé retourné. **Ce n'est pas une panne.** | non |
+| `SCHEMA_MISMATCH` | la réponse n'a pas la forme documentée, ou rien n'a pu être cartographié | non |
+| `COST_MISMATCH` | coût annoncé supérieur au plafond contractuel — arrêt immédiat | non |
+| `COST_UNVERIFIED` | aucun `x-requests-last` exploitable : l'estimation reste comptabilisée, le coût réel est inconnu | non |
+| `AUTH_FAILED` | 401/403 : clé absente, invalide, ou plan insuffisant | non |
+| `PROVIDER_UNAVAILABLE` | erreur réseau ou HTTP hors authentification | non |
 
-Un `COVERAGE_MISSING` n'est jamais compensé, jamais élargi, jamais réessayé. La
-fenêtre n'est pas étendue automatiquement pour trouver quelque chose à mesurer.
+Un `COVERAGE_MISSING` n'est jamais compensé, jamais élargi, jamais réessayé, et
+aucun autre bookmaker n'est substitué.
 
 ---
 
-## Les reçus
+## Les reçus (schéma v2, signés)
 
-Chaque étape réseau réussie écrit un reçu JSON local sous
-`.activation-receipts/` (ou le chemin de `BETMAXXING_ACTIVATION_RECEIPTS`). Ce
-répertoire est dans `.gitignore` : un reçu est une trace d'exploitation d'un
-appel réel et facturé, il appartient à l'opérateur, pas au dépôt.
+Chaque **tentative réseau** écrit un reçu JSON local sous `.activation-receipts/`
+(ou le chemin de `BETMAXXING_ACTIVATION_RECEIPTS`). Ce répertoire est dans
+`.gitignore` : un reçu est une trace d'exploitation d'un appel réel et facturé, il
+appartient à l'opérateur, pas au dépôt.
 
-Un reçu contient : la commande, le statut, l'instant, l'endpoint **templaté**, la
-forme de réponse, la compétition, le bookmaker, le **hachage** de l'identifiant
-d'événement, le plafond, le coût annoncé, les marchés demandés / obtenus /
-absents, la fraîcheur **en secondes** de chaque marché, le nombre de sélections
-cartographiées et les motifs de rejet généralisés.
+### Le secret local de signature
 
-Un reçu ne contient **jamais** : la clé ni un fragment de clé, une URL non
-expurgée, un corps de réponse brut, une cote, un nom de participant, ni
-l'identifiant d'événement en clair. Sept tests le vérifient, dont un qui cherche
-littéralement les noms et les cotes de la fixture dans le fichier écrit.
+Un secret aléatoire est créé au premier besoin réseau, dans le répertoire de
+reçus, en `O_CREAT | O_EXCL` et mode `0600`. Il n'est jamais affiché, jamais
+journalisé, jamais versionné. Les tests injectent un secret déterministe par
+`BETMAXXING_ACTIVATION_RECEIPT_SECRET` et ne dépendent d'aucun aléa réel.
 
-Rétention : ces fichiers sont locaux et sous le contrôle de l'opérateur.
-Supprimez-les quand ils ne servent plus ; rien dans le produit n'en dépend.
+### Contenu
+
+`schema_version`, `receipt_id`, `command`, `status`, `recorded_at`, `expires_at`,
+`sport_key`, `bookmaker`, `event_tag` (ou `event_tags` pour `discover`),
+`window_from` / `window_to`, `endpoints` templatés, `attempts`,
+`network_attempted`, `may_have_reached_provider`, `estimated_credits`,
+`observed_credits`, `accounted_credits`, `quota_remaining`, marchés demandés /
+observés / absents / rejetés / cartographiés, `market_states`, `freshness` en
+secondes, `selections_mapped`, `mapping_rejections` généralisés,
+`parent_receipt_id`, `adapter_status`, `model_impact`, `signature`.
+
+Un reçu ne contient **jamais** : la clé ni un fragment de clé, le secret de
+signature, une URL non expurgée, un corps de réponse brut, une cote, un nom de
+participant, ni l'identifiant d'événement en clair.
+
+### L'identifiant d'événement
+
+HMAC-SHA256 tronqué, clé = le secret local. Un simple `sha256(event_id)` était
+calculable par quiconque dispose de la liste publique des rencontres du
+fournisseur : il ne cachait rien. Le HMAC identifie l'événement **pour cette
+installation** — assez pour que `core` reconnaisse l'approbation de `discover`
+d'un processus à l'autre — sans être inversible par dictionnaire.
+
+### Vérification avant usage
+
+Signature HMAC-SHA256 sur le JSON canonique (clés triées, séparateurs serrés),
+comparée avec `hmac.compare_digest`. Est refusé **avant le réseau** un reçu :
+non signé ou de signature invalide ; de schéma inconnu ; **v1** (non signé, non
+chaîné — il ne prouve rien et n'est pas promu silencieusement) ; expiré ; de
+commande ou de statut inattendus ; portant un autre sport, bookmaker ou
+événement ; dont le coût n'est pas vérifié ; sans parent quand la chaîne l'exige ;
+hors du répertoire autorisé, lien symbolique ou chemin ambigu.
+
+Durée de validité : **6 heures**. Une découverte périmée ne dit rien des
+rencontres d'aujourd'hui, et une preuve qui n'expire jamais finit réutilisée pour
+autre chose.
+
+### Rétention
+
+Ces fichiers sont locaux et sous le contrôle de l'opérateur. Supprimez-les quand
+ils ne servent plus ; rien dans le produit n'en dépend.
 
 ---
 
@@ -151,80 +215,101 @@ La variable dépréciée `BETMAXXING_ODDS_API_KEY` reste acceptée et signalée.
 
 ```bash
 python -m betmaxxing.providers.the_odds_api.activation plan \
-    --sport soccer_france_ligue_one \
-    --bookmaker winamax_fr \
-    --max-credits 6
+  --sport soccer_france_ligue_one \
+  --bookmaker winamax_fr \
+  --max-credits 6
 ```
 
-Ne lit pas la clé, ne construit aucun client HTTP, n'écrit aucun reçu. Affiche la
-séquence chiffrée et `PREPARED_NOT_EXECUTED`. Ajoutez `--json` pour la sortie
-machine.
+Ne lit ni la clé ni le secret de signature, ne construit aucun client HTTP,
+n'écrit aucun reçu. Affiche la séquence chiffrée et `PREPARED_NOT_EXECUTED`.
+`--json` pour la sortie machine.
 
 ### 2. `discover` — 0 crédit
 
 ```bash
 python -m betmaxxing.providers.the_odds_api.activation discover \
-    --sport soccer_france_ligue_one \
-    --bookmaker winamax_fr \
-    --allow-network
+  --sport soccer_france_ligue_one \
+  --bookmaker winamax_fr \
+  --window-hours 24 \
+  --allow-network
 ```
 
 Appelle `/v4/sports`, vérifie que la compétition est **active** — sinon il
 s'arrête là, inutile de payer un crédit pour une réponse vide — puis
 `/v4/sports/{sport}/events` borné par `commenceTimeFrom` / `commenceTimeTo`.
 
-Si l'un de ces deux endpoints annonce un coût non nul, l'étape échoue en
-`COST_MISMATCH` : le contrat de facturation aurait changé.
+Si l'un de ces deux endpoints annonce un coût non nul → `COST_MISMATCH`. S'il
+n'annonce aucun coût → `COST_UNVERIFIED`, et `core` refusera de partir.
 
-**Aucun événement n'est choisi pour vous.** Relevez un identifiant dans la liste.
+**Aucun événement n'est choisi pour vous.** La commande affiche la liste et le
+**chemin du reçu** ; relevez les deux.
 
 ### 3. `core` — 1 crédit
 
 ```bash
 python -m betmaxxing.providers.the_odds_api.activation core \
-    --sport soccer_france_ligue_one \
-    --bookmaker winamax_fr \
-    --event-id <identifiant relevé à l'étape 2> \
-    --max-credits 1 --acknowledge-credits 1 \
-    --allow-network
+  --sport soccer_france_ligue_one \
+  --bookmaker winamax_fr \
+  --event-id EVENT_ID_CHOISI \
+  --discovery-receipt CHEMIN_RECU_DISCOVER \
+  --max-credits 1 \
+  --acknowledge-credits 1 \
+  --allow-network
 ```
 
+Le reçu de découverte est vérifié avant le réseau : v2, signé, non expiré,
+`DISCOVERY_VERIFIED`, même sport et même bookmaker, contenant le HMAC de
+l'événement demandé, attestant un coût observé nul et un quota restant suffisant.
+
 Un appel, `eventIds=` filtré sur cet événement, `markets=h2h`,
-`bookmakers=winamax_fr`. La réponse passe par le **vrai** `_ingest_event` en
-forme `GROUPED_ODDS` : l'objectif n'est pas de voir du JSON arriver, c'est de
-savoir si le code qui le lira en production le lit effectivement.
-
-Ce que cette étape prouve ou infirme :
-
-* l'authentification et le plan donnent accès à l'endpoint ;
-* `winamax_fr` cote **cet** événement (ou non → `COVERAGE_MISSING`) ;
-* le coût réel annoncé vaut bien 1 ;
-* le parseur produit des sélections exploitables.
+`bookmakers=winamax_fr`. La réponse passe par le **vrai** `_ingest_event` en forme
+`GROUPED_ODDS` : l'objectif n'est pas de voir du JSON arriver, c'est de savoir si
+le code qui le lira en production le lit effectivement.
 
 ### 4. `additional` — 5 crédits, autorisation distincte
 
 ```bash
 python -m betmaxxing.providers.the_odds_api.activation additional \
-    --sport soccer_france_ligue_one \
-    --bookmaker winamax_fr \
-    --event-id <le même identifiant> \
-    --max-credits 5 --acknowledge-credits 5 \
-    --allow-network
+  --sport soccer_france_ligue_one \
+  --bookmaker winamax_fr \
+  --event-id LE_MEME_EVENT_ID \
+  --core-receipt CHEMIN_RECU_CORE \
+  --max-credits 5 \
+  --acknowledge-credits 5 \
+  --allow-network
 ```
 
-Refusé sans reçu `CORE_LIVE_VERIFIED` pour ce même événement. Demande les cinq
-marchés par événement et lit les horodatages **au niveau marché**, conformément
-au contrat v4. Un marché absent de la réponse est **constaté**, ni compensé, ni
-réessayé.
+Le reçu de `core` est vérifié avant le réseau : v2, signé, non expiré,
+`command=core`, `status=CORE_LIVE_VERIFIED`, même sport, bookmaker et HMAC
+d'événement, référençant une découverte, attestant au moins une sélection
+cartographiée et un coût compatible avec le plafond de 1 crédit.
+
+Chacun des cinq marchés reçoit ensuite un état explicite :
+
+| État | Signification |
+|---|---|
+| `OBSERVED_MAPPED` | retourné, horodaté au niveau marché, cartographié |
+| `OBSERVED_REJECTED` | retourné, mais inexploitable par le parseur |
+| `NOT_RETURNED` | le bookmaker ne l'a pas coté |
+
+Et le statut de l'étape en découle : aucun retourné → `COVERAGE_MISSING` ;
+retournés mais aucun cartographié → `SCHEMA_MISMATCH` ; au moins un cartographié
+sans couverture complète → `ADDITIONAL_PARTIAL_COVERAGE` ; les cinq →
+`ADDITIONAL_LIVE_VERIFIED`.
 
 ---
 
 ## Après l'exécution
 
-1. Reporter la date et le constat dans `docs/source-matrix.md` (tableau « Ce qui
-   est vérifié »).
-2. Ne changer le statut de l'adaptateur en `VERIFIED` que si `core` **et**
-   `additional` ont réussi ; sinon consigner précisément ce qui a échoué.
+1. Reporter la date, l'événement et l'état **marché par marché** dans
+   `docs/source-matrix.md`.
+2. **Ne promouvoir aucun statut global.** Un événement, à un instant, sur une
+   compétition, avec un bookmaker, est une **preuve limitée** — pas une
+   validation de l'adaptateur. Ce que le reçu atteste tient en six termes :
+   endpoint, bookmaker, compétition, événement, marché, instant. Le statut global
+   reste `IMPLEMENTED_UNVERIFIED` jusqu'à une décision de promotion séparée,
+   fondée sur des critères documentés (nombre d'événements, de compétitions, de
+   jours, taux de couverture constaté).
 3. **Aucun statut de modèle ne change.** Une couverture confirmée n'est pas une
    validation : les modèles restent `BACKTEST_ONLY` jusqu'au protocole de
    `docs/validation-protocol.md`.

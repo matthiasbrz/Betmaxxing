@@ -17,19 +17,26 @@ ceiling checked before any socket is opened, each authorised on its own:
     python -m betmaxxing.providers.the_odds_api.activation plan \\
         --sport soccer_france_ligue_one --bookmaker winamax_fr --max-credits 6
 
-    # 0 credits, two endpoints documented as free
-    ... discover --sport … --bookmaker … --allow-network
+    # 0 credits, two endpoints documented as free; prints a signed receipt path
+    ... discover --sport … --bookmaker … --window-hours 24 --allow-network
 
-    # 1 credit, one event, one market
+    # 1 credit, one event, one market; needs the discovery receipt
     ... core --sport … --bookmaker … --event-id … \\
+        --discovery-receipt <path printed by discover> \\
         --max-credits 1 --acknowledge-credits 1 --allow-network
 
-    # 5 credits, same event, five per-event markets
+    # 5 credits, same event, five per-event markets; needs the core receipt
     ... additional --sport … --bookmaker … --event-id … \\
+        --core-receipt <path printed by core> \\
         --max-credits 5 --acknowledge-credits 5 --allow-network
 
 The key comes from ``BETMAXXING_THE_ODDS_API_KEY`` in the environment. There is
 no ``--api-key`` option, by construction.
+
+Each step is authorised by the previous step's signed receipt, passed explicitly
+by path. The harness bounds what it *does* — requests, endpoints, scope — and
+prices it under the published tariff; it cannot bind the provider's invoice, only
+notice a discrepancy in the headers and stop.
 
 This file is kept only so an operator following an older note is redirected
 rather than left with a missing script. It performs no network call of its own.
@@ -47,17 +54,21 @@ Ce script est remplacé. Il consommait un nombre de crédits que personne ne
 pouvait annoncer à l'avance (un appel groupé par compétition configurée, puis
 un appel par événement).
 
-L'activation se fait désormais en quatre étapes plafonnées et autorisées
-séparément :
+L'activation se fait désormais en quatre étapes bornées, chaînées par reçu signé
+et autorisées séparément :
 
   python -m betmaxxing.providers.the_odds_api.activation plan \\
       --sport <clé> --bookmaker <clé> --max-credits 6
 
-  ... discover   --allow-network                                     0 crédit
-  ... core       --event-id <id> --max-credits 1 --acknowledge-credits 1
-  ... additional --event-id <id> --max-credits 5 --acknowledge-credits 5
+  ... discover   --window-hours 24 --allow-network                   0 crédit
+  ... core       --event-id <id> --discovery-receipt <chemin> \\
+                 --max-credits 1 --acknowledge-credits 1             1 crédit
+  ... additional --event-id <id> --core-receipt <chemin> \\
+                 --max-credits 5 --acknowledge-credits 5             5 crédits
 
-La clé provient de BETMAXXING_THE_ODDS_API_KEY, jamais d'un argument.
+Chaque étape exige le reçu signé de la précédente, dont le chemin est affiché par
+celle-ci. La clé provient de BETMAXXING_THE_ODDS_API_KEY, jamais d'un argument.
+
 Runbook complet : docs/provider-activation.md
 """
 

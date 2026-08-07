@@ -119,15 +119,15 @@ avertissement le signale, sans jamais afficher la valeur.
 **Statut : `PREPARED_NOT_EXECUTED`.** Runbook complet :
 **`docs/provider-activation.md`**.
 
-L'activation se fait en quatre commandes indépendantes, chacune plafonnée et
-autorisée séparément :
+L'activation se fait en quatre commandes indépendantes, chaînées par reçu signé
+et autorisées séparément :
 
-| Commande | Réseau | Plafond | Endpoints |
-|---|---|---|---|
-| `plan` | non | 0 | aucun — aucun client HTTP construit |
-| `discover` | oui | 0 | `/v4/sports`, `/v4/sports/{sport}/events` |
-| `core` | oui | 1 | `/v4/sports/{sport}/odds?eventIds=…` |
-| `additional` | oui | 5 | `/v4/sports/{sport}/events/{id}/odds` |
+| Commande | Réseau | Borne locale | Plafond contractuel estimé | Endpoints |
+|---|---|---|---|---|
+| `plan` | non | aucun client HTTP construit | 0 | aucun |
+| `discover` | oui | 2 requêtes | 0 | `/v4/sports`, `/v4/sports/{sport}/events` |
+| `core` | oui | 1 requête, 1 événement, 1 marché | 1 | `/v4/sports/{sport}/odds?eventIds=…` |
+| `additional` | oui | 1 requête, 1 événement, 5 marchés | 5 | `/v4/sports/{sport}/events/{id}/odds` |
 
 ```bash
 export BETMAXXING_THE_ODDS_API_KEY=...
@@ -138,21 +138,40 @@ python -m betmaxxing.providers.the_odds_api.activation plan \
 C'est le **seul** code du dépôt capable d'appeler réellement le service. Il n'est
 ni collecté par pytest, ni exécuté par la CI. Chaque étape réseau exige
 `--allow-network`, une clé présente dans l'environnement, une portée singulière
-(une compétition, un bookmaker, un événement, 24 h au plus) et — pour les étapes
-payantes — `--max-credits` **et** `--acknowledge-credits` égaux au plafond publié.
-Aucune tentative n'est répétée (`max_retries=0`) : un réessai est une seconde
-requête facturée. Aucun endpoint historique (payant) n'est joignable et aucun
-statut de validation n'est modifié.
+(une compétition, un bookmaker, un événement, 24 h au plus), le **reçu signé** de
+l'étape précédente (`--discovery-receipt`, `--core-receipt`) et — pour les étapes
+payantes — `--max-credits` **et** `--acknowledge-credits` égaux au plafond
+contractuel. Aucune tentative n'est répétée (`max_retries=0`) : un réessai est une
+seconde requête facturée. Aucun endpoint historique (payant) n'est joignable et
+aucun statut de validation n'est modifié.
+
+Ce que le programme borne, il le borne localement : nombre de requêtes,
+endpoints, événements, bookmakers et marchés. Le chiffrage en crédits, lui, repose
+sur le tarif publié. **Le programme ne peut pas empêcher le fournisseur de
+facturer autrement une requête déjà servie** ; il le constate dans les en-têtes
+et s'arrête (`COST_MISMATCH`). Un coût non annoncé donne `COST_UNVERIFIED` :
+l'estimation reste comptabilisée et l'étape suivante est bloquée.
 
 `scripts/smoke_the_odds_api.py` est conservé comme **redirection** et n'émet plus
 aucun appel : sa version précédente demandait un booléen puis appelait
 `collect([FOOTBALL, TENNIS], window)`, dont le coût n'était annonçable par
 personne à l'avance.
 
-Les reçus locaux atterrissent sous `.activation-receipts/` (ou
-`BETMAXXING_ACTIVATION_RECEIPTS`). Le répertoire est dans `.gitignore` ; les reçus
-ne contiennent ni clé, ni URL non expurgée, ni corps brut, ni cote, ni nom de
-participant, et l'identifiant d'événement y est haché.
+### Reçus et secret local
+
+Les reçus atterrissent sous `.activation-receipts/` (ou
+`BETMAXXING_ACTIVATION_RECEIPTS`). Le répertoire est dans `.gitignore`. Un reçu
+est écrit pour **toute tentative réseau**, y compris celles qui échouent après
+avoir été facturées ; un refus antérieur au réseau n'en écrit aucun.
+
+Un secret de signature aléatoire est créé au premier besoin réseau dans ce même
+répertoire, en mode `0600`. Il n'est jamais affiché, journalisé ni versionné.
+Sauvegardez-le si vous voulez pouvoir vérifier d'anciens reçus après une
+réinstallation ; sans lui, les reçus antérieurs ne sont plus vérifiables et il
+faut relancer `discover`.
+
+Les reçus ne contiennent ni clé, ni secret, ni URL non expurgée, ni corps brut,
+ni cote, ni nom de participant ; l'identifiant d'événement y figure en HMAC.
 
 ## Exploitation de l'identité des événements
 

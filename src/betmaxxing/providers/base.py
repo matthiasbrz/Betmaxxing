@@ -26,7 +26,20 @@ from betmaxxing.domain.models import (
 
 
 class ProviderError(RuntimeError):
-    """Base class for provider failures."""
+    """Base class for provider failures.
+
+    ``reached_provider`` carries the one thing a caller cannot reconstruct from
+    the message: whether the request is known to have got there. An HTTP status
+    means it did — the response was served, and may have been billed. A connect
+    failure means it did not. A read timeout means we cannot tell, which counts
+    as "may have" (D-041), because under-counting spend is the direction a budget
+    must never err in.
+
+    Defaults to ``True``: anything that produced a response reached the provider,
+    and a failure of unknown origin is charged rather than forgiven.
+    """
+
+    reached_provider: bool = True
 
 
 class ProviderUnavailable(ProviderError):

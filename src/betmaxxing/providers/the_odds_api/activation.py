@@ -1,57 +1,83 @@
-"""Controlled activation of The Odds API — four commands, four hard ceilings.
+"""Controlled activation of The Odds API — four steps, bounded and evidenced.
 
 Why this module exists
 ----------------------
-The previous smoke script asked for one boolean of consent and then called
-``provider.collect([FOOTBALL, TENNIS], window)``. That is a fan-out: one grouped
-request per configured sport key, then one per-event request for every football
-event found, bounded only by the per-scan budget. A boolean is not a spending
-limit. With a real key nobody could have said, in advance, what that script
-would cost.
+The smoke script it replaced asked for one boolean of consent and then called
+``provider.collect([FOOTBALL, TENNIS], window)``: one grouped request per
+configured sport key, then one per-event request for every football event found,
+bounded only by the per-scan budget. A boolean is not a spending limit. Nobody
+could say, in advance, what that script would cost.
 
-Here the sequence is split into four commands, each with a ceiling that is
-checked before any socket is opened, and each authorised separately:
+What is bounded, and by whom
+----------------------------
+Four words, deliberately kept apart, because collapsing them is how a spending
+record starts lying:
 
-===========  ========  =========  ==========================================
-command      network   credits    endpoints
-===========  ========  =========  ==========================================
-plan         no        0          none — it does not even build a client
-discover     yes       0          ``/v4/sports``, ``/v4/sports/{sport}/events``
-core         yes       1          ``/v4/sports/{sport}/odds?eventIds=…``
-additional   yes       5          ``/v4/sports/{sport}/events/{id}/odds``
-===========  ========  =========  ==========================================
+**Local bound** — what this program will actually do. Number of requests,
+endpoints, events, bookmakers and markets. Enforced here, absolutely, before a
+socket is opened.
 
-Both ``discover`` endpoints are documented free: *"This endpoint does not count
-against the usage quota."* If the provider ever charges for one, that is a
-contract change and the command fails with ``COST_MISMATCH`` rather than
-absorbing it quietly.
+**Estimated contractual ceiling** — what those requests *should* cost under the
+published rule (``markets x effective region units``), re-read 2026-08-05.
+Enforced here as a refusal to proceed when the estimate exceeds what the operator
+authorised.
 
-Rules the implementation enforces rather than documents
--------------------------------------------------------
-* **The key comes from the environment only.** There is no ``--api-key`` option,
-  by construction: an argument lands in shell history, in ``ps``, and in CI logs.
-* **No retries.** ``max_retries=0`` everywhere. A retry is a second billable
-  request; a step whose ceiling is one credit must make at most one attempt.
-* **No chaining.** No command calls another. Each is a separate human decision.
-* **Scope is singular.** One sport key, one bookmaker, one event, a window of at
-  most 24 hours. Anything plural is refused before the network.
-* **Receipts are local and sanitised.** They carry no key, no unredacted URL, no
-  raw payload, no odds and no participant names, and the event id is stored as a
-  hash. They are written under a gitignored directory and never committed.
+**Observed cost** — ``x-requests-last``, what the provider says it charged.
+``None`` when the header is absent or unusable. Never a stand-in for zero.
+
+**Accounted cost** — what the spend record keeps: the observation when there is
+one, the estimate otherwise. Conservative by construction.
+
+This program cannot stop an external company from repricing a request it has
+already served; it can only notice the discrepancy in the headers and stop. So
+"ceiling" here means the first two — a bound on *our* behaviour and on what the
+documented tariff implies — not a guarantee about someone else's invoice.
+
+=========== ======== ============================== ==========================
+command     network  local bound                    estimated contractual cost
+=========== ======== ============================== ==========================
+plan        no       no client is even built        0
+discover    yes      2 requests, free endpoints     0
+core        yes      1 request, 1 event, 1 market   1
+additional  yes      1 request, 1 event, 5 markets  5
+=========== ======== ============================== ==========================
+
+Evidence, not habit
+-------------------
+Each step is authorised by the previous step's **receipt**, passed explicitly by
+path — never discovered by scanning a directory, which would be the program
+choosing its own proof. Receipts are v2: signed with a local HMAC secret over
+their canonical JSON, carrying HMAC-tagged event ids rather than clear ones,
+expiring, and referencing their parent. A receipt that is unsigned, altered,
+expired, of the wrong schema, or about a different sport, bookmaker or event is
+refused before the network.
+
+Every network attempt writes a receipt, whatever its terminal status — a call
+that was billed and then failed validation is exactly the one an audit needs. A
+refusal *before* the network writes nothing: inventing a consumption record for a
+call that never happened is the same error pointing the other way.
 
 Status vocabulary: ``PREPARED_NOT_EXECUTED``, ``DISCOVERY_VERIFIED``,
-``CORE_LIVE_VERIFIED``, ``ADDITIONAL_LIVE_VERIFIED``, ``COVERAGE_MISSING``,
-``SCHEMA_MISMATCH``, ``COST_MISMATCH``, ``AUTH_FAILED``, ``PROVIDER_UNAVAILABLE``.
+``CORE_LIVE_VERIFIED``, ``ADDITIONAL_LIVE_VERIFIED``,
+``ADDITIONAL_PARTIAL_COVERAGE``, ``COVERAGE_MISSING``, ``SCHEMA_MISMATCH``,
+``COST_MISMATCH``, ``COST_UNVERIFIED``, ``AUTH_FAILED``,
+``PROVIDER_UNAVAILABLE``.
 
 Nothing here promotes a model, publishes a candidate, or writes a scan. A green
-run tells you what coverage exists at that instant and nothing more.
+run is a *limited* proof — this endpoint, this bookmaker, this competition, this
+event, this market, this instant. The adapter's global status stays
+``IMPLEMENTED_UNVERIFIED`` until a separate, documented promotion decision.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json as jsonlib
 import os
+import secrets
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -63,9 +89,10 @@ import typer
 from betmaxxing.config import Settings, get_settings
 from betmaxxing.domain.enums import Sport
 from betmaxxing.domain.timeutil import ensure_utc, utc_now
-from betmaxxing.providers.base import CollectionBatch, ProviderError
+from betmaxxing.providers.base import CollectionBatch, ProviderError, QuotaInfo
 from betmaxxing.providers.budget import ProviderBudgetLedger
 from betmaxxing.providers.the_odds_api.client import (
+    HEADER_LAST,
     TheOddsApiAuthError,
     TheOddsApiClient,
     effective_region_units,
@@ -81,11 +108,20 @@ from betmaxxing.providers.the_odds_api.provider import (
     additional_markets_for,
 )
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 #: Where receipts land when ``BETMAXXING_ACTIVATION_RECEIPTS`` is unset. Its
 #: first path segment is listed in ``.gitignore``: a receipt is an operating
 #: record of a real, billed call and belongs to the operator, not to the repo.
 DEFAULT_RECEIPT_DIR = ".activation-receipts"
 RECEIPT_DIR_VARIABLE = "BETMAXXING_ACTIVATION_RECEIPTS"
+
+#: The local signing secret. Generated on first network need, never printed,
+#: never committed. Overridable by environment so tests are deterministic and no
+#: test ever leaves a real secret on disk.
+SECRET_FILENAME = "signing-key.secret"
+SECRET_VARIABLE = "BETMAXXING_ACTIVATION_RECEIPT_SECRET"
 
 #: Injected by the test suite. Production leaves it ``None`` so httpx builds its
 #: own transport; there is no other way to reach this module's network calls.
@@ -94,9 +130,18 @@ _TRANSPORT_FOR_TESTS: httpx.BaseTransport | None = None
 #: Patched by tests that need a deterministic instant.
 _clock = utc_now
 
-#: Hard per-step ceilings. These are the contract, not a default.
+#: Estimated contractual cost of each step, under the published v4 rule.
 STEP_CEILINGS: dict[str, int] = {"plan": 0, "discover": 0, "core": 1, "additional": 5}
 TOTAL_MAX_CREDITS = sum(STEP_CEILINGS.values())
+
+#: What the program itself will do, regardless of what anything costs. These are
+#: enforced by construction: there is no code path that issues a second request.
+LOCAL_BOUNDS: dict[str, dict[str, int]] = {
+    "plan": {"max_requests": 0, "max_events": 0, "max_bookmakers": 0, "max_markets": 0},
+    "discover": {"max_requests": 2, "max_events": 0, "max_bookmakers": 1, "max_markets": 0},
+    "core": {"max_requests": 1, "max_events": 1, "max_bookmakers": 1, "max_markets": 1},
+    "additional": {"max_requests": 1, "max_events": 1, "max_bookmakers": 1, "max_markets": 5},
+}
 
 #: One market, deliberately. ``core_markets_for(FOOTBALL)`` is ``("h2h",
 #: "totals")`` — two markets, therefore two credits. The activation asks for the
@@ -109,7 +154,15 @@ ADDITIONAL_MARKETS: tuple[str, ...] = additional_markets_for(Sport.FOOTBALL)
 
 MAX_WINDOW_HOURS = 24
 
-RECEIPT_SCHEMA = 1
+#: Receipt schema. v1 was unsigned and carried an unsalted SHA of a public event
+#: id; it is refused rather than upgraded, because a v1 file proves nothing.
+RECEIPT_SCHEMA_VERSION = 2
+SIGNATURE_FIELD = "signature"
+
+#: How long a receipt may authorise the next step. Short on purpose: yesterday's
+#: discovery says nothing about today's fixtures, and a proof that never expires
+#: is a proof that eventually gets reused for the wrong thing.
+RECEIPT_TTL = timedelta(hours=6)
 
 
 class ActivationStatus(StrEnum):
@@ -119,20 +172,52 @@ class ActivationStatus(StrEnum):
     DISCOVERY_VERIFIED = "DISCOVERY_VERIFIED"
     CORE_LIVE_VERIFIED = "CORE_LIVE_VERIFIED"
     ADDITIONAL_LIVE_VERIFIED = "ADDITIONAL_LIVE_VERIFIED"
+    ADDITIONAL_PARTIAL_COVERAGE = "ADDITIONAL_PARTIAL_COVERAGE"
     COVERAGE_MISSING = "COVERAGE_MISSING"
     SCHEMA_MISMATCH = "SCHEMA_MISMATCH"
     COST_MISMATCH = "COST_MISMATCH"
+    COST_UNVERIFIED = "COST_UNVERIFIED"
     AUTH_FAILED = "AUTH_FAILED"
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
 
 
-class Refused(Exception):
-    """A step stopped. Carries the status and a message safe to print."""
+#: Statuses that authorise the next step and exit zero. Everything else is a
+#: reportable outcome that stops the sequence.
+VERIFIED_STATUSES = frozenset(
+    {
+        ActivationStatus.DISCOVERY_VERIFIED,
+        ActivationStatus.CORE_LIVE_VERIFIED,
+        ActivationStatus.ADDITIONAL_LIVE_VERIFIED,
+        ActivationStatus.ADDITIONAL_PARTIAL_COVERAGE,
+    }
+)
 
-    def __init__(self, status: ActivationStatus, message: str) -> None:
+
+class MarketState(StrEnum):
+    """What became of one requested market. Absence is not rejection."""
+
+    OBSERVED_MAPPED = "OBSERVED_MAPPED"
+    OBSERVED_REJECTED = "OBSERVED_REJECTED"
+    NOT_RETURNED = "NOT_RETURNED"
+
+
+class Refused(Exception):
+    """A step stopped.
+
+    ``document`` carries the full receipt when the network was already reached,
+    so the operator sees the whole outcome rather than a one-line reason.
+    """
+
+    def __init__(
+        self,
+        status: ActivationStatus,
+        message: str,
+        document: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.message = message
+        self.document = document
 
 
 app = typer.Typer(
@@ -140,23 +225,24 @@ app = typer.Typer(
     no_args_is_help=True,
     help=(
         "Activation contrôlée de The Odds API. Quatre étapes indépendantes, "
-        "chacune plafonnée et autorisée séparément : plan (0), discover (0), "
-        "core (1 crédit), additional (5 crédits)."
+        "chacune bornée localement, chiffrée selon le tarif publié et autorisée "
+        "séparément : plan (0), discover (0), core (1 crédit), additional (5)."
     ),
 )
 
 
 # ---------------------------------------------------------------------------
-# Secrets, hashing, receipts
+# Secrets and scrubbing
 # ---------------------------------------------------------------------------
 def _scrub(text: str, secret: str) -> str:
-    """Remove the key from a message, however it got in there.
+    """Remove the API key from a message, however it got in there.
 
     :func:`redact` strips ``apiKey=…`` from URLs, which covers everything the
-    client itself builds. It does not cover a third party: an ``httpx``
-    transport error can quote the whole request line, and a proxy can echo the
-    query string back inside a body. So the literal value is removed too, and
-    that is the last thing done before anything is printed or written.
+    client itself builds. It does not cover a third party: an ``httpx`` transport
+    error can quote the whole request line, and a proxy can echo the query string
+    back inside a body. So the literal value is removed too, and that is the last
+    thing done before anything is printed — and, for a receipt, before it is
+    signed, so scrubbing can never invalidate a signature.
     """
     cleaned = redact(text)
     if secret:
@@ -164,46 +250,334 @@ def _scrub(text: str, secret: str) -> str:
     return cleaned
 
 
-def hash_event_id(event_id: str) -> str:
-    """Stable, unsalted digest of a provider event id.
-
-    Unsalted on purpose: ``additional`` has to recognise the receipt ``core``
-    wrote for the same event, across processes and days, and a per-run salt
-    would make that impossible. A provider fixture id is not personal data; the
-    hash is here so a receipt cannot be used to reconstruct which matches were
-    looked at, not to protect a secret.
-    """
-    return hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:16]
-
-
 def receipt_dir() -> Path:
     return Path(os.environ.get(RECEIPT_DIR_VARIABLE, "").strip() or DEFAULT_RECEIPT_DIR)
 
 
-def write_receipt(payload: dict[str, Any], *, secret: str) -> Path:
-    """Persist one sanitised receipt locally. Never committed, never uploaded."""
+def receipt_secret() -> str:
+    """The local HMAC secret, created on first need.
+
+    Created with ``O_CREAT | O_EXCL`` at mode ``0600`` so two processes racing
+    cannot end up with different secrets — the loser reads the winner's file.
+    It lives in the gitignored receipt directory, is never printed, never logged
+    and never committed. The environment variable exists so the test suite can
+    inject a deterministic value rather than depend on real randomness.
+    """
+    injected = os.environ.get(SECRET_VARIABLE, "").strip()
+    if injected:
+        return injected
+
     directory = receipt_dir()
     directory.mkdir(parents=True, exist_ok=True)
-    stamp = payload["recorded_at"].replace(":", "").replace("-", "")
-    path = directory / f"{stamp}-{payload['command']}-{payload['event_id_hash'][:8]}.json"
-    text = jsonlib.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)
-    path.write_text(_scrub(text, secret) + "\n", encoding="utf-8")
+    path = directory / SECRET_FILENAME
+    try:
+        handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return path.read_text(encoding="utf-8").strip()
+    value = secrets.token_hex(32)
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        stream.write(value)
+    # `os.open`'s mode is masked by the umask; state it outright.
+    os.chmod(path, 0o600)
+    return value
+
+
+def event_tag(event_id: str) -> str:
+    """Stable local tag for a provider event id.
+
+    HMAC rather than a bare digest. A plain ``sha256(event_id)`` is computable by
+    anyone holding the provider's public fixture list, so it hid nothing; keyed
+    with a secret that never leaves this installation, it identifies the event to
+    *us* — enough for ``core`` to recognise ``discover``'s approval across
+    processes — without being reversible by a dictionary of public ids.
+    """
+    digest = hmac.new(
+        receipt_secret().encode("utf-8"), f"event:{event_id}".encode(), hashlib.sha256
+    )
+    return digest.hexdigest()[:24]
+
+
+# ---------------------------------------------------------------------------
+# Cost model — three numbers, never conflated
+# ---------------------------------------------------------------------------
+def _usable_cost(value: object) -> int | None:
+    """A charge is a non-negative integer. Anything else is *unknown*, not nought."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def observed_credits_of(headers: Mapping[str, Any]) -> int | None:
+    """What the provider says it charged, or ``None`` if it did not say.
+
+    ``None`` is the whole point. The previous version returned ``0`` for a
+    missing header, so a call the ledger had just charged one credit for was
+    recorded as free, and a documented-free endpoint that never reported its cost
+    was accepted as *proof* of costing nothing.
+    """
+    return _usable_cost(headers.get(HEADER_LAST))
+
+
+def _observed_from(quota: QuotaInfo) -> int | None:
+    return _usable_cost(quota.last_cost)
+
+
+def accounted_credits_of(*, estimated: int, observed: int | None) -> int:
+    """What the spend record keeps.
+
+    The observation when there is one — including an explicit nought, which v4
+    really does return for an empty response. The estimate otherwise, because a
+    cost we could not read is a cost we must assume we paid.
+    """
+    return estimated if observed is None else observed
+
+
+# ---------------------------------------------------------------------------
+# Receipts
+# ---------------------------------------------------------------------------
+def canonical_bytes(payload: Mapping[str, Any]) -> bytes:
+    """The exact bytes a signature covers.
+
+    Sorted keys and tight separators, so re-serialising a receipt — or reading it
+    back through a JSON library that reorders — cannot change the signature.
+    ``signature`` itself and any ``_``-prefixed scratch key are excluded.
+    """
+    body = {k: v for k, v in payload.items() if k != SIGNATURE_FIELD and not k.startswith("_")}
+    return jsonlib.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+
+
+def sign_receipt(payload: Mapping[str, Any]) -> str:
+    return hmac.new(
+        receipt_secret().encode("utf-8"), canonical_bytes(payload), hashlib.sha256
+    ).hexdigest()
+
+
+def verify_receipt(payload: Mapping[str, Any]) -> bool:
+    """Constant-time signature check. Everything downstream depends on it."""
+    given = payload.get(SIGNATURE_FIELD)
+    if not isinstance(given, str) or not given:
+        return False
+    return hmac.compare_digest(given, sign_receipt(payload))
+
+
+def write_receipt(document: dict[str, Any]) -> Path:
+    """Sign and persist one receipt locally. Never committed, never uploaded."""
+    directory = receipt_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    signed = {k: v for k, v in document.items() if not k.startswith("_")}
+    signed[SIGNATURE_FIELD] = sign_receipt(signed)
+    stamp = str(signed["recorded_at"]).replace(":", "").replace("-", "")[:15]
+    path = directory / f"{stamp}-{signed['command']}-{str(signed['receipt_id'])[:8]}.json"
+    path.write_text(
+        jsonlib.dumps(signed, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    document[SIGNATURE_FIELD] = signed[SIGNATURE_FIELD]
+    document["_path"] = str(path)
     return path
 
 
-def read_receipts() -> list[dict[str, Any]]:
-    directory = receipt_dir()
-    if not directory.is_dir():
-        return []
-    out: list[dict[str, Any]] = []
-    for path in sorted(directory.glob("*.json")):
-        try:
-            loaded = jsonlib.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(loaded, dict):
-            out.append(loaded)
-    return out
+def load_parent(
+    raw_path: str,
+    *,
+    command: str,
+    status: ActivationStatus,
+    sport: str,
+    bookmaker: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """Read and fully validate the receipt that authorises this step.
+
+    Passed by path, deliberately. The previous version walked the receipt
+    directory looking for something that matched — choosing the operator's
+    evidence for them, from unauthenticated files, in a directory anything can
+    write to.
+    """
+    directory = receipt_dir().resolve()
+    path = Path(raw_path)
+    if path.is_symlink():
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{raw_path} est un lien symbolique. Une preuve doit être un fichier réel "
+            "du répertoire de reçus, pas un renvoi vers ailleurs.",
+        )
+    resolved = path.resolve()
+    if not resolved.is_file() or resolved.parent != directory:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{raw_path} n'est pas un reçu de {directory}. Seul le répertoire de reçus "
+            "autorisé est lu ; aucun chemin ambigu n'est suivi.",
+        )
+
+    try:
+        payload = jsonlib.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED, f"{raw_path} est illisible ({exc})."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise Refused(ActivationStatus.PREPARED_NOT_EXECUTED, f"{raw_path} n'est pas un reçu.")
+
+    version = payload.get("schema_version")
+    if version != RECEIPT_SCHEMA_VERSION:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{raw_path} porte le schéma {version!r}, attendu {RECEIPT_SCHEMA_VERSION}. Les "
+            "reçus antérieurs ne sont ni signés ni chaînés : ils ne prouvent rien et ne "
+            "sont pas promus silencieusement. Relancez `discover` puis les étapes "
+            "suivantes avec cette version.",
+        )
+    if not verify_receipt(payload):
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{raw_path} : signature absente ou invalide. Le reçu a été modifié, ou il "
+            "vient d'une autre installation. Relancez `discover` pour repartir d'une "
+            "preuve authentique.",
+        )
+
+    if payload.get("command") != command or payload.get("status") != str(status):
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{raw_path} porte command={payload.get('command')!r} "
+            f"status={payload.get('status')!r} ; attendu {command!r} / {status}.",
+        )
+    if payload.get("sport_key") != sport or payload.get("bookmaker") != bookmaker:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{raw_path} concerne {payload.get('sport_key')!r}/{payload.get('bookmaker')!r} "
+            f"et non {sport!r}/{bookmaker!r}. Une preuve ne se transpose pas.",
+        )
+
+    expires = _parse_instant(payload.get("expires_at"))
+    if expires is None or expires <= now:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{raw_path} a expiré ({payload.get('expires_at')}). Une découverte périmée ne "
+            "dit rien des rencontres d'aujourd'hui ; relancez `discover`.",
+        )
+    return payload
+
+
+def _parse_instant(raw: object) -> datetime | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        return ensure_utc(datetime.fromisoformat(raw))
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Attempt bookkeeping — so any exit path can still write a receipt
+# ---------------------------------------------------------------------------
+@dataclass
+class Attempt:
+    """Everything a receipt needs, filled in as the step proceeds.
+
+    It exists because receipts used to be written only on the success path: a
+    response that arrived, was billed, and then failed validation left no trace
+    at all. Once a request has been attempted this object is enough to write a
+    complete, sanitised receipt whatever happens next.
+    """
+
+    command: str
+    sport: str
+    bookmaker: str
+    window: tuple[datetime, datetime]
+    ceiling: int
+    now: datetime
+    event_id: str | None = None
+    estimated: int = 0
+    observed: int | None = None
+    attempts: int = 0
+    network_attempted: bool = False
+    reached_provider: bool = False
+    endpoints: list[str] = field(default_factory=list)
+    parent_receipt_id: str | None = None
+    quota_remaining: int | None = None
+    event_tags: list[str] = field(default_factory=list)
+    markets_requested: list[str] = field(default_factory=list)
+    market_states: dict[str, str] = field(default_factory=dict)
+    freshness: dict[str, int] = field(default_factory=dict)
+    selections_mapped: int = 0
+    rejections: list[str] = field(default_factory=list)
+    events: list[dict[str, str]] = field(default_factory=list)
+
+    def record(self, endpoint: str) -> None:
+        self.attempts += 1
+        self.network_attempted = True
+        self.endpoints.append(endpoint)
+
+    @property
+    def accounted(self) -> int:
+        if not self.reached_provider and self.observed is None:
+            # Proven never to have left: nothing was served, nothing was billed.
+            return 0
+        return accounted_credits_of(estimated=self.estimated, observed=self.observed)
+
+
+def build_receipt(attempt: Attempt, status: ActivationStatus, secret: str) -> dict[str, Any]:
+    """Assemble one sanitised receipt.
+
+    Deliberately absent: the key, the full URL, the raw body, every quoted odd,
+    both participant names, and the provider's event id in clear. What remains is
+    which endpoint was called, how many times, whether it got there, what it was
+    estimated at, what it reported, what we account for, which markets came back
+    in what state, how fresh they were, and whether our parser coped — the whole
+    question an activation is meant to answer.
+    """
+    document: dict[str, Any] = {
+        "schema_version": RECEIPT_SCHEMA_VERSION,
+        "receipt_id": secrets.token_hex(8),
+        "command": attempt.command,
+        "status": str(status),
+        "recorded_at": attempt.now.isoformat(),
+        "expires_at": (attempt.now + RECEIPT_TTL).isoformat(),
+        "sport_key": attempt.sport,
+        "bookmaker": attempt.bookmaker,
+        "window_from": attempt.window[0].isoformat(),
+        "window_to": attempt.window[1].isoformat(),
+        "endpoints": list(attempt.endpoints),
+        "endpoint": attempt.endpoints[-1] if attempt.endpoints else "",
+        "attempts": attempt.attempts,
+        "network_attempted": attempt.network_attempted,
+        "may_have_reached_provider": attempt.reached_provider,
+        "estimated_credits": attempt.estimated,
+        "observed_credits": attempt.observed,
+        "accounted_credits": attempt.accounted,
+        "quota_remaining": attempt.quota_remaining,
+        "markets_requested": list(attempt.markets_requested),
+        "markets_observed": [
+            m for m, s in attempt.market_states.items() if s != MarketState.NOT_RETURNED
+        ],
+        "markets_absent": [
+            m for m, s in attempt.market_states.items() if s == MarketState.NOT_RETURNED
+        ],
+        "markets_rejected": [
+            m for m, s in attempt.market_states.items() if s == MarketState.OBSERVED_REJECTED
+        ],
+        "markets_mapped": [
+            m for m, s in attempt.market_states.items() if s == MarketState.OBSERVED_MAPPED
+        ],
+        "market_states": dict(attempt.market_states),
+        "freshness": dict(attempt.freshness),
+        "selections_mapped": attempt.selections_mapped,
+        "mapping_rejections": [_scrub(r, secret) for r in attempt.rejections],
+        "parent_receipt_id": attempt.parent_receipt_id,
+        "adapter_status": "IMPLEMENTED_UNVERIFIED",
+        "model_impact": "aucun — tous les modèles restent BACKTEST_ONLY",
+    }
+    if attempt.command == "discover":
+        document["event_tags"] = list(attempt.event_tags)
+    else:
+        document["event_tag"] = attempt.event_tags[0] if attempt.event_tags else ""
+    return document
 
 
 # ---------------------------------------------------------------------------
@@ -212,8 +586,8 @@ def read_receipts() -> list[dict[str, Any]]:
 def _single(raw: str, label: str) -> str:
     """Exactly one comma-free token, or refuse.
 
-    A list here is a fan-out, and a fan-out is precisely what the previous
-    script did wrong. Multiplying the scope multiplies the bill.
+    A list here is a fan-out, and a fan-out is precisely what the previous script
+    did wrong. Multiplying the scope multiplies the bill.
     """
     tokens = [token.strip() for token in raw.split(",") if token.strip()]
     if len(tokens) != 1:
@@ -237,23 +611,23 @@ def _check_window(window_hours: int) -> int:
 def _check_ceiling(command: str, max_credits: int, acknowledge: int | None) -> int:
     """The ceiling is fixed by the contract; the operator restates it twice.
 
-    ``--max-credits`` must equal the published ceiling for that command, and
-    ``--acknowledge-credits`` must equal it again. Two identical numbers typed by
-    hand is a weak proof of intent, but it is a far stronger one than a boolean:
-    it cannot be satisfied without knowing what the step costs.
+    Two identical numbers typed by hand is a weak proof of intent, but it is a far
+    stronger one than a boolean: it cannot be supplied without knowing what the
+    step costs.
     """
     expected = STEP_CEILINGS[command]
     if max_credits != expected:
         raise Refused(
             ActivationStatus.PREPARED_NOT_EXECUTED,
-            f"`{command}` est plafonné à {expected} crédit(s) ; --max-credits={max_credits} "
-            "est refusé. Le plafond n'est pas négociable depuis la ligne de commande.",
+            f"`{command}` est chiffré à {expected} crédit(s) selon le tarif publié ; "
+            f"--max-credits={max_credits} est refusé. Ce plafond ne se négocie pas depuis "
+            "la ligne de commande.",
         )
     if acknowledge is None or acknowledge != expected:
         raise Refused(
             ActivationStatus.PREPARED_NOT_EXECUTED,
-            f"--acknowledge-credits={expected} est requis pour `{command}` : "
-            "vous confirmez explicitement la dépense avant qu'elle ait lieu.",
+            f"--acknowledge-credits={expected} est requis pour `{command}` : vous "
+            "confirmez explicitement la dépense avant qu'elle ait lieu.",
         )
     return expected
 
@@ -282,8 +656,8 @@ def _client(
 ) -> TheOddsApiClient:
     """One client, zero retries.
 
-    ``max_retries=0`` is the whole point: a retry is another billable request,
-    and a step whose ceiling is one credit may make exactly one attempt.
+    ``max_retries=0`` is the whole point: a retry is another billable request, and
+    a step whose local bound is one request may make exactly one attempt.
     """
     return TheOddsApiClient(
         api_key=key,
@@ -298,23 +672,31 @@ def _client(
     )
 
 
-def _check_observed_cost(observed: int | None, ceiling: int, endpoint: str) -> int:
-    """What the provider says it charged, against what we authorised.
+def _settle_cost(attempt: Attempt, quota: QuotaInfo, endpoint: str) -> None:
+    """Read what the provider charged, and decide whether we can prove it.
 
-    ``x-requests-last`` is authoritative. A figure above the ceiling means the
-    billing contract is not what this harness was built against, and the right
-    response is to stop and say so — not to keep going and find out how much the
-    next step costs.
+    Raises ``COST_MISMATCH`` above the ceiling — the billing contract is not the
+    one this harness was built against, and the right response is to stop.
+    ``COST_UNVERIFIED`` when the header is missing or unusable: the estimate stays
+    accounted for, and an unproven step authorises nothing.
     """
-    if observed is None:
-        return 0
-    if observed > ceiling:
+    attempt.reached_provider = True
+    attempt.observed = _observed_from(quota)
+    attempt.quota_remaining = quota.remaining
+    if attempt.observed is not None and attempt.observed > attempt.ceiling:
         raise Refused(
             ActivationStatus.COST_MISMATCH,
-            f"{endpoint} : le fournisseur annonce {observed} crédit(s) facturé(s) pour "
-            f"un plafond de {ceiling}. Arrêt immédiat — le contrat de facturation a changé.",
+            f"{endpoint} : le fournisseur annonce {attempt.observed} crédit(s) facturé(s) "
+            f"pour un plafond contractuel de {attempt.ceiling}. Arrêt immédiat — la "
+            "tarification n'est plus celle sur laquelle cet outil est chiffré.",
         )
-    return observed
+    if attempt.observed is None:
+        raise Refused(
+            ActivationStatus.COST_UNVERIFIED,
+            f"{endpoint} : aucun en-tête `{HEADER_LAST}` exploitable. Le coût réel est "
+            f"inconnu, l'estimation ({attempt.estimated}) reste comptabilisée par "
+            "prudence, et une étape non vérifiée n'en autorise aucune autre.",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -323,17 +705,17 @@ def _check_observed_cost(observed: int | None, ceiling: int, endpoint: str) -> i
 def _event_of(payload: Any, event_id: str, endpoint: str) -> dict[str, Any]:
     """Locate the one event we asked for, or say precisely what came back."""
     events = payload if isinstance(payload, list) else [payload]
-    usable = [
-        item
-        for item in events
-        if isinstance(item, dict) and {"id", "commence_time", "home_team"} <= set(item)
-    ]
     if not events or all(item in ({}, None) for item in events):
         raise Refused(
             ActivationStatus.COVERAGE_MISSING,
             f"{endpoint} : réponse vide. Ce n'est pas une panne — aucun événement "
             "correspondant n'était disponible à cet instant.",
         )
+    usable = [
+        item
+        for item in events
+        if isinstance(item, dict) and {"id", "commence_time", "home_team"} <= set(item)
+    ]
     if not usable:
         raise Refused(
             ActivationStatus.SCHEMA_MISMATCH,
@@ -355,8 +737,8 @@ def _book_of(raw_event: dict[str, Any], bookmaker: str, endpoint: str) -> dict[s
             return book
     raise Refused(
         ActivationStatus.COVERAGE_MISSING,
-        f"{endpoint} : {bookmaker} n'est pas coté sur cet événement. Une réponse "
-        "valide sans le bookmaker demandé est une couverture manquante, pas une panne.",
+        f"{endpoint} : {bookmaker} n'est pas coté sur cet événement. Une réponse valide "
+        "sans le bookmaker demandé est une couverture manquante, pas une panne.",
     )
 
 
@@ -389,6 +771,28 @@ def _market_keys(book: dict[str, Any]) -> list[str]:
     ]
 
 
+def _classify_markets(
+    requested: tuple[str, ...], book: dict[str, Any], batch: CollectionBatch
+) -> dict[str, str]:
+    """One explicit state per requested market. Absence is not rejection.
+
+    ``NOT_RETURNED`` means the provider did not quote it — a coverage fact.
+    ``OBSERVED_REJECTED`` means it came back and our parser could not use it — a
+    contract or mapping fact. Collapsing the two would hide whichever is real.
+    """
+    returned = set(_market_keys(book))
+    mapped = {str(s.source_meta.get("market", "")) for s in batch.snapshots}
+    states: dict[str, str] = {}
+    for key in requested:
+        if key not in returned:
+            states[key] = str(MarketState.NOT_RETURNED)
+        elif key in mapped:
+            states[key] = str(MarketState.OBSERVED_MAPPED)
+        else:
+            states[key] = str(MarketState.OBSERVED_REJECTED)
+    return states
+
+
 def _parse_with_the_real_parser(
     settings: Settings,
     client: TheOddsApiClient,
@@ -401,8 +805,7 @@ def _parse_with_the_real_parser(
     """Run the response through the adapter's own parser.
 
     The point of a live step is not to see JSON arrive; it is to find out whether
-    the code that will read it in production actually does. So the real
-    ``_ingest_event`` is used, under the shape the endpoint declares.
+    the code that will read it in production actually does.
     """
     provider = TheOddsApiProvider(settings, client=client, now=now)
     batch = CollectionBatch(
@@ -414,13 +817,12 @@ def _parse_with_the_real_parser(
 
 def _check_start_time(raw_event: dict[str, Any], window: tuple[datetime, datetime]) -> None:
     raw = str(raw_event.get("commence_time", ""))
-    try:
-        start = ensure_utc(datetime.fromisoformat(raw.replace("Z", "+00:00")))
-    except ValueError as exc:
+    start = _parse_instant(raw.replace("Z", "+00:00"))
+    if start is None:
         raise Refused(
             ActivationStatus.SCHEMA_MISMATCH,
             f"commence_time illisible ({raw!r}) — aucune date n'est supposée.",
-        ) from exc
+        )
     if not (window[0] < start <= window[1]):
         raise Refused(
             ActivationStatus.COVERAGE_MISSING,
@@ -429,10 +831,29 @@ def _check_start_time(raw_event: dict[str, Any], window: tuple[datetime, datetim
         )
 
 
+def _inside(item: dict[str, Any], window: tuple[datetime, datetime]) -> bool:
+    start = _parse_instant(str(item.get("commence_time", "")).replace("Z", "+00:00"))
+    return start is not None and window[0] < start <= window[1]
+
+
+def _generalise(error: str) -> str:
+    """Keep the reason, drop anything that could be a name or a quoted value."""
+    return error.split(":")[0].strip()[:80]
+
+
+def _status_of(error: ProviderError) -> ActivationStatus:
+    return (
+        ActivationStatus.AUTH_FAILED
+        if isinstance(error, TheOddsApiAuthError)
+        else ActivationStatus.PROVIDER_UNAVAILABLE
+    )
+
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
-def _emit(payload: dict[str, Any], lines: list[str], *, as_json: bool, secret: str = "") -> None:
+def _emit(document: dict[str, Any], lines: list[str], *, as_json: bool, secret: str = "") -> None:
+    payload = {k: v for k, v in document.items() if not k.startswith("_")}
     if as_json:
         typer.echo(_scrub(jsonlib.dumps(payload, indent=2, sort_keys=True), secret))
         return
@@ -440,12 +861,74 @@ def _emit(payload: dict[str, Any], lines: list[str], *, as_json: bool, secret: s
         typer.echo(_scrub(line, secret))
 
 
-def _fail(status: ActivationStatus, message: str, *, as_json: bool, secret: str = "") -> None:
-    if as_json:
+def _finish(
+    document: dict[str, Any],
+    lines: list[str],
+    *,
+    as_json: bool,
+    secret: str,
+    ok: bool,
+) -> None:
+    _emit(document, lines, as_json=as_json, secret=secret)
+    if not ok:
+        raise typer.Exit(1)
+
+
+def _fail(
+    status: ActivationStatus,
+    message: str,
+    *,
+    as_json: bool,
+    secret: str = "",
+    document: dict[str, Any] | None = None,
+) -> None:
+    if document is not None:
+        _emit(
+            document,
+            [f"{status} : {message}", "", *_summary(document)],
+            as_json=as_json,
+            secret=secret,
+        )
+    elif as_json:
         typer.echo(_scrub(jsonlib.dumps({"status": str(status), "detail": message}), secret))
     else:
         typer.echo(_scrub(f"{status} : {message}", secret))
     raise typer.Exit(1)
+
+
+def _summary(document: dict[str, Any]) -> list[str]:
+    lines = [
+        f"Statut          : {document['status']}",
+        f"Endpoint        : {document.get('endpoint') or 'aucun'}",
+        f"Requêtes        : {document.get('attempts', 0)} "
+        f"(borne locale {LOCAL_BOUNDS[document['command']]['max_requests']})",
+        f"Crédits estimés : {document.get('estimated_credits')}",
+        f"Crédits annoncés: {_none(document.get('observed_credits'))}",
+        f"Crédits retenus : {document.get('accounted_credits')} (prudence)",
+    ]
+    states = document.get("market_states") or {}
+    if states:
+        lines.append("Marchés         :")
+        for key, state in states.items():
+            age = document.get("freshness", {}).get(key)
+            suffix = f" · {age} s" if age is not None else ""
+            lines.append(f"  · {key:<18} {state}{suffix}")
+    if document.get("selections_mapped") is not None:
+        lines.append(f"Sélections      : {document['selections_mapped']} cartographiée(s)")
+    if document.get("_path"):
+        lines.append(f"Reçu            : {document['_path']}")
+    lines += [
+        "",
+        "Preuve limitée à cet endpoint, ce bookmaker, cette compétition, cet événement, "
+        "ce marché et cet instant.",
+        f"Statut de l'adaptateur inchangé : {document.get('adapter_status')}. "
+        f"Modèles : {document.get('model_impact')}.",
+    ]
+    return lines
+
+
+def _none(value: object) -> str:
+    return "inconnu" if value is None else str(value)
 
 
 # ---------------------------------------------------------------------------
@@ -461,38 +944,47 @@ def build_plan(
             "command": "plan",
             "network": False,
             "max_credits": STEP_CEILINGS["plan"],
+            "local_bound": LOCAL_BOUNDS["plan"],
             "endpoints": [],
             "markets": [],
-            "note": "Aucune socket, aucune clé lue, aucun reçu écrit.",
+            "note": "Aucune socket, aucune clé lue, aucun secret lu, aucun reçu écrit.",
         },
         {
             "command": "discover",
             "network": True,
             "max_credits": STEP_CEILINGS["discover"],
+            "local_bound": LOCAL_BOUNDS["discover"],
             "endpoints": ["/v4/sports", f"/v4/sports/{sport}/events"],
             "markets": [],
-            "note": "Endpoints documentés gratuits ; un coût annoncé non nul arrête l'étape.",
+            "note": (
+                "Endpoints documentés gratuits ; un coût annoncé non nul arrête l'étape, "
+                "un coût non annoncé la laisse non vérifiée."
+            ),
         },
         {
             "command": "core",
             "network": True,
             "max_credits": STEP_CEILINGS["core"],
+            "local_bound": LOCAL_BOUNDS["core"],
             "endpoints": [f"/v4/sports/{sport}/odds"],
             "markets": list(CORE_MARKETS),
             "note": (
                 f"{len(CORE_MARKETS)} marché x {units} unité(s) régionale(s) = "
-                f"{estimate_cost(markets=len(CORE_MARKETS), region_units=units)} crédit(s)."
+                f"{estimate_cost(markets=len(CORE_MARKETS), region_units=units)} crédit(s) "
+                "selon le tarif publié. Exige le reçu de `discover`."
             ),
         },
         {
             "command": "additional",
             "network": True,
             "max_credits": STEP_CEILINGS["additional"],
+            "local_bound": LOCAL_BOUNDS["additional"],
             "endpoints": [f"/v4/sports/{sport}/events/<event>/odds"],
             "markets": list(ADDITIONAL_MARKETS),
             "note": (
                 f"{len(ADDITIONAL_MARKETS)} marchés x {units} unité(s) régionale(s) = "
-                f"{estimate_cost(markets=len(ADDITIONAL_MARKETS), region_units=units)} crédit(s)."
+                f"{estimate_cost(markets=len(ADDITIONAL_MARKETS), region_units=units)} "
+                "crédit(s) selon le tarif publié. Exige le reçu de `core`."
             ),
         },
     ]
@@ -505,12 +997,32 @@ def build_plan(
         "effective_region_units": units,
         "total_max_credits": TOTAL_MAX_CREDITS,
         "steps": steps,
+        "cost_model": {
+            "local_bound": (
+                "Ce que ce programme fera : nombre de requêtes, endpoints, événements, "
+                "bookmakers et marchés. Imposé ici, avant toute socket."
+            ),
+            "estimated_contractual_ceiling": TOTAL_MAX_CREDITS,
+            "observed": (
+                "`x-requests-last`, ce que le fournisseur déclare avoir facturé. "
+                "`null` s'il ne le déclare pas — jamais remplacé par zéro."
+            ),
+            "accounted": (
+                "Ce qui est retenu en comptabilité : l'observation si elle existe, "
+                "l'estimation sinon."
+            ),
+        },
         "guarantees": [
             "Aucun endpoint historique ou payant n'est joignable depuis cet outil.",
             "Aucune tentative n'est répétée : max_retries=0 sur chaque étape.",
-            "Aucune étape n'en déclenche une autre.",
+            "Aucune étape n'en déclenche une autre ; chaque preuve est fournie en argument.",
             "La clé provient de l'environnement et n'est jamais acceptée en argument.",
         ],
+        "limite": (
+            "Ce programme ne peut pas empêcher le fournisseur de modifier sa "
+            "tarification et de facturer autrement une requête déjà servie ; il peut "
+            "seulement le constater dans les en-têtes et s'arrêter."
+        ),
     }
 
 
@@ -519,12 +1031,12 @@ def plan(
     sport: str = typer.Option(..., "--sport", help="Une seule clé de compétition v4."),
     bookmaker: str = typer.Option(..., "--bookmaker", help="Un seul bookmaker."),
     max_credits: int = typer.Option(
-        ..., "--max-credits", help="Plafond total de la séquence, à restituer exactement."
+        ..., "--max-credits", help="Plafond contractuel total, à restituer exactement."
     ),
     window_hours: int = typer.Option(24, "--window-hours", help="Fenêtre, 24 h au maximum."),
     json_output: bool = typer.Option(False, "--json", help="Sortie JSON."),
 ) -> None:
-    """Chiffrer la séquence hors ligne. Aucune socket, aucune clé lue, 0 crédit."""
+    """Chiffrer la séquence hors ligne. Aucune socket, aucun secret lu, 0 crédit."""
     try:
         one_sport = _single(sport, "--sport")
         one_book = _single(bookmaker, "--bookmaker")
@@ -532,7 +1044,7 @@ def plan(
         if max_credits != TOTAL_MAX_CREDITS:
             raise Refused(
                 ActivationStatus.PREPARED_NOT_EXECUTED,
-                f"La séquence complète est plafonnée à {TOTAL_MAX_CREDITS} crédits "
+                f"La séquence complète est chiffrée à {TOTAL_MAX_CREDITS} crédits "
                 f"({STEP_CEILINGS}) ; --max-credits={max_credits} est refusé.",
             )
     except Refused as exc:
@@ -551,21 +1063,88 @@ def plan(
         f"Bookmaker       : {one_book}",
         f"Fenêtre         : {hours} h",
         f"Unités région   : {document['effective_region_units']}",
-        f"Plafond total   : {TOTAL_MAX_CREDITS} crédits",
+        f"Plafond total   : {TOTAL_MAX_CREDITS} crédits (tarif publié)",
         "",
     ]
     for step in document["steps"]:
         endpoints = ", ".join(step["endpoints"]) or "aucun"
-        lines.append(f"  {step['command']:<11} {step['max_credits']} crédit(s)  {endpoints}")
+        bound = step["local_bound"]["max_requests"]
+        lines.append(
+            f"  {step['command']:<11} {step['max_credits']} crédit(s) · "
+            f"{bound} requête(s) au plus  {endpoints}"
+        )
         if step["markets"]:
             lines.append(f"              marchés : {', '.join(step['markets'])}")
-    lines += ["", "Rien n'a été exécuté. Chaque étape suivante s'autorise séparément."]
+    lines += [
+        "",
+        f"Limite : {document['limite']}",
+        "",
+        "Rien n'a été exécuté. Chaque étape suivante s'autorise séparément et exige "
+        "le reçu signé de la précédente.",
+    ]
     _emit(document, lines, as_json=json_output)
 
 
 # ---------------------------------------------------------------------------
 # discover — free endpoints only
 # ---------------------------------------------------------------------------
+def run_discovery(
+    attempt: Attempt, settings: Settings, secret: str
+) -> tuple[dict[str, Any], ActivationStatus]:
+    """The two documented-free endpoints, and nothing else."""
+    client = _client(settings, secret, ledger=None)
+
+    attempt.record("/v4/sports")
+    catalogue = client.get("sports", params={"all": "false"}, cost=0, billable=False)
+    _settle_cost(attempt, catalogue.quota, "/v4/sports")
+
+    entries = catalogue.payload if isinstance(catalogue.payload, list) else []
+    descriptor = next(
+        (e for e in entries if isinstance(e, dict) and str(e.get("key")) == attempt.sport), None
+    )
+    if descriptor is None or not descriptor.get("active", True):
+        raise Refused(
+            ActivationStatus.COVERAGE_MISSING,
+            f"{attempt.sport} n'est pas retournée active par /v4/sports. L'étape s'arrête "
+            "ici : interroger une compétition hors saison coûterait un crédit pour rien.",
+        )
+
+    endpoint = f"/v4/sports/{attempt.sport}/events"
+    attempt.record(endpoint)
+    listing = client.get(
+        f"sports/{attempt.sport}/events",
+        params={
+            "dateFormat": "iso",
+            "commenceTimeFrom": _iso_z(attempt.window[0]),
+            "commenceTimeTo": _iso_z(attempt.window[1]),
+        },
+        cost=0,
+        billable=False,
+    )
+    _settle_cost(attempt, listing.quota, endpoint)
+
+    attempt.events = [
+        {
+            "id": str(item["id"]),
+            "commence_time": str(item.get("commence_time", "")),
+            "home_team": str(item.get("home_team", "")),
+            "away_team": str(item.get("away_team", "")),
+        }
+        for item in (listing.payload if isinstance(listing.payload, list) else [])
+        if isinstance(item, dict) and item.get("id") and _inside(item, attempt.window)
+    ]
+    attempt.event_tags = [event_tag(e["id"]) for e in attempt.events]
+    if not attempt.events:
+        raise Refused(
+            ActivationStatus.COVERAGE_MISSING,
+            f"Aucun événement à venir pour {attempt.sport} dans la fenêtre déclarée. "
+            "Elle n'est pas élargie automatiquement.",
+        )
+    return build_receipt(attempt, ActivationStatus.DISCOVERY_VERIFIED, secret), (
+        ActivationStatus.DISCOVERY_VERIFIED
+    )
+
+
 @app.command()
 def discover(
     sport: str = typer.Option(..., "--sport"),
@@ -576,6 +1155,7 @@ def discover(
 ) -> None:
     """Lister les événements sur les deux endpoints gratuits. 0 crédit."""
     secret = ""
+    attempt: Attempt | None = None
     try:
         one_sport = _single(sport, "--sport")
         one_book = _single(bookmaker, "--bookmaker")
@@ -583,178 +1163,141 @@ def discover(
         _require_network(allow_network)
         settings = get_settings()
         secret = _require_key(settings)
-        document = _discovery(settings, secret, one_sport, one_book, hours)
+
+        now = _clock()
+        attempt = Attempt(
+            command="discover",
+            sport=one_sport,
+            bookmaker=one_book,
+            window=(now, now + timedelta(hours=hours)),
+            ceiling=STEP_CEILINGS["discover"],
+            now=now,
+        )
+        document, status = run_discovery(attempt, settings, secret)
     except Refused as exc:
-        _fail(exc.status, exc.message, as_json=json_output, secret=secret)
+        _fail(
+            exc.status,
+            exc.message,
+            as_json=json_output,
+            secret=secret,
+            document=_record_failure(attempt, exc.status, secret),
+        )
         return
     except ProviderError as exc:
-        status = (
-            ActivationStatus.AUTH_FAILED
-            if isinstance(exc, TheOddsApiAuthError)
-            else ActivationStatus.PROVIDER_UNAVAILABLE
+        status = _status_of(exc)
+        if attempt is not None:
+            attempt.reached_provider = getattr(exc, "reached_provider", True)
+        _fail(
+            status,
+            str(exc),
+            as_json=json_output,
+            secret=secret,
+            document=_record_failure(attempt, status, secret),
         )
-        _fail(status, str(exc), as_json=json_output, secret=secret)
         return
 
+    write_receipt(document)
+    document["events"] = attempt.events
     lines = [
         f"Statut          : {document['status']}",
         f"Compétition     : {one_sport}",
-        f"Crédits         : {document['observed_credits']} (plafond 0)",
-        f"Événements      : {len(document['events'])}",
+        f"Crédits annoncés: {_none(document['observed_credits'])} (plafond 0)",
+        f"Événements      : {len(attempt.events)}",
         "",
     ]
-    for event in document["events"]:
+    for event in attempt.events:
         lines.append(
             f"  {event['id']}  {event['commence_time']}  "
             f"{event['home_team']} - {event['away_team']}"
         )
     lines += [
         "",
-        "Choisissez UN identifiant et relancez `core --event-id <id>` : "
-        "aucune sélection n'est faite pour vous.",
+        f"Reçu            : {document['_path']}",
+        "",
+        "Choisissez UN identifiant, puis relancez `core --event-id <id> "
+        "--discovery-receipt <ce reçu>`. Aucune sélection n'est faite pour vous.",
     ]
-    _emit(document, lines, as_json=json_output, secret=secret)
+    _finish(document, lines, as_json=json_output, secret=secret, ok=status in VERIFIED_STATUSES)
 
 
-def _discovery(
-    settings: Settings, secret: str, sport: str, bookmaker: str, window_hours: int
-) -> dict[str, Any]:
-    now = _clock()
-    window = (now, now + timedelta(hours=window_hours))
-    client = _client(settings, secret, ledger=None)
+def _record_failure(
+    attempt: Attempt | None, status: ActivationStatus, secret: str
+) -> dict[str, Any] | None:
+    """Write the audit trail for an attempt that reached the wire and then failed.
 
-    catalogue = client.get("sports", params={"all": "false"}, cost=0, billable=False)
-    spent = _check_observed_cost(catalogue.quota.last_cost, 0, "/v4/sports")
-    entries = catalogue.payload if isinstance(catalogue.payload, list) else []
-    descriptor = next(
-        (e for e in entries if isinstance(e, dict) and str(e.get("key")) == sport), None
-    )
-    if descriptor is None or not descriptor.get("active", True):
-        raise Refused(
-            ActivationStatus.COVERAGE_MISSING,
-            f"{sport} n'est pas retournée active par /v4/sports. L'étape s'arrête ici : "
-            "interroger une compétition hors saison coûterait un crédit pour rien.",
-        )
-
-    listing = client.get(
-        f"sports/{sport}/events",
-        params={
-            "dateFormat": "iso",
-            "commenceTimeFrom": _iso_z(window[0]),
-            "commenceTimeTo": _iso_z(window[1]),
-        },
-        cost=0,
-        billable=False,
-    )
-    spent += _check_observed_cost(listing.quota.last_cost, 0, f"/v4/sports/{sport}/events")
-
-    events = [
-        {
-            "id": str(item["id"]),
-            "commence_time": str(item.get("commence_time", "")),
-            "home_team": str(item.get("home_team", "")),
-            "away_team": str(item.get("away_team", "")),
-        }
-        for item in (listing.payload if isinstance(listing.payload, list) else [])
-        if isinstance(item, dict) and item.get("id") and _inside(item, window)
-    ]
-    if not events:
-        raise Refused(
-            ActivationStatus.COVERAGE_MISSING,
-            f"Aucun événement à venir pour {sport} dans les {window_hours} h déclarées. "
-            "La fenêtre n'est pas élargie automatiquement.",
-        )
-
-    return {
-        "status": str(ActivationStatus.DISCOVERY_VERIFIED),
-        "recorded_at": now.isoformat(),
-        "sport_key": sport,
-        "bookmaker": bookmaker,
-        "window_hours": window_hours,
-        "max_credits": STEP_CEILINGS["discover"],
-        "observed_credits": spent,
-        "events": events,
-    }
-
-
-def _inside(item: dict[str, Any], window: tuple[datetime, datetime]) -> bool:
-    raw = str(item.get("commence_time", ""))
-    try:
-        start = ensure_utc(datetime.fromisoformat(raw.replace("Z", "+00:00")))
-    except ValueError:
-        return False
-    return window[0] < start <= window[1]
+    Nothing is written when the network was never touched: a consumption record
+    for a call that never happened is a fabrication, the same error as losing the
+    record of one that did.
+    """
+    if attempt is None or not attempt.network_attempted:
+        return None
+    document = build_receipt(attempt, status, secret)
+    write_receipt(document)
+    return document
 
 
 # ---------------------------------------------------------------------------
 # core — one event, one bookmaker, one market, one credit
 # ---------------------------------------------------------------------------
 def run_core(
-    settings: Settings,
-    secret: str,
-    *,
-    sport: str,
-    bookmaker: str,
-    event_id: str,
-    window_hours: int,
-    ceiling: int,
-) -> dict[str, Any]:
-    """One grouped request, filtered to one event. At most one credit."""
-    now = _clock()
-    window = (now, now + timedelta(hours=window_hours))
+    attempt: Attempt, settings: Settings, secret: str, parent: dict[str, Any]
+) -> tuple[dict[str, Any], ActivationStatus]:
+    """One grouped request, filtered to one event. One credit at the published tariff."""
+    event_id = str(attempt.event_id)
     ledger = ProviderBudgetLedger(settings)
     client = _client(settings, secret, ledger=ledger)
 
-    units = effective_region_units(bookmakers=[bookmaker], regions=None)
-    cost = estimate_cost(markets=len(CORE_MARKETS), region_units=units)
-    if cost > ceiling:
+    units = effective_region_units(bookmakers=[attempt.bookmaker], regions=None)
+    attempt.estimated = estimate_cost(markets=len(CORE_MARKETS), region_units=units)
+    attempt.markets_requested = list(CORE_MARKETS)
+    attempt.parent_receipt_id = str(parent["receipt_id"])
+    if attempt.estimated > attempt.ceiling:
         raise Refused(
             ActivationStatus.COST_MISMATCH,
-            f"L'estimation ({cost}) dépasse le plafond ({ceiling}) — appel non tenté.",
+            f"L'estimation ({attempt.estimated}) dépasse le plafond ({attempt.ceiling}) "
+            "— appel non tenté.",
         )
 
-    endpoint = f"/v4/sports/{sport}/odds"
+    endpoint = f"/v4/sports/{attempt.sport}/odds"
+    attempt.record(endpoint)
     response = client.get(
-        f"sports/{sport}/odds",
+        f"sports/{attempt.sport}/odds",
         params={
             "eventIds": event_id,
             "markets": ",".join(CORE_MARKETS),
-            "bookmakers": bookmaker,
+            "bookmakers": attempt.bookmaker,
             "oddsFormat": "decimal",
             "dateFormat": "iso",
         },
-        cost=cost,
+        cost=attempt.estimated,
     )
-    observed = _check_observed_cost(response.quota.last_cost, ceiling, endpoint)
+    _settle_cost(attempt, response.quota, endpoint)
 
     raw_event = _event_of(response.payload, event_id, endpoint)
-    _check_start_time(raw_event, window)
-    book = _book_of(raw_event, bookmaker, endpoint)
+    _check_start_time(raw_event, attempt.window)
+    book = _book_of(raw_event, attempt.bookmaker, endpoint)
 
     batch = _parse_with_the_real_parser(
-        settings, client, raw_event, window=window, now=now, shape=ResponseShape.GROUPED_ODDS
+        settings,
+        client,
+        raw_event,
+        window=attempt.window,
+        now=attempt.now,
+        shape=ResponseShape.GROUPED_ODDS,
     )
+    attempt.freshness = _freshness(book, ResponseShape.GROUPED_ODDS, attempt.now)
+    attempt.market_states = _classify_markets(CORE_MARKETS, book, batch)
+    attempt.selections_mapped = len(batch.snapshots)
+    attempt.rejections = [_generalise(e) for e in batch.partial_errors]
+
     if not batch.snapshots:
         raise Refused(
             ActivationStatus.SCHEMA_MISMATCH,
             "Le bookmaker est présent mais le parseur n'a retenu aucune sélection : "
-            f"{'; '.join(batch.partial_errors) or 'aucun détail'}.",
+            f"{'; '.join(attempt.rejections) or 'aucun détail'}.",
         )
-
-    return _receipt(
-        command="core",
-        status=ActivationStatus.CORE_LIVE_VERIFIED,
-        now=now,
-        sport=sport,
-        bookmaker=bookmaker,
-        event_id=event_id,
-        ceiling=ceiling,
-        observed=observed,
-        requested=list(CORE_MARKETS),
-        book=book,
-        shape=ResponseShape.GROUPED_ODDS,
-        batch=batch,
-        endpoint=endpoint,
+    return build_receipt(attempt, ActivationStatus.CORE_LIVE_VERIFIED, secret), (
+        ActivationStatus.CORE_LIVE_VERIFIED
     )
 
 
@@ -763,14 +1306,18 @@ def core(
     sport: str = typer.Option(..., "--sport"),
     bookmaker: str = typer.Option(..., "--bookmaker"),
     event_id: str = typer.Option(..., "--event-id"),
+    discovery_receipt: str = typer.Option(
+        ..., "--discovery-receipt", help="Chemin du reçu émis par `discover`."
+    ),
     max_credits: int = typer.Option(..., "--max-credits"),
     acknowledge_credits: int = typer.Option(None, "--acknowledge-credits"),
     window_hours: int = typer.Option(24, "--window-hours"),
     allow_network: bool = typer.Option(False, "--allow-network"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Un seul événement, un seul marché, un seul bookmaker. 1 crédit au plus."""
+    """Un seul événement, un seul marché, un seul bookmaker. 1 crédit au tarif publié."""
     secret = ""
+    attempt: Attempt | None = None
     try:
         one_sport = _single(sport, "--sport")
         one_book = _single(bookmaker, "--bookmaker")
@@ -780,106 +1327,179 @@ def core(
         _require_network(allow_network)
         settings = get_settings()
         secret = _require_key(settings)
-        document = run_core(
-            settings,
-            secret,
+
+        now = _clock()
+        parent = load_parent(
+            discovery_receipt,
+            command="discover",
+            status=ActivationStatus.DISCOVERY_VERIFIED,
             sport=one_sport,
             bookmaker=one_book,
-            event_id=one_event,
-            window_hours=hours,
-            ceiling=ceiling,
+            now=now,
         )
+        _check_discovery(parent, one_event, discovery_receipt)
+
+        attempt = Attempt(
+            command="core",
+            sport=one_sport,
+            bookmaker=one_book,
+            window=(now, now + timedelta(hours=hours)),
+            ceiling=ceiling,
+            now=now,
+            event_id=one_event,
+            event_tags=[event_tag(one_event)],
+        )
+        document, status = run_core(attempt, settings, secret, parent)
     except Refused as exc:
-        _fail(exc.status, exc.message, as_json=json_output, secret=secret)
+        _fail(
+            exc.status,
+            exc.message,
+            as_json=json_output,
+            secret=secret,
+            document=_record_failure(attempt, exc.status, secret),
+        )
         return
     except ProviderError as exc:
-        status = (
-            ActivationStatus.AUTH_FAILED
-            if isinstance(exc, TheOddsApiAuthError)
-            else ActivationStatus.PROVIDER_UNAVAILABLE
+        status = _status_of(exc)
+        if attempt is not None:
+            attempt.reached_provider = getattr(exc, "reached_provider", True)
+        _fail(
+            status,
+            str(exc),
+            as_json=json_output,
+            secret=secret,
+            document=_record_failure(attempt, status, secret),
         )
-        _fail(status, str(exc), as_json=json_output, secret=secret)
         return
 
-    write_receipt(document, secret=secret)
-    _emit(document, _summary(document), as_json=json_output, secret=secret)
+    write_receipt(document)
+    _finish(
+        document,
+        [
+            *_summary(document),
+            "",
+            "Étape suivante possible : `additional --core-receipt "
+            f"{document['_path']}` (5 crédits, autorisation distincte).",
+        ],
+        as_json=json_output,
+        secret=secret,
+        ok=status in VERIFIED_STATUSES,
+    )
+
+
+def _check_discovery(parent: dict[str, Any], event_id: str, label: str) -> None:
+    """The discovery must actually have approved *this* event, at nil cost."""
+    tags = parent.get("event_tags")
+    if not isinstance(tags, list) or event_tag(event_id) not in tags:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{label} n'a pas retenu cet événement. `core` ne facture que ce qu'une "
+            "découverte approuvée a listé ; relancez `discover` si la fenêtre a bougé.",
+        )
+    if parent.get("observed_credits") != 0:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{label} n'atteste pas un coût observé nul "
+            f"({parent.get('observed_credits')!r}). Une découverte dont le coût n'a pas "
+            "été prouvé n'autorise aucune dépense.",
+        )
+    remaining = parent.get("quota_remaining")
+    if isinstance(remaining, int) and remaining < STEP_CEILINGS["core"]:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{label} indique {remaining} crédit(s) restant(s), insuffisant pour "
+            f"les {STEP_CEILINGS['core']} du présent appel.",
+        )
 
 
 # ---------------------------------------------------------------------------
 # additional — same event, five markets, five credits
 # ---------------------------------------------------------------------------
 def run_additional(
-    settings: Settings,
-    secret: str,
-    *,
-    sport: str,
-    bookmaker: str,
-    event_id: str,
-    window_hours: int,
-    ceiling: int,
-) -> dict[str, Any]:
-    """The per-event markets, for an event a previous step already verified."""
-    digest = hash_event_id(event_id)
-    verified = [
-        receipt
-        for receipt in read_receipts()
-        if receipt.get("status") == str(ActivationStatus.CORE_LIVE_VERIFIED)
-        and receipt.get("event_id_hash") == digest
-    ]
-    if not verified:
-        raise Refused(
-            ActivationStatus.PREPARED_NOT_EXECUTED,
-            "Aucun reçu CORE_LIVE_VERIFIED pour cet événement. Cinq crédits ne sont "
-            "engagés qu'après qu'un seul a démontré l'endpoint, l'auth et le parseur.",
-        )
-
-    now = _clock()
-    window = (now, now + timedelta(hours=window_hours))
+    attempt: Attempt, settings: Settings, secret: str, parent: dict[str, Any]
+) -> tuple[dict[str, Any], ActivationStatus]:
+    """The per-event markets, classified one by one."""
+    event_id = str(attempt.event_id)
     ledger = ProviderBudgetLedger(settings)
     client = _client(settings, secret, ledger=ledger)
 
-    units = effective_region_units(bookmakers=[bookmaker], regions=None)
-    cost = estimate_cost(markets=len(ADDITIONAL_MARKETS), region_units=units)
-    if cost > ceiling:
+    units = effective_region_units(bookmakers=[attempt.bookmaker], regions=None)
+    attempt.estimated = estimate_cost(markets=len(ADDITIONAL_MARKETS), region_units=units)
+    attempt.markets_requested = list(ADDITIONAL_MARKETS)
+    attempt.parent_receipt_id = str(parent["receipt_id"])
+    if attempt.estimated > attempt.ceiling:
         raise Refused(
             ActivationStatus.COST_MISMATCH,
-            f"L'estimation ({cost}) dépasse le plafond ({ceiling}) — appel non tenté.",
+            f"L'estimation ({attempt.estimated}) dépasse le plafond ({attempt.ceiling}) "
+            "— appel non tenté.",
         )
 
-    endpoint = f"/v4/sports/{sport}/events/<event>/odds"
+    endpoint = f"/v4/sports/{attempt.sport}/events/<event>/odds"
+    attempt.record(endpoint)
     response = client.get(
-        f"sports/{sport}/events/{event_id}/odds",
+        f"sports/{attempt.sport}/events/{event_id}/odds",
         params={
             "markets": ",".join(ADDITIONAL_MARKETS),
-            "bookmakers": bookmaker,
+            "bookmakers": attempt.bookmaker,
             "oddsFormat": "decimal",
             "dateFormat": "iso",
         },
-        cost=cost,
+        cost=attempt.estimated,
     )
-    observed = _check_observed_cost(response.quota.last_cost, ceiling, endpoint)
+    _settle_cost(attempt, response.quota, endpoint)
 
     raw_event = _event_of(response.payload, event_id, endpoint)
-    _check_start_time(raw_event, window)
-    book = _book_of(raw_event, bookmaker, endpoint)
+    _check_start_time(raw_event, attempt.window)
+    book = _book_of(raw_event, attempt.bookmaker, endpoint)
 
     batch = _parse_with_the_real_parser(
-        settings, client, raw_event, window=window, now=now, shape=ResponseShape.EVENT_ODDS
-    )
-    return _receipt(
-        command="additional",
-        status=ActivationStatus.ADDITIONAL_LIVE_VERIFIED,
-        now=now,
-        sport=sport,
-        bookmaker=bookmaker,
-        event_id=event_id,
-        ceiling=ceiling,
-        observed=observed,
-        requested=list(ADDITIONAL_MARKETS),
-        book=book,
+        settings,
+        client,
+        raw_event,
+        window=attempt.window,
+        now=attempt.now,
         shape=ResponseShape.EVENT_ODDS,
-        batch=batch,
-        endpoint=endpoint,
+    )
+    attempt.freshness = _freshness(book, ResponseShape.EVENT_ODDS, attempt.now)
+    attempt.market_states = _classify_markets(ADDITIONAL_MARKETS, book, batch)
+    attempt.selections_mapped = len(batch.snapshots)
+    attempt.rejections = [_generalise(e) for e in batch.partial_errors]
+
+    status = _additional_status(attempt.market_states)
+    document = build_receipt(attempt, status, secret)
+    if status not in VERIFIED_STATUSES:
+        raise Refused(status, _additional_reason(status), document)
+    return document, status
+
+
+def _additional_status(states: dict[str, str]) -> ActivationStatus:
+    """Absence, rejection and success are three answers, not one.
+
+    Nothing returned is a coverage fact about the bookmaker. Everything returned
+    and nothing usable is a fact about the contract or our parser. Some of each is
+    genuinely partial, and saying so is more useful than rounding it to either
+    end.
+    """
+    values = list(states.values())
+    if all(state == MarketState.NOT_RETURNED for state in values):
+        return ActivationStatus.COVERAGE_MISSING
+    if not any(state == MarketState.OBSERVED_MAPPED for state in values):
+        return ActivationStatus.SCHEMA_MISMATCH
+    if all(state == MarketState.OBSERVED_MAPPED for state in values):
+        return ActivationStatus.ADDITIONAL_LIVE_VERIFIED
+    return ActivationStatus.ADDITIONAL_PARTIAL_COVERAGE
+
+
+def _additional_reason(status: ActivationStatus) -> str:
+    if status is ActivationStatus.COVERAGE_MISSING:
+        return (
+            "Le bookmaker est coté sur cet événement mais aucun des marchés demandés "
+            "n'est revenu. Rien n'est compensé, rien n'est réessayé, aucun autre "
+            "bookmaker n'est substitué."
+        )
+    return (
+        "Des marchés sont revenus mais aucun n'a produit de sélection cartographiée : "
+        "horodatage au niveau marché absent, ou structure inattendue."
     )
 
 
@@ -888,14 +1508,16 @@ def additional(
     sport: str = typer.Option(..., "--sport"),
     bookmaker: str = typer.Option(..., "--bookmaker"),
     event_id: str = typer.Option(..., "--event-id"),
+    core_receipt: str = typer.Option(..., "--core-receipt", help="Chemin du reçu émis par `core`."),
     max_credits: int = typer.Option(..., "--max-credits"),
     acknowledge_credits: int = typer.Option(None, "--acknowledge-credits"),
     window_hours: int = typer.Option(24, "--window-hours"),
     allow_network: bool = typer.Option(False, "--allow-network"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Les cinq marchés par événement, sur l'événement déjà vérifié. 5 crédits au plus."""
+    """Les cinq marchés par événement, sur l'événement déjà prouvé. 5 crédits au plus."""
     secret = ""
+    attempt: Attempt | None = None
     try:
         one_sport = _single(sport, "--sport")
         one_book = _single(bookmaker, "--bookmaker")
@@ -905,107 +1527,90 @@ def additional(
         _require_network(allow_network)
         settings = get_settings()
         secret = _require_key(settings)
-        document = run_additional(
-            settings,
-            secret,
+
+        now = _clock()
+        parent = load_parent(
+            core_receipt,
+            command="core",
+            status=ActivationStatus.CORE_LIVE_VERIFIED,
             sport=one_sport,
             bookmaker=one_book,
-            event_id=one_event,
-            window_hours=hours,
-            ceiling=ceiling,
+            now=now,
         )
+        _check_core(parent, one_event, core_receipt)
+
+        attempt = Attempt(
+            command="additional",
+            sport=one_sport,
+            bookmaker=one_book,
+            window=(now, now + timedelta(hours=hours)),
+            ceiling=ceiling,
+            now=now,
+            event_id=one_event,
+            event_tags=[event_tag(one_event)],
+        )
+        document, status = run_additional(attempt, settings, secret, parent)
     except Refused as exc:
-        _fail(exc.status, exc.message, as_json=json_output, secret=secret)
+        recorded = (
+            exc.document
+            if exc.document is not None
+            else _record_failure(attempt, exc.status, secret)
+        )
+        if exc.document is not None:
+            write_receipt(exc.document)
+        _fail(exc.status, exc.message, as_json=json_output, secret=secret, document=recorded)
         return
     except ProviderError as exc:
-        status = (
-            ActivationStatus.AUTH_FAILED
-            if isinstance(exc, TheOddsApiAuthError)
-            else ActivationStatus.PROVIDER_UNAVAILABLE
+        status = _status_of(exc)
+        if attempt is not None:
+            attempt.reached_provider = getattr(exc, "reached_provider", True)
+        _fail(
+            status,
+            str(exc),
+            as_json=json_output,
+            secret=secret,
+            document=_record_failure(attempt, status, secret),
         )
-        _fail(status, str(exc), as_json=json_output, secret=secret)
         return
 
-    write_receipt(document, secret=secret)
-    _emit(document, _summary(document), as_json=json_output, secret=secret)
+    write_receipt(document)
+    _finish(document, _summary(document), as_json=json_output, secret=secret, ok=True)
 
 
-# ---------------------------------------------------------------------------
-# Receipt assembly and human summary
-# ---------------------------------------------------------------------------
-def _receipt(
-    *,
-    command: str,
-    status: ActivationStatus,
-    now: datetime,
-    sport: str,
-    bookmaker: str,
-    event_id: str,
-    ceiling: int,
-    observed: int,
-    requested: list[str],
-    book: dict[str, Any],
-    shape: ResponseShape,
-    batch: CollectionBatch,
-    endpoint: str,
-) -> dict[str, Any]:
-    """Everything worth auditing, and nothing that would be worth exfiltrating.
-
-    Deliberately absent: the key, the full URL, the raw body, every quoted odd,
-    both participant names, and the provider's event id in clear. What remains is
-    which endpoint was called, what it cost, which markets came back, how fresh
-    they were and whether our parser coped — which is the whole question an
-    activation is meant to answer.
-    """
-    observed_markets = _market_keys(book)
-    return {
-        "schema": RECEIPT_SCHEMA,
-        "command": command,
-        "status": str(status),
-        "recorded_at": now.isoformat(),
-        "endpoint": endpoint,
-        "response_shape": str(shape),
-        "sport_key": sport,
-        "bookmaker": bookmaker,
-        "event_id_hash": hash_event_id(event_id),
-        "max_credits": ceiling,
-        "observed_credits": observed,
-        "markets_requested": requested,
-        "markets_observed": observed_markets,
-        "markets_absent": [m for m in requested if m not in observed_markets],
-        "freshness": _freshness(book, shape, now),
-        "selections_mapped": len(batch.snapshots),
-        "mapping_rejections": [_generalise(error) for error in batch.partial_errors],
-        "model_impact": "aucun — tous les modèles restent BACKTEST_ONLY",
-    }
-
-
-def _generalise(error: str) -> str:
-    """Keep the reason, drop anything that could be a name or a quoted value."""
-    return error.split(":")[0].strip()[:80]
-
-
-def _summary(document: dict[str, Any]) -> list[str]:
-    absent = document["markets_absent"]
-    lines = [
-        f"Statut          : {document['status']}",
-        f"Endpoint        : {document['endpoint']}",
-        f"Crédits         : {document['observed_credits']} annoncé(s), "
-        f"plafond {document['max_credits']}",
-        f"Marchés demandés: {', '.join(document['markets_requested'])}",
-        f"Marchés obtenus : {', '.join(document['markets_observed']) or 'aucun'}",
-    ]
-    if absent:
-        lines.append(
-            f"Marchés absents : {', '.join(absent)} — constat, non compensé et non réessayé."
+def _check_core(parent: dict[str, Any], event_id: str, label: str) -> None:
+    """Five credits are committed only on a proof that one already worked."""
+    if parent.get("event_tag") != event_tag(event_id):
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{label} porte sur un autre événement. Une preuve ne se transpose pas d'une "
+            "rencontre à une autre.",
         )
-    lines += [
-        f"Sélections      : {document['selections_mapped']} cartographiée(s)",
-        f"Fraîcheur (s)   : {document['freshness'] or 'aucune'}",
-        "",
-        "Reçu local écrit (non versionné). Aucun modèle promu, aucun candidat publié.",
-    ]
-    return lines
+    if not parent.get("parent_receipt_id"):
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{label} ne référence aucune découverte. La chaîne doit être complète : "
+            "`discover` puis `core` puis `additional`.",
+        )
+    if not isinstance(parent.get("selections_mapped"), int) or parent["selections_mapped"] < 1:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{label} n'atteste aucune sélection h2h cartographiée. Rien ne prouve que le "
+            "parseur lira la réponse par événement.",
+        )
+    observed = parent.get("observed_credits")
+    accounted = parent.get("accounted_credits")
+    if not isinstance(observed, int) or observed > STEP_CEILINGS["core"]:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{label} n'atteste pas un coût observé compatible avec le plafond de "
+            f"{STEP_CEILINGS['core']} crédit ({observed!r}).",
+        )
+    if not isinstance(accounted, int) or accounted > STEP_CEILINGS["core"]:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{label} comptabilise {accounted!r} crédit(s), au-delà du plafond de "
+            f"{STEP_CEILINGS['core']}.",
+        )
 
 
 def _iso_z(moment: datetime) -> str:

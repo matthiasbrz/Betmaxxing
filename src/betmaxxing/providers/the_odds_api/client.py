@@ -289,19 +289,25 @@ class TheOddsApiClient:
                 # *write* timeout may have. Only the former is free.
                 self._settle_failure(reservation, exc, cost)
                 if attempt > self._max_retries:
-                    raise TheOddsApiError(
+                    error = TheOddsApiError(
                         f"timeout ({type(exc).__name__}) après {attempt} tentative(s) "
                         f"sur {redact(url)}"
-                    ) from None
+                    )
+                    # The caller cannot recover this from the message, and it
+                    # decides whether the attempt stays charged.
+                    error.reached_provider = may_have_been_billed(exc)
+                    raise error from None
                 self._backoff(attempt, None)
                 continue
             except httpx.TransportError as exc:
                 # The message may contain the URL, so it is redacted.
                 self._settle_failure(reservation, exc, cost)
                 if attempt > self._max_retries:
-                    raise TheOddsApiError(
+                    error = TheOddsApiError(
                         f"erreur de transport sur {redact(url)}: {redact(str(exc))}"
-                    ) from None
+                    )
+                    error.reached_provider = may_have_been_billed(exc)
+                    raise error from None
                 self._backoff(attempt, None)
                 continue
 

@@ -705,3 +705,109 @@ command, including those unrelated to that revision.
 **Limite.** If the domain deliberately changes a rule, the equivalence test fails
 and the divergence must be decided explicitly: write a corrective revision, or
 leave history as it was. That is the point, not a defect.
+
+---
+
+## Instruction 03A bis — closing the last gate before any provider call
+
+Still nothing calls The Odds API. This tranche closes six gaps that would have
+made the first real call unauditable. Statuses unchanged throughout.
+
+### D-054 — An unknown cost is `null`, never zero
+
+**Décision.** Three fields, never conflated: `estimated_credits` (the pre-call
+bound), `observed_credits` (`x-requests-last`, or `null` when the header is
+absent, non-integer or negative), `accounted_credits` (the observation when there
+is one, the estimate otherwise). A step whose cost could not be read reports
+`COST_UNVERIFIED` and authorises nothing.
+**Raison.** `_check_observed_cost(None, …)` returned `0`. The client already did
+the right thing — it charges the estimate when the header is missing, because
+under-counting is the direction a budget must never err in (D-041) — so the
+receipt contradicted the ledger by reporting nought. Worse, a documented-free
+endpoint that answered without the header was accepted as *proof* of costing
+nothing, which is precisely the evidence `core` was about to rely on.
+**Coût.** One integer becomes three, in the receipt and in the output.
+**Limite.** `accounted_credits` is a conservative guess whenever the provider
+declines to say. It can over-count; it will not under-count.
+
+### D-055 — Receipts are signed, tagged and chained by argument
+
+**Décision.** Schema v2. A local HMAC secret is created on first network need
+(`O_CREAT | O_EXCL`, `0600`, in the gitignored receipt directory, never printed).
+Event ids travel as HMAC tags, not bare digests. Every receipt is signed over its
+canonical JSON and verified with `hmac.compare_digest` before it is trusted.
+`core` requires `--discovery-receipt`, `additional` requires `--core-receipt`.
+**Raison.** Three failures compounded. `discover` wrote nothing, so the proof
+`core` should have demanded did not exist and any well-formed `--event-id` was
+accepted. `additional` scanned the directory for a file whose status and event
+hash matched — choosing the operator's evidence for them, from an unauthenticated
+file, in a directory anything can write to, without checking the command, the
+schema, the sport, the bookmaker or the age. And the event hash was an unsalted
+SHA of a public fixture id, computable by anyone with the provider's own event
+list, so it hid nothing and a stray edit silently promoted a failed step.
+**Coût.** Two more mandatory arguments, and a local secret worth backing up if
+old receipts must stay verifiable across a reinstall.
+**Limite.** The secret protects against a dictionary of public ids and against
+accidental or casual edits on this machine. It is not a defence against someone
+who already has read access to the receipt directory.
+
+### D-056 — Every network attempt leaves a receipt; no local refusal does
+
+**Décision.** Once a request has been attempted, a sanitised receipt is written
+whatever the terminal status — including `COVERAGE_MISSING`, `SCHEMA_MISMATCH`,
+`COST_MISMATCH`, `COST_UNVERIFIED`, `AUTH_FAILED`, `PROVIDER_UNAVAILABLE` and a
+possibly-billed timeout. It records `network_attempted`, the exact number of
+attempts, whether the request may have reached the provider, and the three costs.
+A refusal *before* the network writes nothing and reserves nothing.
+**Raison.** Receipts were written only after the run function returned. A response
+that arrived, was charged, and then failed validation left no trace at all — the
+credit was spent and the audit trail was silent, which is the inverse of what an
+audit trail is for. Inventing a consumption record for a call that never happened
+would be the same error pointing the other way.
+**Coût.** `ProviderError` gained a `reached_provider` flag so the harness can
+distinguish "never left" from "may have been served" without re-deriving it from
+a message.
+**Limite.** `may_have_reached_provider` is evidence, not certainty. A read timeout
+records `true` and keeps its estimate charged; the provider may in fact have
+served nothing.
+
+### D-057 — A market has three states, and absence is not success
+
+**Décision.** Each of the five requested markets gets `OBSERVED_MAPPED`,
+`OBSERVED_REJECTED` or `NOT_RETURNED`. None returned → `COVERAGE_MISSING`;
+returned but none mapped → `SCHEMA_MISMATCH`; some mapped → the explicit
+`ADDITIONAL_PARTIAL_COVERAGE`; all five → `ADDITIONAL_LIVE_VERIFIED`.
+**Raison.** `run_additional()` built an `ADDITIONAL_LIVE_VERIFIED` receipt as soon
+as the bookmaker appeared, without requiring a single requested market, let alone
+a mapped selection. A response containing the bookmaker and none of the markets
+proves neither coverage nor market-level timestamp parsing.
+**Coût.** Four terminal statuses where there was one.
+**Limite.** `OBSERVED_REJECTED` conflates "the provider sent something we cannot
+read" with "the market-level timestamp was missing". The receipt's
+`mapping_rejections` distinguishes them; the state does not.
+
+### D-058 — "Hard ceiling" was too strong a word
+
+**Décision.** Four terms, kept apart in the code, the receipt and the docs: local
+technical bound (requests, endpoints, events, bookmakers, markets — enforced
+here), estimated contractual ceiling (0/0/1/5 under the published rule), observed
+cost, accounted cost.
+**Raison.** A local program cannot bind an external company's invoice. It bounds
+what it does, and computes what that *should* cost under a tariff it re-read on a
+given date. If the provider reprices a request it has already served, the harness
+can notice it in the headers and stop — nothing more. An overstated guarantee is
+the kind that gets relied on.
+**Coût.** More words in every table.
+**Limite.** This is the honest statement of the limit, not a fix for it.
+
+### D-059 — A green activation is a limited proof, not a promotion
+
+**Décision.** The runbook no longer tells the operator to set the adapter to
+`VERIFIED`. A successful run attests six things — endpoint, bookmaker,
+competition, event, market, instant — and the receipt records exactly those. The
+adapter stays `IMPLEMENTED_UNVERIFIED` until a separate decision against written
+criteria (events, competitions, days, observed coverage rate).
+**Raison.** One event at one instant is not a property of an adapter. Promoting on
+it would make the status mean "it worked once", which is not what a status is for.
+**Coût.** The promotion criteria still have to be written; the roadmap says so.
+**Limite.** Until they are, there is no path to `VERIFIED` at all — deliberately.

@@ -1,123 +1,111 @@
 """The activation harness: what each command may spend, and what it may touch.
 
-The previous script had one boolean of consent and then called
+The script this replaced had one boolean of consent and then called
 ``provider.collect([FOOTBALL, TENNIS], window)`` — a fan-out across every
 configured sport key, followed by a per-event call for every football event it
 found, bounded only by the *scan* budget. "I consent" is not a spending limit;
 it is a mood. With a real key that script could quietly cost tens of credits,
 and nobody could have said in advance how many.
 
-The replacement is four commands with hard, separately-authorised ceilings:
+The replacement is four commands, separately authorised, each bounded twice: by
+what the program will actually do, and by what the published contract says that
+should cost.
 
-===========  ========  =========  =====================================
-command      network   credits    endpoints
-===========  ========  =========  =====================================
-plan         no        0          none — it does not even build a client
-discover     yes       0          /v4/sports, /v4/sports/{sport}/events
-core         yes       1          /v4/sports/{sport}/odds?eventIds=…
-additional   yes       5          /v4/sports/{sport}/events/{id}/odds
-===========  ========  =========  =====================================
+===========  ========  ===========================  ==========================
+command      network   local bound                  estimated contractual cost
+===========  ========  ===========================  ==========================
+plan         no        no client is even built      0
+discover     yes       2 requests, free endpoints   0
+core         yes       1 request, 1 event, 1 market 1
+additional   yes       1 request, 1 event, 5 markets 5
+===========  ========  ===========================  ==========================
 
-Every test here runs against a fake transport or no transport at all. The suite
-also installs a global socket guard (see ``tests/conftest.py``), so a command
-that tried to reach a provider would raise rather than connect.
+This file covers the mechanics: consent, scope, endpoints, requests and leaks.
+Its siblings cover the cost model (``test_activation_cost_model.py``), the signed
+receipt chain (``test_activation_receipts.py``) and the terminal outcomes
+(``test_activation_outcomes.py``).
+
+Every payload here comes from an ``httpx.MockTransport``. The suite also installs
+a session-wide socket guard (``tests/conftest.py``), so a command that tried to
+reach a provider would raise rather than connect.
 """
 
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
-from typer.testing import CliRunner
 
-NOW = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
-#: Deliberately recognisable, and deliberately not a real key shape in use.
-FAKE_KEY = "FAKEKEY0000deadbeef0000FAKEKEY00"
-SPORT = "soccer_france_ligue_one"
-BOOKMAKER = "winamax_fr"
-EVENT_ID = "evt-fixture-0001"
+from helpers_activation import (
+    BOOKMAKER,
+    EVENT_ID,
+    FAKE_KEY,
+    NOW,
+    OTHER_EVENT_ID,
+    SPORT,
+    Recorder,
+    additional_args,
+    cli,
+    core_args,
+    discover_args,
+    event_odds_payload,
+    events_payload,
+    install,
+    iso_z,
+    odds_payload,
+    receipt_path,
+    receipts_in,
+    run,
+    runner,
+    sports_payload,
+)
 
-runner = CliRunner()
-
-
-def cli() -> Any:
-    """Call-time import: the harness is introduced by this tranche."""
-    from betmaxxing.providers.the_odds_api.activation import app
-
-    return app
-
-
-@pytest.fixture
-def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, db_settings: Any) -> Path:
-    """A throwaway receipt directory and a database, with no key configured."""
-    monkeypatch.setenv("BETMAXXING_MODE", "paper")
-    monkeypatch.setenv("BETMAXXING_DATABASE_URL", db_settings.database_url)
-    monkeypatch.setenv("BETMAXXING_NOTIFICATIONS_ENABLED", "false")
-    monkeypatch.setenv("BETMAXXING_ACTIVATION_RECEIPTS", str(tmp_path / "receipts"))
-    monkeypatch.delenv("BETMAXXING_THE_ODDS_API_KEY", raising=False)
-    monkeypatch.delenv("BETMAXXING_ODDS_API_KEY", raising=False)
-    from betmaxxing.config import reset_settings_cache
-
-    reset_settings_cache()
-    return tmp_path / "receipts"
+FREE_HEADERS = {"x-requests-last": "0", "x-requests-remaining": "487", "x-requests-used": "13"}
+PAID_HEADERS = {"x-requests-last": "1", "x-requests-remaining": "486", "x-requests-used": "14"}
 
 
-@pytest.fixture
-def keyed(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    monkeypatch.setenv("BETMAXXING_THE_ODDS_API_KEY", FAKE_KEY)
-    from betmaxxing.config import reset_settings_cache
-
-    reset_settings_cache()
-    return workspace
-
-
-class Recorder:
-    """Fake transport recording every request the harness attempts."""
-
-    def __init__(self, routes: dict[str, Any] | None = None) -> None:
-        self.routes = routes or {}
-        self.requests: list[httpx.Request] = []
-
-    def handler(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
-        path = urlparse(str(request.url)).path
-        for suffix, reply in self.routes.items():
-            if path.endswith(suffix) or suffix in path:
-                if callable(reply):
-                    return reply(request)
-                return httpx.Response(200, json=reply, headers={"x-requests-last": "0"})
-        return httpx.Response(200, json=[], headers={"x-requests-last": "0"})
-
-    @property
-    def paths(self) -> list[str]:
-        return [urlparse(str(r.url)).path for r in self.requests]
-
-    def query(self, index: int) -> dict[str, list[str]]:
-        return parse_qs(urlparse(str(self.requests[index].url)).query)
+def free_routes(**kwargs: Any) -> dict[str, Any]:
+    return {
+        "/sports/": lambda _r: httpx.Response(
+            200, json=events_payload(**kwargs), headers=FREE_HEADERS
+        ),
+        "/sports": lambda _r: httpx.Response(200, json=sports_payload(), headers=FREE_HEADERS),
+    }
 
 
-def install(monkeypatch: pytest.MonkeyPatch, recorder: Recorder) -> None:
-    """Inject the fake transport into the harness's client factory."""
-    from betmaxxing.providers.the_odds_api import activation
+def approved(monkeypatch: pytest.MonkeyPatch, receipts: Path) -> str:
+    """Run a clean discovery and return the path of its receipt."""
+    install(monkeypatch, Recorder(free_routes()))
+    result = run(*discover_args())
+    assert result.exit_code == 0, result.stdout
+    return str(receipt_path(receipts, "discover"))
 
-    monkeypatch.setattr(activation, "_TRANSPORT_FOR_TESTS", httpx.MockTransport(recorder.handler))
 
-
-def run(*args: str) -> Any:
-    return runner.invoke(cli(), list(args))
+def verified_core(monkeypatch: pytest.MonkeyPatch, receipts: Path) -> str:
+    """Run discover then core cleanly, and return the core receipt's path."""
+    discovery = approved(monkeypatch, receipts)
+    install(
+        monkeypatch,
+        Recorder(
+            {"/odds": lambda _r: httpx.Response(200, json=odds_payload(), headers=PAID_HEADERS)}
+        ),
+    )
+    result = run(*core_args(discovery_receipt=discovery))
+    assert result.exit_code == 0, result.stdout
+    return str(receipt_path(receipts, "core"))
 
 
 # ---------------------------------------------------------------------------
 # plan — no key, no client, no network, no credit
 # ---------------------------------------------------------------------------
 class TestPlan:
+    ARGS = ("plan", "--sport", SPORT, "--bookmaker", BOOKMAKER, "--max-credits", "6")
+
     def test_it_runs_without_a_key(self, workspace: Path) -> None:
-        result = run("plan", "--sport", SPORT, "--bookmaker", BOOKMAKER, "--max-credits", "6")
+        result = run(*self.ARGS)
         assert result.exit_code == 0, result.stdout
 
     def test_it_never_reads_the_key(self, keyed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -134,7 +122,7 @@ class TestPlan:
         monkeypatch.setattr(
             config.Settings, "resolved_the_odds_api_key", property(spy), raising=False
         )
-        result = run("plan", "--sport", SPORT, "--bookmaker", BOOKMAKER, "--max-credits", "6")
+        result = run(*self.ARGS)
         assert result.exit_code == 0, result.stdout
         assert reads == [], "plan read the API key"
 
@@ -147,24 +135,20 @@ class TestPlan:
             original(self, *args, **kwargs)
 
         monkeypatch.setattr(httpx.Client, "__init__", spy)
-        run("plan", "--sport", SPORT, "--bookmaker", BOOKMAKER, "--max-credits", "6")
+        run(*self.ARGS)
         assert built == [], "plan constructed an HTTP client"
 
     def test_it_makes_no_request(self, keyed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         recorder = Recorder()
         install(monkeypatch, recorder)
-        run("plan", "--sport", SPORT, "--bookmaker", BOOKMAKER, "--max-credits", "6")
+        run(*self.ARGS)
         assert recorder.requests == []
 
     def test_it_reports_prepared_not_executed(self, workspace: Path) -> None:
-        result = run("plan", "--sport", SPORT, "--bookmaker", BOOKMAKER, "--max-credits", "6")
-        assert "PREPARED_NOT_EXECUTED" in result.stdout
+        assert "PREPARED_NOT_EXECUTED" in run(*self.ARGS).stdout
 
     def test_it_states_the_per_step_and_total_ceilings(self, workspace: Path) -> None:
-        result = run(
-            "plan", "--sport", SPORT, "--bookmaker", BOOKMAKER, "--max-credits", "6", "--json"
-        )
-        plan = json.loads(result.stdout)
+        plan = json.loads(run(*self.ARGS, "--json").stdout)
         assert plan["status"] == "PREPARED_NOT_EXECUTED"
         assert plan["total_max_credits"] == 6
         by_step = {step["command"]: step for step in plan["steps"]}
@@ -174,17 +158,10 @@ class TestPlan:
         assert by_step["additional"]["max_credits"] == 5
 
     def test_it_states_the_effective_regional_units(self, workspace: Path) -> None:
-        result = run(
-            "plan", "--sport", SPORT, "--bookmaker", BOOKMAKER, "--max-credits", "6", "--json"
-        )
-        plan = json.loads(result.stdout)
-        assert plan["effective_region_units"] == 1
+        assert json.loads(run(*self.ARGS, "--json").stdout)["effective_region_units"] == 1
 
     def test_it_lists_the_exact_markets_of_each_paid_step(self, workspace: Path) -> None:
-        result = run(
-            "plan", "--sport", SPORT, "--bookmaker", BOOKMAKER, "--max-credits", "6", "--json"
-        )
-        by_step = {s["command"]: s for s in json.loads(result.stdout)["steps"]}
+        by_step = {s["command"]: s for s in json.loads(run(*self.ARGS, "--json").stdout)["steps"]}
         assert by_step["core"]["markets"] == ["h2h"]
         assert by_step["additional"]["markets"] == [
             "draw_no_bet",
@@ -194,17 +171,21 @@ class TestPlan:
             "double_chance_h1",
         ]
 
+    def test_it_states_the_local_bound_of_each_step(self, workspace: Path) -> None:
+        """Requests, events, bookmakers and markets — what the program enforces."""
+        by_step = {s["command"]: s for s in json.loads(run(*self.ARGS, "--json").stdout)["steps"]}
+        assert by_step["core"]["local_bound"]["max_requests"] == 1
+        assert by_step["additional"]["local_bound"]["max_requests"] == 1
+        assert by_step["discover"]["local_bound"]["max_requests"] == 2
+
     def test_it_prints_no_key_in_the_planned_endpoints(self, keyed: Path) -> None:
-        result = run(
-            "plan", "--sport", SPORT, "--bookmaker", BOOKMAKER, "--max-credits", "6", "--json"
-        )
+        result = run(*self.ARGS, "--json")
         assert FAKE_KEY not in result.stdout
         assert "apiKey" not in result.stdout
 
     def test_it_is_deterministic(self, workspace: Path) -> None:
-        args = ("plan", "--sport", SPORT, "--bookmaker", BOOKMAKER, "--max-credits", "6", "--json")
-        first = json.loads(run(*args).stdout)
-        second = json.loads(run(*args).stdout)
+        first = json.loads(run(*self.ARGS, "--json").stdout)
+        second = json.loads(run(*self.ARGS, "--json").stdout)
         for plan in (first, second):
             plan.pop("generated_at", None)
         assert first == second
@@ -214,115 +195,109 @@ class TestPlan:
         assert result.exit_code != 0
 
     def test_it_writes_no_receipt(self, workspace: Path) -> None:
-        run("plan", "--sport", SPORT, "--bookmaker", BOOKMAKER, "--max-credits", "6")
-        assert not workspace.exists() or list(workspace.glob("*.json")) == []
+        run(*self.ARGS)
+        assert receipts_in(workspace) == []
 
 
 # ---------------------------------------------------------------------------
 # Network consent, keys and exact acknowledgement
 # ---------------------------------------------------------------------------
 class TestConsentGates:
+    def _args(self, command: str, receipt: str) -> tuple[str, ...]:
+        if command == "discover":
+            return discover_args()
+        if command == "core":
+            return core_args(discovery_receipt=receipt)
+        return additional_args(core_receipt=receipt)
+
     @pytest.mark.parametrize("command", ["discover", "core", "additional"])
     def test_every_networked_command_refuses_without_allow_network(
-        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, command: str
+        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, command: str, frozen_clock: None
     ) -> None:
+        receipt = "" if command == "discover" else self._receipt_for(monkeypatch, keyed, command)
         recorder = Recorder()
         install(monkeypatch, recorder)
-        args = ["--sport", SPORT, "--bookmaker", BOOKMAKER]
-        if command != "discover":
-            ceiling = "1" if command == "core" else "5"
-            args += [
-                "--event-id",
-                EVENT_ID,
-                "--max-credits",
-                ceiling,
-                "--acknowledge-credits",
-                ceiling,
-            ]
-        result = run(command, *args)
+        args = [a for a in self._args(command, receipt) if a != "--allow-network"]
+        result = run(*args)
         assert result.exit_code != 0
         assert recorder.requests == []
 
     @pytest.mark.parametrize("command", ["discover", "core", "additional"])
     def test_every_networked_command_refuses_without_a_key(
-        self, workspace: Path, monkeypatch: pytest.MonkeyPatch, command: str
+        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, command: str, frozen_clock: None
     ) -> None:
+        receipt = "" if command == "discover" else self._receipt_for(monkeypatch, keyed, command)
+        monkeypatch.delenv("BETMAXXING_THE_ODDS_API_KEY", raising=False)
+        from betmaxxing.config import reset_settings_cache
+
+        reset_settings_cache()
+
         recorder = Recorder()
         install(monkeypatch, recorder)
-        args = ["--sport", SPORT, "--bookmaker", BOOKMAKER, "--allow-network"]
-        if command != "discover":
-            ceiling = "1" if command == "core" else "5"
-            args += [
-                "--event-id",
-                EVENT_ID,
-                "--max-credits",
-                ceiling,
-                "--acknowledge-credits",
-                ceiling,
-            ]
-        result = run(command, *args)
+        result = run(*self._args(command, receipt))
         assert result.exit_code != 0
         assert recorder.requests == []
 
+    def _receipt_for(self, monkeypatch: pytest.MonkeyPatch, keyed: Path, command: str) -> str:
+        return (
+            approved(monkeypatch, keyed) if command == "core" else verified_core(monkeypatch, keyed)
+        )
+
     @pytest.mark.parametrize(
-        ("command", "max_credits", "ack"),
-        [
-            ("core", "1", "2"),
-            ("core", "2", "1"),
-            ("core", "2", "2"),
-            ("core", "0", "0"),
-            ("additional", "5", "4"),
-            ("additional", "4", "5"),
-            ("additional", "6", "6"),
-            ("additional", "1", "1"),
-        ],
+        ("max_credits", "ack"),
+        [("1", "2"), ("2", "1"), ("2", "2"), ("0", "0")],
+        ids=["ack-too-high", "ack-too-low", "ceiling-raised", "ceiling-zeroed"],
     )
-    def test_a_mismatched_or_wrong_ceiling_fails_before_the_network(
+    def test_a_mismatched_core_ceiling_fails_before_the_network(
         self,
         keyed: Path,
         monkeypatch: pytest.MonkeyPatch,
-        command: str,
+        frozen_clock: None,
         max_credits: str,
         ack: str,
     ) -> None:
-        recorder = Recorder()
+        discovery = approved(monkeypatch, keyed)
+        recorder = Recorder({"/odds": odds_payload()})
         install(monkeypatch, recorder)
         result = run(
-            command,
-            "--sport",
-            SPORT,
-            "--bookmaker",
-            BOOKMAKER,
-            "--event-id",
-            EVENT_ID,
-            "--max-credits",
-            max_credits,
-            "--acknowledge-credits",
-            ack,
-            "--allow-network",
+            *core_args(discovery_receipt=discovery, max_credits=max_credits, acknowledge=ack)
         )
         assert result.exit_code != 0
         assert recorder.requests == [], "a request was made despite an invalid ceiling"
 
+    @pytest.mark.parametrize(
+        ("max_credits", "ack"),
+        [("5", "4"), ("4", "5"), ("6", "6"), ("1", "1")],
+        ids=["ack-too-low", "ceiling-lowered", "ceiling-raised", "ceiling-one"],
+    )
+    def test_a_mismatched_additional_ceiling_fails_before_the_network(
+        self,
+        keyed: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        frozen_clock: None,
+        max_credits: str,
+        ack: str,
+    ) -> None:
+        core = verified_core(monkeypatch, keyed)
+        recorder = Recorder({"/events/": event_odds_payload()})
+        install(monkeypatch, recorder)
+        result = run(*additional_args(core_receipt=core, max_credits=max_credits, acknowledge=ack))
+        assert result.exit_code != 0
+        assert recorder.requests == []
+
     @pytest.mark.parametrize("command", ["core", "additional"])
     def test_the_acknowledgement_is_mandatory(
-        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, command: str
+        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None, command: str
     ) -> None:
-        recorder = Recorder()
+        receipt = self._receipt_for(monkeypatch, keyed, command)
+        recorder = Recorder({"/odds": odds_payload(), "/events/": event_odds_payload()})
         install(monkeypatch, recorder)
-        ceiling = "1" if command == "core" else "5"
-        result = run(
-            command,
-            "--sport",
-            SPORT,
-            "--bookmaker",
-            BOOKMAKER,
-            "--event-id",
-            EVENT_ID,
-            "--max-credits",
-            ceiling,
-            "--allow-network",
+        args = (
+            core_args(discovery_receipt=receipt, acknowledge=None)
+            if command == "core"
+            else additional_args(core_receipt=receipt, acknowledge=None)
         )
+        result = run(*args)
         assert result.exit_code != 0
         assert recorder.requests == []
 
@@ -340,69 +315,42 @@ class TestConsentGates:
 
 
 class TestScopeIsSingular:
-    @pytest.mark.parametrize("command", ["discover", "core", "additional"])
-    def test_two_sports_are_refused(
-        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, command: str
+    def test_two_sports_are_refused_by_discover(
+        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder()
+        recorder = Recorder(free_routes())
         install(monkeypatch, recorder)
-        args = [
-            "--sport",
-            f"{SPORT},tennis_atp_aus_open_singles",
-            "--bookmaker",
-            BOOKMAKER,
-            "--allow-network",
-        ]
-        if command != "discover":
-            ceiling = "1" if command == "core" else "5"
-            args += [
-                "--event-id",
-                EVENT_ID,
-                "--max-credits",
-                ceiling,
-                "--acknowledge-credits",
-                ceiling,
-            ]
-        result = run(command, *args)
+        result = run(*discover_args(sport=f"{SPORT},tennis_atp_aus_open_singles"))
         assert result.exit_code != 0
         assert recorder.requests == []
 
-    @pytest.mark.parametrize("command", ["discover", "core", "additional"])
-    def test_two_bookmakers_are_refused(
-        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, command: str
+    def test_two_bookmakers_are_refused_by_discover(
+        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder()
+        recorder = Recorder(free_routes())
         install(monkeypatch, recorder)
-        args = ["--sport", SPORT, "--bookmaker", "winamax_fr,unibet", "--allow-network"]
-        if command != "discover":
-            ceiling = "1" if command == "core" else "5"
-            args += [
-                "--event-id",
-                EVENT_ID,
-                "--max-credits",
-                ceiling,
-                "--acknowledge-credits",
-                ceiling,
-            ]
-        result = run(command, *args)
+        result = run(*discover_args(bookmaker="winamax_fr,unibet"))
+        assert result.exit_code != 0
+        assert recorder.requests == []
+
+    def test_two_events_are_refused_by_core(
+        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
+    ) -> None:
+        discovery = approved(monkeypatch, keyed)
+        recorder = Recorder({"/odds": odds_payload()})
+        install(monkeypatch, recorder)
+        result = run(
+            *core_args(discovery_receipt=discovery, event_id=f"{EVENT_ID},{OTHER_EVENT_ID}")
+        )
         assert result.exit_code != 0
         assert recorder.requests == []
 
     def test_a_window_over_24_hours_is_refused(
-        self, keyed: Path, monkeypatch: pytest.MonkeyPatch
+        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder()
+        recorder = Recorder(free_routes())
         install(monkeypatch, recorder)
-        result = run(
-            "discover",
-            "--sport",
-            SPORT,
-            "--bookmaker",
-            BOOKMAKER,
-            "--window-hours",
-            "48",
-            "--allow-network",
-        )
+        result = run(*discover_args(extra=("--window-hours", "48")))
         assert result.exit_code != 0
         assert recorder.requests == []
 
@@ -424,40 +372,15 @@ class TestScopeIsSingular:
 # ---------------------------------------------------------------------------
 # discover — free endpoints only
 # ---------------------------------------------------------------------------
-def sports_payload(active: bool = True) -> list[dict[str, Any]]:
-    return [{"key": SPORT, "group": "Soccer", "title": "Ligue 1", "active": active}]
-
-
-def events_payload(hours_ahead: float = 6.0, event_id: str = EVENT_ID) -> list[dict[str, Any]]:
-    return [
-        {
-            "id": event_id,
-            "sport_key": SPORT,
-            "commence_time": (NOW + timedelta(hours=hours_ahead)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "home_team": "Olympique Lyonnais",
-            "away_team": "Stade Rennais",
-        }
-    ]
-
-
-@pytest.fixture
-def frozen_clock(monkeypatch: pytest.MonkeyPatch) -> None:
-    from betmaxxing.providers.the_odds_api import activation
-
-    monkeypatch.setattr(activation, "_clock", lambda: NOW)
-
-
 class TestDiscover:
     def _run(self, monkeypatch: pytest.MonkeyPatch, recorder: Recorder, *extra: str) -> Any:
         install(monkeypatch, recorder)
-        return run(
-            "discover", "--sport", SPORT, "--bookmaker", BOOKMAKER, "--allow-network", *extra
-        )
+        return run(*discover_args(extra=extra))
 
     def test_it_calls_exactly_the_two_free_endpoints(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder({"/sports/": events_payload(), "/sports": sports_payload()})
+        recorder = Recorder(free_routes())
         result = self._run(monkeypatch, recorder)
         assert result.exit_code == 0, result.stdout
         assert len(recorder.paths) == 2
@@ -467,26 +390,30 @@ class TestDiscover:
     def test_it_never_touches_a_paid_endpoint(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder({"/sports/": events_payload(), "/sports": sports_payload()})
+        recorder = Recorder(free_routes())
         self._run(monkeypatch, recorder)
         assert not any("/odds" in path for path in recorder.paths)
         assert not any("historical" in path for path in recorder.paths)
 
     def test_it_spends_nothing(
-        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None, db_settings: Any
+        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
+        from betmaxxing.config import get_settings
         from betmaxxing.providers.budget import ProviderBudgetLedger
 
-        recorder = Recorder({"/sports/": events_payload(), "/sports": sports_payload()})
-        self._run(monkeypatch, recorder)
-        from betmaxxing.config import get_settings
-
+        self._run(monkeypatch, Recorder(free_routes()))
         assert ProviderBudgetLedger(get_settings()).spent_today("the_odds_api", NOW) == 0
 
     def test_an_inactive_sport_stops_before_the_events_call(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder({"/sports": sports_payload(active=False)})
+        recorder = Recorder(
+            {
+                "/sports": lambda _r: httpx.Response(
+                    200, json=sports_payload(active=False), headers=FREE_HEADERS
+                )
+            }
+        )
         result = self._run(monkeypatch, recorder)
         assert len(recorder.paths) == 1
         assert result.exit_code != 0
@@ -495,9 +422,7 @@ class TestDiscover:
     def test_no_event_in_the_window_is_coverage_missing(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder(
-            {"/sports/": events_payload(hours_ahead=48.0), "/sports": sports_payload()}
-        )
+        recorder = Recorder(free_routes(hours_ahead=48.0))
         result = self._run(monkeypatch, recorder)
         assert "COVERAGE_MISSING" in result.stdout
         assert len(recorder.paths) == 2, "it widened the search after finding nothing"
@@ -505,10 +430,7 @@ class TestDiscover:
     def test_an_event_already_started_is_excluded(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder(
-            {"/sports/": events_payload(hours_ahead=-1.0), "/sports": sports_payload()}
-        )
-        result = self._run(monkeypatch, recorder)
+        result = self._run(monkeypatch, Recorder(free_routes(hours_ahead=-1.0)))
         assert "COVERAGE_MISSING" in result.stdout
 
     def test_it_selects_no_event_automatically(
@@ -517,16 +439,22 @@ class TestDiscover:
         two = [
             *events_payload(),
             {
-                "id": "evt-fixture-0002",
+                "id": OTHER_EVENT_ID,
                 "sport_key": SPORT,
-                "commence_time": (NOW + timedelta(hours=8)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "commence_time": iso_z(NOW.replace(hour=20)),
                 "home_team": "A",
                 "away_team": "B",
             },
         ]
-        recorder = Recorder({"/sports/": two, "/sports": sports_payload()})
-        result = self._run(monkeypatch, recorder, "--json")
-        payload = json.loads(result.stdout)
+        recorder = Recorder(
+            {
+                "/sports/": lambda _r: httpx.Response(200, json=two, headers=FREE_HEADERS),
+                "/sports": lambda _r: httpx.Response(
+                    200, json=sports_payload(), headers=FREE_HEADERS
+                ),
+            }
+        )
+        payload = json.loads(self._run(monkeypatch, recorder, "--json").stdout)
         assert payload["status"] == "DISCOVERY_VERIFIED"
         assert len(payload["events"]) == 2
         assert "selected_event_id" not in payload
@@ -537,7 +465,7 @@ class TestDiscover:
         """These endpoints are documented free; a charge means the contract moved."""
         recorder = Recorder(
             {
-                "/sports": lambda r: httpx.Response(
+                "/sports": lambda _r: httpx.Response(
                     200, json=sports_payload(), headers={"x-requests-last": "3"}
                 )
             }
@@ -549,7 +477,7 @@ class TestDiscover:
     def test_it_does_not_retry(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder({"/sports": lambda r: httpx.Response(503, json={})})
+        recorder = Recorder({"/sports": lambda _r: httpx.Response(503, json={})})
         result = self._run(monkeypatch, recorder)
         assert len(recorder.paths) == 1, f"{len(recorder.paths)} attempts — retries are on"
         assert result.exit_code != 0
@@ -558,77 +486,46 @@ class TestDiscover:
 # ---------------------------------------------------------------------------
 # core — one event, one bookmaker, one market, one credit
 # ---------------------------------------------------------------------------
-def odds_payload() -> list[dict[str, Any]]:
-    return [
-        {
-            "id": EVENT_ID,
-            "sport_key": SPORT,
-            "sport_title": "Ligue 1",
-            "commence_time": (NOW + timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "home_team": "Olympique Lyonnais",
-            "away_team": "Stade Rennais",
-            "bookmakers": [
-                {
-                    "key": BOOKMAKER,
-                    "title": "Winamax (FR)",
-                    "last_update": "2026-08-04T11:50:00Z",
-                    "markets": [
-                        {
-                            "key": "h2h",
-                            "outcomes": [
-                                {"name": "Olympique Lyonnais", "price": 1.63},
-                                {"name": "Stade Rennais", "price": 5.00},
-                                {"name": "Draw", "price": 4.20},
-                            ],
-                        }
-                    ],
-                }
-            ],
-        }
-    ]
-
-
 class TestCore:
-    def _run(self, monkeypatch: pytest.MonkeyPatch, recorder: Recorder, *extra: str) -> Any:
+    def _run(self, monkeypatch: pytest.MonkeyPatch, keyed: Path, routes: Any, *extra: str) -> Any:
+        discovery = approved(monkeypatch, keyed)
+        recorder = Recorder(routes)
         install(monkeypatch, recorder)
-        return run(
-            "core",
-            "--sport",
-            SPORT,
-            "--bookmaker",
-            BOOKMAKER,
-            "--event-id",
-            EVENT_ID,
-            "--max-credits",
-            "1",
-            "--acknowledge-credits",
-            "1",
-            "--allow-network",
-            *extra,
-        )
+        result = run(*core_args(discovery_receipt=discovery, extra=extra))
+        self.recorder = recorder
+        return result
 
     def test_it_makes_exactly_one_request(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder({"/odds": odds_payload()})
-        result = self._run(monkeypatch, recorder)
+        result = self._run(
+            monkeypatch,
+            keyed,
+            {"/odds": lambda _r: httpx.Response(200, json=odds_payload(), headers=PAID_HEADERS)},
+        )
         assert result.exit_code == 0, result.stdout
-        assert len(recorder.requests) == 1
+        assert len(self.recorder.requests) == 1
 
     def test_it_uses_the_grouped_endpoint_filtered_by_event(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder({"/odds": odds_payload()})
-        self._run(monkeypatch, recorder)
-        assert recorder.paths[0].endswith(f"/v4/sports/{SPORT}/odds")
-        assert recorder.query(0)["eventIds"] == [EVENT_ID]
+        self._run(
+            monkeypatch,
+            keyed,
+            {"/odds": lambda _r: httpx.Response(200, json=odds_payload(), headers=PAID_HEADERS)},
+        )
+        assert self.recorder.paths[0].endswith(f"/v4/sports/{SPORT}/odds")
+        assert self.recorder.query(0)["eventIds"] == [EVENT_ID]
 
     def test_it_requests_exactly_one_market_and_one_bookmaker(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder({"/odds": odds_payload()})
-        self._run(monkeypatch, recorder)
-        query = recorder.query(0)
+        self._run(
+            monkeypatch,
+            keyed,
+            {"/odds": lambda _r: httpx.Response(200, json=odds_payload(), headers=PAID_HEADERS)},
+        )
+        query = self.recorder.query(0)
         assert query["markets"] == ["h2h"]
         assert query["bookmakers"] == [BOOKMAKER]
 
@@ -637,78 +534,101 @@ class TestCore:
     ) -> None:
         from betmaxxing.providers.the_odds_api import TheOddsApiProvider
 
+        discovery = approved(monkeypatch, keyed)
         calls: list[str] = []
         monkeypatch.setattr(
             TheOddsApiProvider,
             "collect",
             lambda *a, **k: calls.append("collect") or [],  # type: ignore[func-returns-value]
         )
-        recorder = Recorder({"/odds": odds_payload()})
-        self._run(monkeypatch, recorder)
-        assert calls == [], "the smoke path fanned out through collect()"
+        install(
+            monkeypatch,
+            Recorder(
+                {"/odds": lambda _r: httpx.Response(200, json=odds_payload(), headers=PAID_HEADERS)}
+            ),
+        )
+        run(*core_args(discovery_receipt=discovery))
+        assert calls == [], "the activation path fanned out through collect()"
 
     def test_it_does_not_retry(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder({"/odds": lambda r: httpx.Response(503, json={})})
-        self._run(monkeypatch, recorder)
-        assert len(recorder.requests) == 1
+        self._run(monkeypatch, keyed, {"/odds": lambda _r: httpx.Response(503, json={})})
+        assert len(self.recorder.requests) == 1
 
     def test_an_empty_response_is_coverage_missing_not_a_failure(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder({"/odds": []})
-        result = self._run(monkeypatch, recorder)
+        result = self._run(
+            monkeypatch,
+            keyed,
+            {"/odds": lambda _r: httpx.Response(200, json=[], headers=PAID_HEADERS)},
+        )
         assert "COVERAGE_MISSING" in result.stdout
-        assert len(recorder.requests) == 1, "it called again after an empty response"
+        assert len(self.recorder.requests) == 1, "it called again after an empty response"
 
     def test_a_missing_bookmaker_is_coverage_missing(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
         payload = odds_payload()
         payload[0]["bookmakers"] = []
-        recorder = Recorder({"/odds": payload})
-        result = self._run(monkeypatch, recorder)
+        result = self._run(
+            monkeypatch,
+            keyed,
+            {"/odds": lambda _r: httpx.Response(200, json=payload, headers=PAID_HEADERS)},
+        )
         assert "COVERAGE_MISSING" in result.stdout
 
     def test_a_reported_cost_above_the_ceiling_is_a_mismatch(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder(
+        result = self._run(
+            monkeypatch,
+            keyed,
             {
-                "/odds": lambda r: httpx.Response(
+                "/odds": lambda _r: httpx.Response(
                     200, json=odds_payload(), headers={"x-requests-last": "4"}
                 )
-            }
+            },
         )
-        result = self._run(monkeypatch, recorder)
         assert "COST_MISMATCH" in result.stdout
         assert result.exit_code != 0
 
-    def test_an_event_outside_the_window_is_refused_before_the_network(
+    def test_an_event_outside_the_window_is_refused(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
         payload = odds_payload()
-        payload[0]["commence_time"] = (NOW + timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        recorder = Recorder({"/odds": payload})
-        result = self._run(monkeypatch, recorder)
+        payload[0]["commence_time"] = iso_z(NOW.replace(day=6))
+        result = self._run(
+            monkeypatch,
+            keyed,
+            {"/odds": lambda _r: httpx.Response(200, json=payload, headers=PAID_HEADERS)},
+        )
         assert result.exit_code != 0
 
     def test_it_writes_a_receipt_marked_core_live_verified(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder({"/odds": odds_payload()})
-        self._run(monkeypatch, recorder)
-        receipts = list(keyed.glob("*.json"))
-        assert receipts
-        payload = json.loads(receipts[-1].read_text())
-        assert payload["status"] == "CORE_LIVE_VERIFIED"
+        self._run(
+            monkeypatch,
+            keyed,
+            {"/odds": lambda _r: httpx.Response(200, json=odds_payload(), headers=PAID_HEADERS)},
+        )
+        core = [r for r in receipts_in(keyed) if r["command"] == "core"]
+        assert core and core[-1]["status"] == "CORE_LIVE_VERIFIED"
 
     def test_a_malformed_payload_is_a_schema_mismatch(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder({"/odds": [{"unexpected": True}]})
-        result = self._run(monkeypatch, recorder)
+        result = self._run(
+            monkeypatch,
+            keyed,
+            {
+                "/odds": lambda _r: httpx.Response(
+                    200, json=[{"unexpected": True}], headers=PAID_HEADERS
+                )
+            },
+        )
         assert "SCHEMA_MISMATCH" in result.stdout
 
 
@@ -716,92 +636,31 @@ class TestCore:
 # additional — same event, five markets, five credits, separate authorisation
 # ---------------------------------------------------------------------------
 class TestAdditional:
-    def _core_first(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        recorder = Recorder({"/odds": odds_payload()})
+    def _run(self, monkeypatch: pytest.MonkeyPatch, keyed: Path, routes: Any, *extra: str) -> Any:
+        core = verified_core(monkeypatch, keyed)
+        recorder = Recorder(routes)
         install(monkeypatch, recorder)
-        result = run(
-            "core",
-            "--sport",
-            SPORT,
-            "--bookmaker",
-            BOOKMAKER,
-            "--event-id",
-            EVENT_ID,
-            "--max-credits",
-            "1",
-            "--acknowledge-credits",
-            "1",
-            "--allow-network",
-        )
-        assert result.exit_code == 0, result.stdout
+        result = run(*additional_args(core_receipt=core, extra=extra))
+        self.recorder = recorder
+        return result
 
-    def _run(self, monkeypatch: pytest.MonkeyPatch, recorder: Recorder, *extra: str) -> Any:
-        install(monkeypatch, recorder)
-        return run(
-            "additional",
-            "--sport",
-            SPORT,
-            "--bookmaker",
-            BOOKMAKER,
-            "--event-id",
-            EVENT_ID,
-            "--max-credits",
-            "5",
-            "--acknowledge-credits",
-            "5",
-            "--allow-network",
-            *extra,
-        )
-
-    def test_it_refuses_without_a_prior_core_receipt(
-        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
-    ) -> None:
-        recorder = Recorder({"/events/": {}})
-        result = self._run(monkeypatch, recorder)
-        assert result.exit_code != 0
-        assert recorder.requests == []
-
-    def test_it_refuses_when_core_covered_a_different_event(
-        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
-    ) -> None:
-        self._core_first(monkeypatch)
-        recorder = Recorder({"/events/": {}})
-        install(monkeypatch, recorder)
-        result = run(
-            "additional",
-            "--sport",
-            SPORT,
-            "--bookmaker",
-            BOOKMAKER,
-            "--event-id",
-            "evt-a-different-one",
-            "--max-credits",
-            "5",
-            "--acknowledge-credits",
-            "5",
-            "--allow-network",
-        )
-        assert result.exit_code != 0
-        assert recorder.requests == []
+    @staticmethod
+    def _ok(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=event_odds_payload(), headers={"x-requests-last": "5"})
 
     def test_it_makes_exactly_one_request_to_the_event_endpoint(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        self._core_first(monkeypatch)
-        recorder = Recorder({"/events/": _event_odds_payload()})
-        result = self._run(monkeypatch, recorder)
+        result = self._run(monkeypatch, keyed, {"/events/": self._ok})
         assert result.exit_code == 0, result.stdout
-        assert len(recorder.requests) == 1
-        assert recorder.paths[0].endswith(f"/v4/sports/{SPORT}/events/{EVENT_ID}/odds")
+        assert len(self.recorder.requests) == 1
+        assert self.recorder.paths[0].endswith(f"/v4/sports/{SPORT}/events/{EVENT_ID}/odds")
 
     def test_it_requests_exactly_the_five_markets(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        self._core_first(monkeypatch)
-        recorder = Recorder({"/events/": _event_odds_payload()})
-        self._run(monkeypatch, recorder)
-        markets = recorder.query(0)["markets"][0].split(",")
-        assert markets == [
+        self._run(monkeypatch, keyed, {"/events/": self._ok})
+        assert self.recorder.query(0)["markets"][0].split(",") == [
             "draw_no_bet",
             "double_chance",
             "h2h_3_way_h1",
@@ -812,19 +671,22 @@ class TestAdditional:
     def test_it_reads_market_level_timestamps(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        self._core_first(monkeypatch)
-        recorder = Recorder({"/events/": _event_odds_payload()})
-        result = self._run(monkeypatch, recorder, "--json")
+        result = self._run(monkeypatch, keyed, {"/events/": self._ok}, "--json")
         payload = json.loads(result.stdout)
         assert payload["status"] == "ADDITIONAL_LIVE_VERIFIED"
-        assert len(set(payload["freshness"].values())) == 2
+        assert len(set(payload["freshness"].values())) == 5
 
     def test_a_partially_missing_market_is_reported_not_compensated(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        self._core_first(monkeypatch)
-        recorder = Recorder({"/events/": _event_odds_payload()})
-        result = self._run(monkeypatch, recorder, "--json")
+        def partial(_r: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json=event_odds_payload(markets=("draw_no_bet", "double_chance")),
+                headers={"x-requests-last": "5"},
+            )
+
+        result = self._run(monkeypatch, keyed, {"/events/": partial}, "--json")
         payload = json.loads(result.stdout)
         assert set(payload["markets_requested"]) > set(payload["markets_observed"])
         assert payload["markets_observed"] == ["draw_no_bet", "double_chance"]
@@ -832,55 +694,14 @@ class TestAdditional:
     def test_it_does_not_retry(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        self._core_first(monkeypatch)
-        recorder = Recorder({"/events/": lambda r: httpx.Response(503, json={})})
-        self._run(monkeypatch, recorder)
-        assert len(recorder.requests) == 1
+        self._run(monkeypatch, keyed, {"/events/": lambda _r: httpx.Response(503, json={})})
+        assert len(self.recorder.requests) == 1
 
     def test_it_never_touches_another_sport(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        self._core_first(monkeypatch)
-        recorder = Recorder({"/events/": _event_odds_payload()})
-        self._run(monkeypatch, recorder)
-        assert all("tennis" not in path for path in recorder.paths)
-
-
-def _event_odds_payload() -> dict[str, Any]:
-    """Event-odds shape: no bookmaker timestamp, one per market, two of five."""
-    return {
-        "id": EVENT_ID,
-        "sport_key": SPORT,
-        "sport_title": "Ligue 1",
-        "commence_time": (NOW + timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "home_team": "Olympique Lyonnais",
-        "away_team": "Stade Rennais",
-        "bookmakers": [
-            {
-                "key": BOOKMAKER,
-                "title": "Winamax (FR)",
-                "markets": [
-                    {
-                        "key": "draw_no_bet",
-                        "last_update": "2026-08-04T11:40:00Z",
-                        "outcomes": [
-                            {"name": "Olympique Lyonnais", "price": 1.30},
-                            {"name": "Stade Rennais", "price": 3.40},
-                        ],
-                    },
-                    {
-                        "key": "double_chance",
-                        "last_update": "2026-08-04T11:12:00Z",
-                        "outcomes": [
-                            {"name": "Olympique Lyonnais or Draw", "price": 1.15},
-                            {"name": "Draw or Stade Rennais", "price": 1.55},
-                            {"name": "Olympique Lyonnais or Stade Rennais", "price": 1.28},
-                        ],
-                    },
-                ],
-            }
-        ],
-    }
+        self._run(monkeypatch, keyed, {"/events/": self._ok})
+        assert all("tennis" not in path for path in self.recorder.paths)
 
 
 # ---------------------------------------------------------------------------
@@ -893,10 +714,12 @@ class TestNoLeak:
     def test_the_key_never_appears_in_an_error_path(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None, status: int
     ) -> None:
-        recorder = Recorder({"/sports": lambda r: httpx.Response(status, json={"m": "x"})})
-        install(monkeypatch, recorder)
-        result = run("discover", "--sport", SPORT, "--bookmaker", BOOKMAKER, "--allow-network")
-        assert FAKE_KEY not in result.stdout
+        install(
+            monkeypatch,
+            Recorder({"/sports": lambda _r: httpx.Response(status, json={"m": "x"})}),
+        )
+        result = run(*discover_args())
+        assert FAKE_KEY not in result.output
         assert FAKE_KEY not in str(result.exception or "")
 
     def test_the_key_never_appears_on_a_transport_failure(
@@ -905,85 +728,52 @@ class TestNoLeak:
         def boom(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError(f"failed connecting with {FAKE_KEY}", request=request)
 
-        recorder = Recorder({"/sports": boom})
-        install(monkeypatch, recorder)
-        result = run("discover", "--sport", SPORT, "--bookmaker", BOOKMAKER, "--allow-network")
-        assert FAKE_KEY not in result.stdout
+        install(monkeypatch, Recorder({"/sports": boom}))
+        result = run(*discover_args())
+        assert FAKE_KEY not in result.output
 
-    def test_the_receipt_carries_no_key(
+    def test_no_receipt_carries_the_key(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder({"/odds": odds_payload()})
-        install(monkeypatch, recorder)
-        run(
-            "core",
-            "--sport",
-            SPORT,
-            "--bookmaker",
-            BOOKMAKER,
-            "--event-id",
-            EVENT_ID,
-            "--max-credits",
-            "1",
-            "--acknowledge-credits",
-            "1",
-            "--allow-network",
-        )
+        verified_core(monkeypatch, keyed)
         for receipt in keyed.glob("*.json"):
-            text = receipt.read_text()
+            text = receipt.read_text(encoding="utf-8")
             assert FAKE_KEY not in text
             assert "apiKey" not in text
 
-    def test_the_receipt_hashes_the_event_id(
+    def test_no_receipt_carries_the_event_id_in_clear(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder({"/odds": odds_payload()})
-        install(monkeypatch, recorder)
-        run(
-            "core",
-            "--sport",
-            SPORT,
-            "--bookmaker",
-            BOOKMAKER,
-            "--event-id",
-            EVENT_ID,
-            "--max-credits",
-            "1",
-            "--acknowledge-credits",
-            "1",
-            "--allow-network",
-        )
-        payload = json.loads(next(iter(keyed.glob("*.json"))).read_text())
-        assert EVENT_ID not in json.dumps(payload)
-        assert payload["event_id_hash"]
+        verified_core(monkeypatch, keyed)
+        for receipt in receipts_in(keyed):
+            assert EVENT_ID not in json.dumps(receipt)
+            assert receipt.get("event_tag") or receipt.get("event_tags")
 
-    def test_the_receipt_carries_no_odds_or_participants(
+    def test_no_receipt_carries_odds_or_participants(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        recorder = Recorder({"/odds": odds_payload()})
-        install(monkeypatch, recorder)
-        run(
-            "core",
-            "--sport",
-            SPORT,
-            "--bookmaker",
-            BOOKMAKER,
-            "--event-id",
-            EVENT_ID,
-            "--max-credits",
-            "1",
-            "--acknowledge-credits",
-            "1",
-            "--allow-network",
+        core = verified_core(monkeypatch, keyed)
+        install(
+            monkeypatch,
+            Recorder(
+                {
+                    "/events/": lambda _r: httpx.Response(
+                        200, json=event_odds_payload(), headers={"x-requests-last": "5"}
+                    )
+                }
+            ),
         )
-        text = json.dumps(json.loads(next(iter(keyed.glob("*.json"))).read_text()))
-        for forbidden in ("Olympique", "Rennais", "1.63", "4.20", "outcomes", "price"):
-            assert forbidden not in text, f"{forbidden!r} was persisted"
+        run(*additional_args(core_receipt=core))
+
+        for receipt in receipts_in(keyed):
+            text = json.dumps(receipt)
+            for forbidden in ("Olympique", "Rennais", "1.63", "4.20", "outcomes", "price"):
+                assert forbidden not in text, f"{forbidden!r} was persisted in {receipt['command']}"
 
     def test_receipts_are_gitignored(self) -> None:
         from betmaxxing.providers.the_odds_api.activation import DEFAULT_RECEIPT_DIR
 
-        ignore = Path(".gitignore").read_text()
+        ignore = Path(".gitignore").read_text(encoding="utf-8")
         assert DEFAULT_RECEIPT_DIR.split("/")[0] in ignore
 
 
@@ -1001,7 +791,7 @@ class TestNoChaining:
     def test_the_help_advertises_no_run_all(self) -> None:
         result = runner.invoke(cli(), ["--help"])
         for forbidden in ("all", "full", "auto", "chain"):
-            assert f" {forbidden} " not in result.stdout.lower()
+            assert f" {forbidden} " not in result.output.lower()
 
 
 class TestTheSuiteCannotReachAProvider:

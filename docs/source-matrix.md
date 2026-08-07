@@ -294,14 +294,14 @@ explicite distinct de celui d'un scan.
 
 **Statut de l'activation : `PREPARED_NOT_EXECUTED`.** La procédure complète est
 dans **`docs/provider-activation.md`**. En résumé, quatre étapes indépendantes,
-plafonnées et autorisées séparément :
+chaînées par reçu signé et autorisées séparément :
 
-| Commande | Réseau | Plafond | Endpoints |
-|---|---|---|---|
-| `plan` | non | 0 | aucun — aucun client HTTP construit |
-| `discover` | oui | 0 | `/v4/sports`, `/v4/sports/{sport}/events` |
-| `core` | oui | 1 | `/v4/sports/{sport}/odds?eventIds=…` |
-| `additional` | oui | 5 | `/v4/sports/{sport}/events/{id}/odds` |
+| Commande | Réseau | Borne locale | Plafond contractuel estimé | Endpoints |
+|---|---|---|---|---|
+| `plan` | non | aucun client HTTP construit | 0 | aucun |
+| `discover` | oui | 2 requêtes | 0 | `/v4/sports`, `/v4/sports/{sport}/events` |
+| `core` | oui | 1 requête, 1 événement, 1 marché | 1 | `/v4/sports/{sport}/odds?eventIds=…` |
+| `additional` | oui | 1 requête, 1 événement, 5 marchés | 5 | `/v4/sports/{sport}/events/{id}/odds` |
 
 ```bash
 export BETMAXXING_THE_ODDS_API_KEY=...   # votre clé, jamais versionnée, jamais en argument
@@ -315,9 +315,26 @@ compétition configurée plus un appel par événement football, borné par le s
 budget de scan. Personne ne pouvait annoncer son coût à l'avance. Le script
 subsiste comme redirection et n'émet plus aucun appel.
 
-Chaque étape masque la clé, rapporte les crédits annoncés, écrit un reçu local
-expurgé (non versionné) et **ne modifie aucun statut de validation**. Reportez la
-date et le constat dans le tableau ci-dessus.
+`core` exige `--discovery-receipt`, `additional` exige `--core-receipt`. Les reçus
+sont signés en HMAC-SHA256 avec un secret local (`0600`, non versionné), portent
+l'identifiant d'événement en HMAC et non en clair, expirent au bout de six heures,
+et référencent leur parent. Un reçu altéré, périmé, d'un autre sport, d'un autre
+bookmaker, d'un autre événement, ou de schéma v1 est refusé **avant** le réseau.
+
+Chaque étape masque la clé, distingue coût estimé / observé / comptabilisé, écrit
+un reçu local expurgé **quelle que soit l'issue** — y compris un appel facturé qui
+échoue ensuite — et **ne modifie aucun statut de validation**.
+
+### Ce qu'une exécution réussie prouvera, et ce qu'elle ne prouvera pas
+
+Une exécution verte est une **preuve limitée** : cet endpoint, ce bookmaker, cette
+compétition, cet événement, ce marché, cet instant. Elle ne promeut pas
+l'adaptateur. Le statut global reste `IMPLEMENTED_UNVERIFIED` jusqu'à une décision
+séparée fondée sur des critères documentés — nombre d'événements, de compétitions
+et de jours observés, et taux de couverture constaté.
+
+Reportez la date, l'événement et l'état **marché par marché** dans le tableau
+ci-dessus.
 
 Aucun compte payant n'a été créé et aucun achat n'a été effectué.
 

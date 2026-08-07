@@ -170,6 +170,47 @@ def pg_settings(postgres_url: str, request: pytest.FixtureRequest) -> Iterator[S
     reset_settings_cache()
 
 
+# ---------------------------------------------------------------------------
+# Activation harness
+# ---------------------------------------------------------------------------
+#: These three live here rather than in a test module because four suites need
+#: them, and pytest only discovers fixtures from conftest. The payloads and
+#: argument builders they go with are in ``tests/helpers_activation.py``.
+@pytest.fixture
+def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, db_settings: Settings) -> Path:
+    """A throwaway receipt directory and a database, with no key configured."""
+    from helpers_activation import FAKE_RECEIPT_SECRET
+
+    monkeypatch.setenv("BETMAXXING_MODE", "paper")
+    monkeypatch.setenv("BETMAXXING_DATABASE_URL", db_settings.database_url)
+    monkeypatch.setenv("BETMAXXING_NOTIFICATIONS_ENABLED", "false")
+    monkeypatch.setenv("BETMAXXING_ACTIVATION_RECEIPTS", str(tmp_path / "receipts"))
+    # Deterministic signing secret: no test depends on real randomness, and none
+    # writes a secret into a directory a developer might later inspect by hand.
+    monkeypatch.setenv("BETMAXXING_ACTIVATION_RECEIPT_SECRET", FAKE_RECEIPT_SECRET)
+    monkeypatch.delenv("BETMAXXING_THE_ODDS_API_KEY", raising=False)
+    monkeypatch.delenv("BETMAXXING_ODDS_API_KEY", raising=False)
+    reset_settings_cache()
+    return tmp_path / "receipts"
+
+
+@pytest.fixture
+def keyed(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    from helpers_activation import FAKE_KEY
+
+    monkeypatch.setenv("BETMAXXING_THE_ODDS_API_KEY", FAKE_KEY)
+    reset_settings_cache()
+    return workspace
+
+
+@pytest.fixture
+def frozen_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    from betmaxxing.providers.the_odds_api import activation
+    from helpers_activation import NOW
+
+    monkeypatch.setattr(activation, "_clock", lambda: NOW)
+
+
 @pytest.fixture
 def env_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Settings]:
     """Settings installed in the environment, for code paths calling get_settings()."""
