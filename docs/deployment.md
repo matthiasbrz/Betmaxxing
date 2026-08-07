@@ -116,8 +116,15 @@ avertissement le signale, sans jamais afficher la valeur.
 
 ### Activation contrôlée (opt-in, consomme des crédits réels)
 
-**Statut : `PREPARED_NOT_EXECUTED`.** Runbook complet :
-**`docs/provider-activation.md`**.
+**L'état courant se lit, il ne se suppose pas :**
+
+```bash
+python -m betmaxxing.providers.the_odds_api.activation status
+```
+
+Cinq dimensions sont rapportées séparément — adaptateur, exécution, connectivité +
+coût, couverture bookmaker, mapping + fraîcheur — parce qu'elles sont
+indépendantes. Runbook complet : **`docs/provider-activation.md`**.
 
 L'activation se fait en quatre commandes indépendantes, chaînées par reçu signé
 et autorisées séparément :

@@ -194,12 +194,18 @@ class TestSignature:
     def test_every_receipt_carries_one(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
+        from betmaxxing.providers.the_odds_api.activation import RECEIPT_SCHEMA_VERSION
+
         do_discover(monkeypatch)
         receipts = receipts_in(keyed)
         assert receipts
         for receipt in receipts:
             assert receipt["signature"]
-            assert receipt["schema_version"] == 2
+            # Pinned to the constant rather than a literal: newly written
+            # receipts follow the current schema, and the version moved to 3
+            # when `market_states` changed meaning. Which versions may still be
+            # *read* is a separate question, covered in `test_activation_state.py`.
+            assert receipt["schema_version"] == RECEIPT_SCHEMA_VERSION
 
     def test_it_verifies_against_the_local_secret(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
@@ -487,7 +493,14 @@ class TestAdditionalDemandsACoreReceipt:
     def test_it_does_not_scan_the_directory_for_evidence(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        """A valid core receipt on disk is not an authorisation to spend five credits."""
+        """A valid core receipt on disk is not an authorisation to spend five credits.
+
+        The invariant is about *authority*, not about reading files at all: the
+        read-only `status` command legitimately walks the directory to report.
+        What must never happen is a directory walk feeding a precondition. So this
+        asserts the two things that matter — no legacy scan-for-proof helper
+        survives, and the audit function's result never reaches `load_parent`.
+        """
         import inspect
 
         from betmaxxing.providers.the_odds_api import activation
@@ -496,6 +509,14 @@ class TestAdditionalDemandsACoreReceipt:
         assert "read_receipts(" not in source, (
             "the harness still walks the receipt directory choosing its own proof"
         )
+        for command in ("def core", "def additional"):
+            body = source.split(command)[-1].split("\ndef ")[0]
+            assert "audit_receipts(" not in body, (
+                f"{command} reaches for the audit scan instead of the named receipt"
+            )
+        authorise = inspect.getsource(activation.load_parent)
+        assert "audit_receipts" not in authorise
+        assert "glob(" not in authorise, "load_parent enumerates files instead of reading one"
 
     def test_a_discovery_receipt_is_refused(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None

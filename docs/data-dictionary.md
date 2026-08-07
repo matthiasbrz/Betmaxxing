@@ -176,3 +176,40 @@ relue est naïve : `from_storage()` la réattache à UTC. `ensure_utc()` continu
 **refuser** un datetime naïf venant d'un fournisseur ou d'un utilisateur — les deux
 cas sont volontairement dans des fonctions distinctes pour que la lecture permissive
 ne soit jamais atteignable depuis un chemin d'ingestion.
+
+## Reçus d'activation fournisseur — schéma v3
+
+Ces fichiers **ne sont pas** en base : ce sont des JSON locaux signés sous
+`.activation-receipts/` (répertoire gitignoré, jamais versionné, sans contrepartie
+distante). Ils sont décrits ici parce qu'ils constituent le seul journal d'audit des
+appels réels au fournisseur.
+
+| Champ | Sens |
+|---|---|
+| `schema_version` | 3 pour tout reçu écrit désormais. Les v2 restent **lus** et honorés, jamais réécrits ni re-signés ; v1 et inconnues sont refusées |
+| `receipt_id` | identifiant local du reçu |
+| `parent_receipt_id` / `parent_schema_version` | le reçu qui a autorisé cette étape, et sous quel schéma il a été accepté |
+| `command`, `status`, `recorded_at`, `expires_at` | étape, issue terminale, instant, péremption (6 h) |
+| `sport_key`, `bookmaker` | portée demandée |
+| `event_tag` / `event_tags` | identifiant(s) d'événement en **HMAC local**, jamais en clair |
+| `window_from`, `window_to` | fenêtre déclarée |
+| `endpoints`, `endpoint`, `attempts` | endpoints **templatés** (jamais d'URL avec query string) et nombre exact de requêtes tentées |
+| `network_attempted`, `may_have_reached_provider` | une socket a-t-elle été ouverte ; la requête a-t-elle pu être servie (un timeout de lecture vaut « oui ») |
+| `estimated_credits` | borne calculée avant l'appel |
+| `observed_credits` | `x-requests-last`, ou **`null`** s'il est absent, illisible ou négatif — jamais remplacé par zéro |
+| `accounted_credits` | ce qui est retenu : l'observation si elle existe, l'estimation sinon |
+| `quota_remaining` | `x-requests-remaining` de la dernière réponse, ou `null` |
+| **`bookmaker_state`** | `core` / `additional` seulement. `OBSERVED` ou `NOT_RETURNED` — dimension **indépendante** de l'état des marchés. **Absent** d'un reçu `discover` : `/events` ne renvoie aucune information de bookmaker, donc il n'y a rien à constater, et un défaut à `NOT_RETURNED` se lirait comme un constat |
+| `markets_requested` | portée de marchés de l'appel |
+| **`market_states`** | un état par marché demandé, **total** : `NOT_EVALUATED_BOOKMAKER_ABSENT`, `NOT_RETURNED`, `OBSERVED_REJECTED` ou `OBSERVED_MAPPED` |
+| `markets_mapped` / `markets_rejected` / `markets_absent` / **`markets_not_evaluated`** / `markets_observed` | projections strictes de `market_states`, partitionnant `markets_requested` exactement une fois — aucune ne peut le contredire |
+| `freshness` | âge **en secondes** par marché, dérivé de l'horodatage que v4 envoie pour cette forme de réponse |
+| `selections_mapped` | sélections retenues par le parseur réel |
+| `mapping_rejections` | motifs généralisés (tronqués avant le premier `:`), sans nom ni valeur |
+| **`events_returned`** / **`events_in_window`** / **`events_admissible`** | `discover` seulement. Entonnoir : reçus avant filtrage temporel, après la fenêtre stricte, après validation et déduplication. Invariants `0 ≤ admissible ≤ in_window ≤ returned` et `admissible == len(set(event_tags))`. Des entiers, jamais un détail par événement |
+| `adapter_status`, `model_impact` | rappels constants : l'adaptateur n'est pas promu, aucun modèle n'est affecté |
+| `signature` | HMAC-SHA256 sur le JSON canonique (clés triées, séparateurs serrés), vérifié par `hmac.compare_digest` avant tout usage comme précondition |
+
+Ne s'y trouvent **jamais** : la clé API, le secret de signature, une URL non
+expurgée, un corps de réponse brut, une cote, un nom de participant, un horaire
+individuel, ni l'identifiant d'événement en clair.

@@ -146,15 +146,16 @@
 | Ordonnanceur | ✅ **fonctionnel** | Ledger durable, anti-starvation, fencing et heartbeat testés sur **SQLite et PostgreSQL 16 réel**. Sûr multi-workers contre une même base ; rien ne coordonne plusieurs bases |
 | Collecte + persistance | ✅ **fonctionnel** | Les trois chemins persistent événements, snapshots et scan, y compris un scan d'erreur |
 | Budget fournisseur | ✅ **appliqué, atomique** | Bucket journalier par UPDATE conditionnel, prouvé par courses PostgreSQL réelles. Un coût incertain reste facturé |
-| Marchés additionnels | ◐ **collectés, non vérifiés** | Les **cinq** marchés football sont demandés, mappés et persistés **sur fixture**, `double_chance_h1` compris. `totals` tennis n'est pas demandé. Aucun appel réel ne l'a confirmé |
+| Marchés additionnels | ◐ **collectés, non vérifiés** | Les **cinq** marchés football sont demandés, mappés et persistés **sur fixture**, `double_chance_h1` compris. `totals` tennis n'est pas demandé. Aucun appel réel ne l'a confirmé : `additional` n'a jamais été exécuté |
 | Revues d'identité et alias | ✅ **administrables** | CLI `betmaxxing identity …`. Aucune résolution automatique ; l'opérateur et sa décision sont conservés |
 | Historique | ◐ **estimateur seul** | Interface et estimateur de coût hors ligne. Aucun téléchargement implémenté |
 | Modèles football / tennis | ⚠️ `BACKTEST_ONLY` | Produisent des probabilités ; aucune validation |
 | Incertitude | ⛔ `UNAVAILABLE` | Aucune méthode défendable. `SYNTHETIC` en démo seulement |
 | Mode `paper` / `live_analysis` | ⚠️ **ne publie rien** | Conséquence directe de la ligne précédente. C'est correct |
 | Challenge — Montante | ⚠️ `PARTIAL`, désactivé | Persistant et testé, mais **désactivé par défaut** ; aucune validation d'usage réel |
-| `TheOddsApiProvider` | ⚠️ `IMPLEMENTED_UNVERIFIED` | Contrats locaux verts ; **aucun appel réel** |
-| Activation fournisseur | ⚠️ `PREPARED_NOT_EXECUTED` | Quatre commandes bornées localement et chiffrées 0/0/1/5 au tarif publié, chaînées par reçu signé (HMAC), reçu écrit pour **toute** tentative réseau, garde de socket global. **Aucun appel émis, aucune clé lue, aucun crédit consommé** |
+| `TheOddsApiProvider` | ⚠️ `IMPLEMENTED_UNVERIFIED` | Contrats locaux verts. 6 appels réels le 2026-08-07 (4 gratuits, 2 payants, 2 crédits) ont validé auth, endpoint payant et comptabilité du coût ; le **mapping des cotes reste non vérifié en réel** (`winamax_fr` absent des 2 événements testés) |
+| Activation fournisseur | ◐ **partiellement exercée en réel** | Connectivité, authentification, endpoint payant, comptabilité du coût, chaînage et signature : **vérifiés en réel** (4 requêtes gratuites + 2 payantes, 2 crédits, quota 494 → 492). Mapping et fraîcheur : **non obtenus en réel**, seulement `OFFLINE_CONTRACT_VERIFIED` sur fixture. L'état courant se lit avec `activation status`, qui sépare les cinq dimensions |
+| Couverture `winamax_fr` sur `soccer_spl` | ⛔ **absente** sur les 2 événements testés | Constat daté et borné : deux événements, deux instants. Aucune généralisation au fournisseur |
 | Couverture Winamax | ❓ **non vérifiée** | Annoncée par la documentation officielle (lue le 2026-08-05) ; non confirmée par un appel |
 | Migrations historiques | ✅ **figées** | `3ce123580afa` et `b7c1e9d24a10` n'importent plus le paquet applicatif ; rejouables à l'identique et équivalence testée |
 | Interface web | ⛔ non commencée | Tranche 6 |
@@ -165,7 +166,7 @@
 
 | Élément | Raison |
 |---|---|
-| Vérification réelle de The Odds API | Nécessite la clé de l'utilisateur et trois accords explicites et distincts. L'outillage est prêt, borné localement et chiffré au tarif publié : `plan` (0), `discover` (0), `core` (1 crédit), `additional` (5). Statut : `PREPARED_NOT_EXECUTED`. Runbook : `docs/provider-activation.md` |
+| Vérification réelle du mapping The Odds API | Exige un événement où `winamax_fr` est effectivement coté. Les deux tentatives SPL du 2026-08-07 ne l'ont pas trouvé. Chaque nouvelle tentative demande une autorisation explicite et distincte. Runbook : `docs/provider-activation.md` |
 | Promotion de l'adaptateur en `VERIFIED` | Une activation réussie est une preuve **limitée** (un endpoint, un bookmaker, une compétition, un événement, un marché, un instant). Les critères de promotion globale — nombre d'événements, de compétitions, de jours, taux de couverture — restent à écrire |
 | Méthode d'incertitude réelle | Nécessite des données historiques : bootstrap paramétrique/clusterisé + étude de couverture (D-019) |
 | Endpoints historiques (payants) | Hors périmètre : aucun appel payant sans action de l'utilisateur |
@@ -180,7 +181,7 @@
 ## Blocages
 
 1. **Couverture fournisseur non vérifiée.** L'adaptateur The Odds API est complet et
-   testé sur contrats locaux, mais aucun appel réel n'a confirmé que `winamax_fr`
+   testé sur contrats locaux ; deux appels réels du 2026-08-07 n'ont pas trouvé `winamax_fr`
    apparaît sur les événements visés. Seule une action de l'utilisateur (sa clé, son
    accord) peut lever ce point.
 2. **Aucune donnée historique.** Sans elle : pas d'entraînement, pas de protocole

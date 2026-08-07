@@ -36,7 +36,7 @@ uvicorn betmaxxing.api.main:app --reload
 Tests, lint, types :
 
 ```bash
-pytest -W error        # 972 tests ; `python -m pytest` exécute exactement la même suite
+pytest -W error        # `python -m pytest` exécute exactement la même suite
 ruff check .           # tout le dépôt, migrations comprises
 ruff format --check .
 mypy
@@ -172,8 +172,13 @@ Un scan rapporte aussi un `collection_status` : `OK`, `COLLECTED_NO_MODEL`,
 ## The Odds API — `IMPLEMENTED_UNVERIFIED`
 
 L'adaptateur est implémenté et testé sur contrats locaux (aucun appel réseau en CI).
-**Aucun appel réel n'a été effectué**, donc la couverture de `winamax_fr` n'est pas
-confirmée.
+Six appels réels ont eu lieu le **2026-08-07** — 4 gratuits, 2 payants, 2 crédits.
+Ils ont prouvé l'authentification, l'endpoint payant, la comptabilité du coût, le
+chaînage et la signature des reçus. Ils n'ont **rien** prouvé du mapping des cotes
+ni de la fraîcheur : `winamax_fr` était absent des deux événements testés
+(`soccer_spl`, 2026-08-08), donc aucun bloc bookmaker n'a pu être lu. La couverture
+`winamax_fr` reste **non confirmée**, et l'adaptateur reste
+`IMPLEMENTED_UNVERIFIED`.
 
 Ce qu'il fait, et ce que « fait » veut dire ici :
 
@@ -190,10 +195,15 @@ Ce qu'il fait, et ce que « fait » veut dire ici :
 « Demandé et persisté » est prouvé **sur fixture locale**, pas contre le service réel.
 La distinction est le sujet de tout ce paragraphe.
 
-Pour vérifier la couverture réelle vous-même — **statut : `PREPARED_NOT_EXECUTED`**,
-aucun appel n'a encore été émis. Quatre étapes indépendantes, chaînées par reçu
-signé et autorisées séparément (`plan` 0, `discover` 0, `core` 1 crédit,
-`additional` 5 crédits au tarif publié) :
+Pour vérifier la couverture réelle vous-même. Six appels réels ont eu lieu le
+2026-08-07 (4 gratuits, 2 payants, 2 crédits) : ils ont prouvé l'authentification,
+l'endpoint payant et la comptabilité du coût, et **pas** le mapping des cotes —
+`winamax_fr` était absent des deux événements testés. L'état courant se lit avec
+`activation status`, qui sépare les cinq dimensions de preuve.
+
+Quatre étapes indépendantes, chaînées par reçu signé et autorisées séparément
+(`plan` 0, `discover` 0, `core` 1 crédit, `additional` 5 crédits au tarif
+publié) :
 
 ```bash
 export BETMAXXING_THE_ODDS_API_KEY=...   # votre clé, jamais versionnée, jamais en argument
@@ -293,7 +303,7 @@ doit être vérifiée auprès de l'ANJ avant diffusion plutôt qu'affichée pér
 - Interface web React non commencée (tranche 6) ; CLI et API couvrent les usages actuels.
 - **Aucune méthode d'incertitude défendable** : `paper` et `live_analysis` ne publient
   rien aujourd'hui.
-- `TheOddsApiProvider` est `IMPLEMENTED_UNVERIFIED` — aucun appel réel.
+- `TheOddsApiProvider` est `IMPLEMENTED_UNVERIFIED` — auth, endpoint payant et comptabilité du coût vérifiés en réel le 2026-08-07 ; **mapping des cotes non vérifié en réel**.
 - Le Challenge est `PARTIAL` : persistant et testé, mais désactivé par défaut.
 - Le planificateur est sûr multi-workers contre **une même base**, testé sur SQLite
   **et PostgreSQL 16 réel** (réclamation, fencing, heartbeat, insertion concurrente).

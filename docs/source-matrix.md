@@ -66,17 +66,19 @@ Ne pas confondre avec `odds-api.io`, qui est un service différent.
 
 ### Ce qui est vérifié, et ce qui ne l'est pas
 
-**Date de la dernière vérification par un appel réel : aucune.** Cette session
-n'a effectué **aucun appel** vers le service et n'a consommé **aucun crédit**.
+**Dernière vérification par appel réel : 2026-08-07.** Six requêtes au total —
+quatre gratuites (`/v4/sports`, `/v4/sports/{sport}/events`, coût observé nul) et
+deux payantes (`/v4/sports/soccer_spl/odds`, 1 crédit chacune). Quota 494 → 492.
+Ce qui a été prouvé et ce qui ne l'a pas été est détaillé ci-dessus.
 
 | Critère | État | Vérifié le |
 |---|---|---|
 | Sports et marchés couverts | `À vérifier` sur les pages officielles | — |
 | Présence de `winamax_fr` (zones `fr`/`eu`) | **Annoncé** par la documentation officielle (lue le 2026-08-05) ; **non confirmé** par un appel | — |
-| Winamax présent sur un événement donné | `À vérifier` — la présence dans une liste ne prouve rien par événement | — |
+| Winamax présent sur un événement donné | **absent** sur les 2 événements `soccer_spl` testés (`bookmaker_state = NOT_RETURNED`). Constat borné à ces événements et ces instants ; aucune généralisation | 2026-08-07 |
 | Accès aux marchés additionnels selon le plan | `À vérifier` | — |
 | Historique (endpoints payants) | **Non utilisé.** Interfaces et estimateur de coût seulement | — |
-| Quotas et coût par appel | En-têtes `x-requests-remaining` / `-used` / `-last` lus et reportés | — |
+| Quotas et coût par appel | En-têtes lus, reportés et **conformes** : gratuit = 0, `core` = 1, sur 6 appels réels | 2026-08-07 |
 | **Droit de rétention des réponses brutes** | `À confirmer dans les CGU` — en attendant, **aucun payload brut n'est conservé** | — |
 | Qualité des identifiants d'événements | `id` fournisseur utilisé comme clé de rapprochement autoritaire | — |
 | Reports / annulations / abandons | `À vérifier` | — |
@@ -292,9 +294,33 @@ explicite distinct de celui d'un scan.
 
 ### Comment vérifier vous-même
 
-**Statut de l'activation : `PREPARED_NOT_EXECUTED`.** La procédure complète est
-dans **`docs/provider-activation.md`**. En résumé, quatre étapes indépendantes,
-chaînées par reçu signé et autorisées séparément :
+**L'activation a été partiellement exercée en réel.** L'état courant se lit,
+il ne se suppose pas :
+
+```bash
+python -m betmaxxing.providers.the_odds_api.activation status
+```
+
+### Ce qui a été vérifié, et comment
+
+| Dimension | État | Vérifié |
+|---|---|---|
+| Découverte (endpoints gratuits) | **conforme** | en réel — 4 requêtes, `x-requests-last=0` |
+| Authentification, endpoint payant, comptabilité du coût | **conforme** | en réel — 2 requêtes, 2 crédits, quota 494 → 492 |
+| Chaînage et signature des reçus | **conforme** | en réel |
+| Couverture `winamax_fr` | **absente** sur les 2 événements `soccer_spl` testés, à ces instants | en réel |
+| Mapping des cotes, horodatage, fraîcheur | **non vérifiés en réel** | uniquement sur **fixture synthétique** (`OFFLINE_CONTRACT_VERIFIED`) |
+| Adaptateur dans son ensemble | `IMPLEMENTED_UNVERIFIED` | — |
+
+Coût réel cumulé connu : **2 crédits** (fait daté, pas une constante).
+
+Les deux absences SPL portent sur **deux événements, à ces instants**. Elles ne
+disent rien de la couverture Winamax en général chez le fournisseur, ni de cette
+compétition à un autre moment.
+
+La procédure complète est dans **`docs/provider-activation.md`**. En résumé,
+quatre étapes indépendantes, chaînées par reçu signé et autorisées séparément,
+plus une commande `status` de lecture seule :
 
 | Commande | Réseau | Borne locale | Plafond contractuel estimé | Endpoints |
 |---|---|---|---|---|
@@ -373,7 +399,7 @@ En V1 seul le fournisseur de démonstration est implémenté.
 |---|---|---|
 | `demo` | odds, context, results | Opérationnel, **synthétique**, déterministe, sans clé |
 | `manual_csv` | odds | Opérationnel, horodaté, quarantaine des lignes invalides |
-| `the_odds_api` | odds | **`IMPLEMENTED_UNVERIFIED`** — testé sur contrats locaux, aucun appel réel |
+| `the_odds_api` | odds | **`IMPLEMENTED_UNVERIFIED`** — contrats locaux verts ; auth, endpoint payant et coût **vérifiés en réel** le 2026-08-07 ; mapping des cotes **non vérifié en réel** |
 | Telegram | notification | Implémenté, inactif sans configuration explicite |
 | E-mail (SMTP) | notification | Implémenté, inactif sans configuration explicite |
 | SMS | notification | Interface seulement — coût par message, jamais actif en V1 |

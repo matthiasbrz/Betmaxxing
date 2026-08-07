@@ -156,7 +156,26 @@ MAX_WINDOW_HOURS = 24
 
 #: Receipt schema. v1 was unsigned and carried an unsalted SHA of a public event
 #: id; it is refused rather than upgraded, because a v1 file proves nothing.
-RECEIPT_SCHEMA_VERSION = 2
+#:
+#: v3 changes the *meaning* of ``market_states``, so it is a new version rather
+#: than v2 with extra fields. In v2 the map was partial — empty when the
+#: bookmaker was absent — and ``markets_absent`` could read as "nothing was
+#: missing" while a market had in fact never been looked at. In v3 the map is
+#: total over ``markets_requested`` and carries the explicit
+#: ``NOT_EVALUATED_BOOKMAKER_ABSENT``. A reader that applied v3's invariants to a
+#: v2 file would draw a wrong conclusion, which is exactly what a version number
+#: is for.
+RECEIPT_SCHEMA_VERSION = 3
+
+#: v2 receipts already on an operator's disk stay usable as authority. Every
+#: field the chain actually depends on — ``event_tags``, ``event_tag``,
+#: ``observed_credits``, ``accounted_credits``, ``selections_mapped``,
+#: ``parent_receipt_id``, ``expires_at`` — has the same meaning in both versions;
+#: only ``market_states`` and its projections changed, and those are not
+#: preconditions. So a valid v2 receipt is read, verified and honoured, never
+#: rewritten and never re-signed. Anything outside this set is refused.
+SUPPORTED_SCHEMA_VERSIONS = frozenset({2, RECEIPT_SCHEMA_VERSION})
+
 SIGNATURE_FIELD = "signature"
 
 #: How long a receipt may authorise the next step. Short on purpose: yesterday's
@@ -166,8 +185,18 @@ RECEIPT_TTL = timedelta(hours=6)
 
 
 class ActivationStatus(StrEnum):
-    """Every outcome the harness can report. There is no other vocabulary."""
+    """Every outcome the harness can report. There is no other vocabulary.
 
+    ``PLAN_ONLY`` and ``PREPARED_NOT_EXECUTED`` are deliberately distinct.
+    ``plan`` computes and reports; it knows nothing about what has been executed,
+    and once real ``core`` calls exist, a label meaning "nothing has run" printed
+    by ``plan`` is simply false. ``PREPARED_NOT_EXECUTED`` survives only where it
+    is still true: a refusal that happened before any socket opened, and the
+    paid-activation dimension reported by ``status`` while no paid call has been
+    attempted.
+    """
+
+    PLAN_ONLY = "PLAN_ONLY"
     PREPARED_NOT_EXECUTED = "PREPARED_NOT_EXECUTED"
     DISCOVERY_VERIFIED = "DISCOVERY_VERIFIED"
     CORE_LIVE_VERIFIED = "CORE_LIVE_VERIFIED"
@@ -193,12 +222,72 @@ VERIFIED_STATUSES = frozenset(
 )
 
 
+class BookmakerState(StrEnum):
+    """Whether the bookmaker we asked for was quoted on the event at all.
+
+    Its own dimension, because it is a different question from what the markets
+    did. Two real ``core`` calls came back valid, for the right event, with no
+    block for our bookmaker — and the receipts recorded that as an empty market
+    map, which reads like "we looked and found nothing missing".
+    """
+
+    OBSERVED = "OBSERVED"
+    NOT_RETURNED = "NOT_RETURNED"
+
+
 class MarketState(StrEnum):
-    """What became of one requested market. Absence is not rejection."""
+    """What became of one requested market. Four distinct findings.
+
+    ``NOT_EVALUATED_BOOKMAKER_ABSENT`` is the one that was missing. Without it,
+    "we never got to look" and "we looked and it was not there" collapse into the
+    same silence — and the second is a fact about the bookmaker's offer while the
+    first is a fact about nothing at all.
+    """
 
     OBSERVED_MAPPED = "OBSERVED_MAPPED"
     OBSERVED_REJECTED = "OBSERVED_REJECTED"
     NOT_RETURNED = "NOT_RETURNED"
+    NOT_EVALUATED_BOOKMAKER_ABSENT = "NOT_EVALUATED_BOOKMAKER_ABSENT"
+
+
+class ExecutionState(StrEnum):
+    """How far the activation has actually gone, on this installation."""
+
+    NO_NETWORK_ATTEMPTED = "NO_NETWORK_ATTEMPTED"
+    DISCOVERY_ATTEMPTED = "DISCOVERY_ATTEMPTED"
+    CORE_ATTEMPTED = "CORE_ATTEMPTED"
+    ADDITIONAL_ATTEMPTED = "ADDITIONAL_ATTEMPTED"
+
+
+class PaidActivationState(StrEnum):
+    """The paid dimension only. Separate from coverage and from mapping."""
+
+    PREPARED_NOT_EXECUTED = "PREPARED_NOT_EXECUTED"
+    CORE_EXECUTED_NO_COVERAGE = "CORE_EXECUTED_NO_COVERAGE"
+    CORE_EXECUTED_COVERAGE_OBSERVED = "CORE_EXECUTED_COVERAGE_OBSERVED"
+    ADDITIONAL_EXECUTED = "ADDITIONAL_EXECUTED"
+
+
+class CostProof(StrEnum):
+    """Whether connectivity and billing have been exercised, and conformingly."""
+
+    NOT_EXERCISED = "NOT_EXERCISED"
+    EXERCISED_CONFORMING = "EXERCISED_CONFORMING"
+    EXERCISED_NONCONFORMING = "EXERCISED_NONCONFORMING"
+
+
+class MappingProof(StrEnum):
+    """Whether the parser and the freshness check have actually been exercised.
+
+    ``OFFLINE_CONTRACT_VERIFIED`` is what a synthetic fixture can earn. It is not
+    a live verification and must never be reported as one: the whole point of the
+    distinction is that a fixture proves our code reads *the documented shape*,
+    not that the provider sends it.
+    """
+
+    NOT_OBTAINED_LIVE = "NOT_OBTAINED_LIVE"
+    OFFLINE_CONTRACT_VERIFIED = "OFFLINE_CONTRACT_VERIFIED"
+    OBTAINED_LIVE = "OBTAINED_LIVE"
 
 
 class Refused(Exception):
@@ -425,13 +514,13 @@ def load_parent(
         raise Refused(ActivationStatus.PREPARED_NOT_EXECUTED, f"{raw_path} n'est pas un reçu.")
 
     version = payload.get("schema_version")
-    if version != RECEIPT_SCHEMA_VERSION:
+    if version not in SUPPORTED_SCHEMA_VERSIONS:
         raise Refused(
             ActivationStatus.PREPARED_NOT_EXECUTED,
-            f"{raw_path} porte le schéma {version!r}, attendu {RECEIPT_SCHEMA_VERSION}. Les "
-            "reçus antérieurs ne sont ni signés ni chaînés : ils ne prouvent rien et ne "
-            "sont pas promus silencieusement. Relancez `discover` puis les étapes "
-            "suivantes avec cette version.",
+            f"{raw_path} porte le schéma {version!r} ; seuls "
+            f"{sorted(SUPPORTED_SCHEMA_VERSIONS)} sont lus. Un reçu v1 n'est ni signé ni "
+            "chaîné : il ne prouve rien et n'est pas promu silencieusement. Relancez "
+            "`discover` puis les étapes suivantes avec cette version.",
         )
     if not verify_receipt(payload):
         raise Refused(
@@ -508,6 +597,16 @@ class Attempt:
     selections_mapped: int = 0
     rejections: list[str] = field(default_factory=list)
     events: list[dict[str, str]] = field(default_factory=list)
+    #: Its own dimension, independent of what the markets did.
+    bookmaker_state: str = str(BookmakerState.NOT_RETURNED)
+    #: Which schema the authorising parent carried, so provenance stays traceable
+    #: when a v2 receipt is honoured by a v3 step.
+    parent_schema_version: int | None = None
+    #: Discovery funnel, three integers and nothing else — a per-event breakdown
+    #: would smuggle the schedule back into a sanitised artefact.
+    events_returned: int = 0
+    events_in_window: int = 0
+    events_admissible: int = 0
 
     def record(self, endpoint: str) -> None:
         self.attempts += 1
@@ -553,31 +652,51 @@ def build_receipt(attempt: Attempt, status: ActivationStatus, secret: str) -> di
         "accounted_credits": attempt.accounted,
         "quota_remaining": attempt.quota_remaining,
         "markets_requested": list(attempt.markets_requested),
-        "markets_observed": [
-            m for m, s in attempt.market_states.items() if s != MarketState.NOT_RETURNED
-        ],
-        "markets_absent": [
-            m for m, s in attempt.market_states.items() if s == MarketState.NOT_RETURNED
-        ],
-        "markets_rejected": [
-            m for m, s in attempt.market_states.items() if s == MarketState.OBSERVED_REJECTED
-        ],
-        "markets_mapped": [
-            m for m, s in attempt.market_states.items() if s == MarketState.OBSERVED_MAPPED
-        ],
+        # Every list below is a strict projection of `market_states`, so none of
+        # them can contradict it. Together they partition `markets_requested`
+        # exactly once — which is what makes `markets_absent == []` readable: it
+        # now means "nothing was observed missing", with
+        # `markets_not_evaluated` carrying the ones we never got to look at.
+        "markets_observed": _project(
+            attempt, MarketState.OBSERVED_MAPPED, MarketState.OBSERVED_REJECTED
+        ),
+        "markets_mapped": _project(attempt, MarketState.OBSERVED_MAPPED),
+        "markets_rejected": _project(attempt, MarketState.OBSERVED_REJECTED),
+        "markets_absent": _project(attempt, MarketState.NOT_RETURNED),
+        "markets_not_evaluated": _project(attempt, MarketState.NOT_EVALUATED_BOOKMAKER_ABSENT),
         "market_states": dict(attempt.market_states),
         "freshness": dict(attempt.freshness),
         "selections_mapped": attempt.selections_mapped,
         "mapping_rejections": [_scrub(r, secret) for r in attempt.rejections],
         "parent_receipt_id": attempt.parent_receipt_id,
+        "parent_schema_version": attempt.parent_schema_version,
         "adapter_status": "IMPLEMENTED_UNVERIFIED",
         "model_impact": "aucun — tous les modèles restent BACKTEST_ONLY",
     }
     if attempt.command == "discover":
+        # `/events` returns no bookmaker information at all, so a discovery has
+        # no bookmaker observation to report. The field is omitted rather than
+        # defaulted: `NOT_RETURNED` here would read as a finding about the
+        # bookmaker when in fact nothing was ever asked about it.
         document["event_tags"] = list(attempt.event_tags)
+        document["events_returned"] = attempt.events_returned
+        document["events_in_window"] = attempt.events_in_window
+        document["events_admissible"] = attempt.events_admissible
     else:
+        document["bookmaker_state"] = attempt.bookmaker_state
         document["event_tag"] = attempt.event_tags[0] if attempt.event_tags else ""
     return document
+
+
+def _project(attempt: Attempt, *states: MarketState) -> list[str]:
+    """The requested markets currently in one of these states, in request order.
+
+    Request order rather than dict order so two receipts for the same scope are
+    comparable, and derived strictly from ``market_states`` so a projection can
+    never disagree with the map it summarises.
+    """
+    wanted = {str(state) for state in states}
+    return [m for m in attempt.markets_requested if attempt.market_states.get(m) in wanted]
 
 
 # ---------------------------------------------------------------------------
@@ -731,15 +850,19 @@ def _event_of(payload: Any, event_id: str, endpoint: str) -> dict[str, Any]:
     )
 
 
-def _book_of(raw_event: dict[str, Any], bookmaker: str, endpoint: str) -> dict[str, Any]:
+def _book_of(raw_event: dict[str, Any], bookmaker: str) -> dict[str, Any] | None:
+    """The bookmaker's block, or ``None`` if it is not in the response.
+
+    Returns rather than raises. The previous version raised here, *before* the
+    markets were classified, so a receipt written on that path had an empty
+    market map — indistinguishable from "we checked and nothing was missing".
+    The caller now records the bookmaker's state, classifies every requested
+    market as ``NOT_EVALUATED_BOOKMAKER_ABSENT``, and only then stops.
+    """
     for book in raw_event.get("bookmakers") or []:
         if isinstance(book, dict) and str(book.get("key", "")) == bookmaker:
             return book
-    raise Refused(
-        ActivationStatus.COVERAGE_MISSING,
-        f"{endpoint} : {bookmaker} n'est pas coté sur cet événement. Une réponse valide "
-        "sans le bookmaker demandé est une couverture manquante, pas une panne.",
-    )
+    return None
 
 
 def _freshness(book: dict[str, Any], shape: ResponseShape, now: datetime) -> dict[str, int]:
@@ -772,16 +895,25 @@ def _market_keys(book: dict[str, Any]) -> list[str]:
 
 
 def _classify_markets(
-    requested: tuple[str, ...], book: dict[str, Any], batch: CollectionBatch
+    requested: tuple[str, ...], book: dict[str, Any] | None, batch: CollectionBatch | None
 ) -> dict[str, str]:
-    """One explicit state per requested market. Absence is not rejection.
+    """One explicit state per requested market. Four distinct findings.
 
-    ``NOT_RETURNED`` means the provider did not quote it — a coverage fact.
-    ``OBSERVED_REJECTED`` means it came back and our parser could not use it — a
-    contract or mapping fact. Collapsing the two would hide whichever is real.
+    ``NOT_EVALUATED_BOOKMAKER_ABSENT`` — there was no block to look in, so we
+    know nothing about the market. ``NOT_RETURNED`` — the bookmaker was quoted
+    and did not offer it, which is a coverage fact about its offer.
+    ``OBSERVED_REJECTED`` — it came back and our parser could not use it, a
+    contract or mapping fact. ``OBSERVED_MAPPED`` — it worked.
+
+    The map is **total** over ``requested``: every market asked for gets exactly
+    one state, so ``set(market_states) == set(markets_requested)`` holds on every
+    terminal receipt whose market scope was known. The two real ``core`` receipts
+    broke that invariant by returning ``{}``.
     """
+    if book is None:
+        return dict.fromkeys(requested, str(MarketState.NOT_EVALUATED_BOOKMAKER_ABSENT))
     returned = set(_market_keys(book))
-    mapped = {str(s.source_meta.get("market", "")) for s in batch.snapshots}
+    mapped = {str(s.source_meta.get("market", "")) for s in (batch.snapshots if batch else [])}
     states: dict[str, str] = {}
     for key in requested:
         if key not in returned:
@@ -906,13 +1038,39 @@ def _summary(document: dict[str, Any]) -> list[str]:
         f"Crédits annoncés: {_none(document.get('observed_credits'))}",
         f"Crédits retenus : {document.get('accounted_credits')} (prudence)",
     ]
+    if document.get("bookmaker_state"):
+        wording = (
+            "coté sur cet événement"
+            if document["bookmaker_state"] == str(BookmakerState.OBSERVED)
+            else "non retourné par le fournisseur"
+        )
+        lines.append(
+            f"Bookmaker       : {document.get('bookmaker')} — "
+            f"{document['bookmaker_state']} ({wording})"
+        )
     states = document.get("market_states") or {}
     if states:
         lines.append("Marchés         :")
         for key, state in states.items():
             age = document.get("freshness", {}).get(key)
             suffix = f" · {age} s" if age is not None else ""
-            lines.append(f"  · {key:<18} {state}{suffix}")
+            gloss = (
+                "  ← non évalué : aucun bloc bookmaker à examiner"
+                if state == str(MarketState.NOT_EVALUATED_BOOKMAKER_ABSENT)
+                else ""
+            )
+            lines.append(f"  · {key:<18} {state}{suffix}{gloss}")
+    if document.get("markets_not_evaluated"):
+        lines.append(
+            "                  aucun de ces marchés n'a été évalué : le bookmaker "
+            "demandé n'était pas dans la réponse."
+        )
+    if document.get("events_returned") is not None and document.get("command") == "discover":
+        lines.append(
+            f"Événements      : {document['events_returned']} retourné(s) · "
+            f"{document['events_in_window']} dans la fenêtre · "
+            f"{document['events_admissible']} exploitable(s)"
+        )
     if document.get("selections_mapped") is not None:
         lines.append(f"Sélections      : {document['selections_mapped']} cartographiée(s)")
     if document.get("_path"):
@@ -989,7 +1147,10 @@ def build_plan(
         },
     ]
     return {
-        "status": str(ActivationStatus.PREPARED_NOT_EXECUTED),
+        # `plan` computes; it does not know what has been executed. Claiming
+        # PREPARED_NOT_EXECUTED here became false the moment real `core` calls
+        # happened — the activation's actual state is what `status` reports.
+        "status": str(ActivationStatus.PLAN_ONLY),
         "generated_at": generated_at,
         "sport_key": sport,
         "bookmaker": bookmaker,
@@ -1079,8 +1240,10 @@ def plan(
         "",
         f"Limite : {document['limite']}",
         "",
-        "Rien n'a été exécuté. Chaque étape suivante s'autorise séparément et exige "
-        "le reçu signé de la précédente.",
+        "Cette commande n'a rien exécuté et ne dit rien de ce qui l'a été : "
+        "l'état réel de l'activation sur cette installation est donné par "
+        "`status`. Chaque étape s'autorise séparément et exige le reçu signé de "
+        "la précédente.",
     ]
     _emit(document, lines, as_json=json_output)
 
@@ -1130,18 +1293,57 @@ def run_discovery(
             "home_team": str(item.get("home_team", "")),
             "away_team": str(item.get("away_team", "")),
         }
-        for item in (listing.payload if isinstance(listing.payload, list) else [])
-        if isinstance(item, dict) and item.get("id") and _inside(item, attempt.window)
+        for item in _count_the_funnel(attempt, listing.payload)
     ]
-    attempt.event_tags = [event_tag(e["id"]) for e in attempt.events]
+    # Deduplicated: a provider repeating an event must not inflate the count.
+    attempt.event_tags = list(dict.fromkeys(event_tag(e["id"]) for e in attempt.events))
+    attempt.events_admissible = len(attempt.event_tags)
     if not attempt.events:
         raise Refused(
             ActivationStatus.COVERAGE_MISSING,
-            f"Aucun événement à venir pour {attempt.sport} dans la fenêtre déclarée. "
-            "Elle n'est pas élargie automatiquement.",
+            _discovery_reason(attempt),
+            build_receipt(attempt, ActivationStatus.COVERAGE_MISSING, secret),
         )
     return build_receipt(attempt, ActivationStatus.DISCOVERY_VERIFIED, secret), (
         ActivationStatus.DISCOVERY_VERIFIED
+    )
+
+
+def _count_the_funnel(attempt: Attempt, payload: Any) -> list[dict[str, Any]]:
+    """Record how many events survived each stage, and return the survivors.
+
+    Three integers, because the Ligue 1 attempt could not say which of three
+    things had happened: the provider returned nothing; it returned fixtures that
+    all fall outside the declared window; or it returned fixtures we refused as
+    unusable. Only the first is a calendar fact — the others would point at our
+    own filter, and re-running to find out is not consequence-free.
+
+    Integers only, never a per-event breakdown: that would put the schedule back
+    into a receipt whose whole point is to carry none of it.
+    """
+    raw = payload if isinstance(payload, list) else []
+    items = [item for item in raw if isinstance(item, dict)]
+    attempt.events_returned = len(items)
+    in_window = [item for item in items if _inside(item, attempt.window)]
+    attempt.events_in_window = len(in_window)
+    return [item for item in in_window if str(item.get("id", "")).strip()]
+
+
+def _discovery_reason(attempt: Attempt) -> str:
+    """Say which of the three findings this actually was."""
+    if attempt.events_returned == 0:
+        return (
+            f"/v4/sports/{attempt.sport}/events n'a retourné aucun événement. La réponse "
+            "est valide et vide : c'est un fait de calendrier, pas une panne."
+        )
+    if attempt.events_in_window == 0:
+        return (
+            f"{attempt.events_returned} événement(s) retourné(s), aucun dans la fenêtre "
+            "déclarée. La fenêtre n'est pas élargie automatiquement."
+        )
+    return (
+        f"{attempt.events_in_window} événement(s) dans la fenêtre, aucun exploitable "
+        "(identifiant absent ou horaire illisible). Aucun événement n'est deviné."
     )
 
 
@@ -1251,6 +1453,7 @@ def run_core(
     attempt.estimated = estimate_cost(markets=len(CORE_MARKETS), region_units=units)
     attempt.markets_requested = list(CORE_MARKETS)
     attempt.parent_receipt_id = str(parent["receipt_id"])
+    attempt.parent_schema_version = int(parent["schema_version"])
     if attempt.estimated > attempt.ceiling:
         raise Refused(
             ActivationStatus.COST_MISMATCH,
@@ -1275,7 +1478,20 @@ def run_core(
 
     raw_event = _event_of(response.payload, event_id, endpoint)
     _check_start_time(raw_event, attempt.window)
-    book = _book_of(raw_event, attempt.bookmaker, endpoint)
+
+    # The bookmaker's state is recorded, and every requested market classified,
+    # *before* anything stops. That ordering is the whole of E1: the previous
+    # version raised on an absent bookmaker and wrote a receipt whose market map
+    # was empty, which reads as "we looked and nothing was missing".
+    book = _observe_bookmaker(attempt, raw_event, CORE_MARKETS)
+    if book is None:
+        raise Refused(
+            ActivationStatus.COVERAGE_MISSING,
+            f"{endpoint} : {attempt.bookmaker} n'est pas coté sur cet événement — bookmaker "
+            "non retourné, marché non évalué. Une réponse valide sans le bookmaker demandé "
+            "est une couverture manquante, pas une panne.",
+            build_receipt(attempt, ActivationStatus.COVERAGE_MISSING, secret),
+        )
 
     batch = _parse_with_the_real_parser(
         settings,
@@ -1295,10 +1511,28 @@ def run_core(
             ActivationStatus.SCHEMA_MISMATCH,
             "Le bookmaker est présent mais le parseur n'a retenu aucune sélection : "
             f"{'; '.join(attempt.rejections) or 'aucun détail'}.",
+            build_receipt(attempt, ActivationStatus.SCHEMA_MISMATCH, secret),
         )
     return build_receipt(attempt, ActivationStatus.CORE_LIVE_VERIFIED, secret), (
         ActivationStatus.CORE_LIVE_VERIFIED
     )
+
+
+def _observe_bookmaker(
+    attempt: Attempt, raw_event: dict[str, Any], requested: tuple[str, ...]
+) -> dict[str, Any] | None:
+    """Record the bookmaker's state and a total market map, then hand back the block.
+
+    Called before any early exit so the receipt is complete on every path. When
+    the block is missing, every requested market is marked
+    ``NOT_EVALUATED_BOOKMAKER_ABSENT`` rather than left out of the map.
+    """
+    book = _book_of(raw_event, attempt.bookmaker)
+    attempt.bookmaker_state = str(
+        BookmakerState.OBSERVED if book is not None else BookmakerState.NOT_RETURNED
+    )
+    attempt.market_states = _classify_markets(requested, book, None)
+    return book
 
 
 @app.command()
@@ -1427,6 +1661,7 @@ def run_additional(
     attempt.estimated = estimate_cost(markets=len(ADDITIONAL_MARKETS), region_units=units)
     attempt.markets_requested = list(ADDITIONAL_MARKETS)
     attempt.parent_receipt_id = str(parent["receipt_id"])
+    attempt.parent_schema_version = int(parent["schema_version"])
     if attempt.estimated > attempt.ceiling:
         raise Refused(
             ActivationStatus.COST_MISMATCH,
@@ -1450,7 +1685,15 @@ def run_additional(
 
     raw_event = _event_of(response.payload, event_id, endpoint)
     _check_start_time(raw_event, attempt.window)
-    book = _book_of(raw_event, attempt.bookmaker, endpoint)
+
+    book = _observe_bookmaker(attempt, raw_event, ADDITIONAL_MARKETS)
+    if book is None:
+        raise Refused(
+            ActivationStatus.COVERAGE_MISSING,
+            f"{endpoint} : {attempt.bookmaker} n'est pas coté sur cet événement — bookmaker "
+            "non retourné, aucun des cinq marchés n'est évalué.",
+            build_receipt(attempt, ActivationStatus.COVERAGE_MISSING, secret),
+        )
 
     batch = _parse_with_the_real_parser(
         settings,
@@ -1478,9 +1721,12 @@ def _additional_status(states: dict[str, str]) -> ActivationStatus:
     Nothing returned is a coverage fact about the bookmaker. Everything returned
     and nothing usable is a fact about the contract or our parser. Some of each is
     genuinely partial, and saying so is more useful than rounding it to either
-    end.
+    end. A market never evaluated is none of those, and is handled before this
+    function is reached.
     """
     values = list(states.values())
+    if all(state == MarketState.NOT_EVALUATED_BOOKMAKER_ABSENT for state in values):
+        return ActivationStatus.COVERAGE_MISSING
     if all(state == MarketState.NOT_RETURNED for state in values):
         return ActivationStatus.COVERAGE_MISSING
     if not any(state == MarketState.OBSERVED_MAPPED for state in values):
@@ -1611,6 +1857,159 @@ def _check_core(parent: dict[str, Any], event_id: str, label: str) -> None:
             f"{label} comptabilise {accounted!r} crédit(s), au-delà du plafond de "
             f"{STEP_CEILINGS['core']}.",
         )
+
+
+# ---------------------------------------------------------------------------
+# status — what has actually happened, in five separate dimensions
+# ---------------------------------------------------------------------------
+def audit_receipts() -> tuple[list[dict[str, Any]], int]:
+    """Every locally verifiable receipt, and how many failed verification.
+
+    Read-only, and deliberately **not** a source of authority: nothing here is
+    ever passed to :func:`load_parent`. A step is authorised by a receipt the
+    operator names on the command line, never by one this function happened to
+    find. Reporting and authorising are different jobs, and conflating them is
+    what let ``additional`` pick its own proof out of a writable directory.
+
+    A file that fails signature or schema verification is counted, not read: it
+    must neither become evidence nor vanish silently.
+    """
+    directory = receipt_dir()
+    if not directory.is_dir():
+        return [], 0
+    verified: list[dict[str, Any]] = []
+    unverifiable = 0
+    for path in sorted(directory.glob("*.json")):
+        try:
+            payload = jsonlib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            unverifiable += 1
+            continue
+        if not isinstance(payload, dict):
+            unverifiable += 1
+            continue
+        if payload.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
+            unverifiable += 1
+            continue
+        if not verify_receipt(payload):
+            unverifiable += 1
+            continue
+        payload["_path"] = str(path)
+        verified.append(payload)
+    return verified, unverifiable
+
+
+def build_activation_state(receipts: list[dict[str, Any]], unverifiable: int) -> dict[str, Any]:
+    """Five dimensions, reported separately because they are separate facts.
+
+    One label cannot carry them. Two real ``core`` calls proved connectivity,
+    authentication and billing while proving nothing at all about the parser, and
+    found no coverage on the two events they looked at. Condensing that into a
+    single word loses whichever part the reader needed — and
+    ``PREPARED_NOT_EXECUTED`` in particular became simply false.
+    """
+    attempted = [r for r in receipts if r.get("network_attempted")]
+    paid = [r for r in attempted if r.get("command") in ("core", "additional")]
+    statuses = {str(r.get("status")) for r in paid}
+
+    execution = ExecutionState.NO_NETWORK_ATTEMPTED
+    if any(r.get("command") == "additional" for r in paid):
+        execution = ExecutionState.ADDITIONAL_ATTEMPTED
+    elif any(r.get("command") == "core" for r in paid):
+        execution = ExecutionState.CORE_ATTEMPTED
+    elif attempted:
+        execution = ExecutionState.DISCOVERY_ATTEMPTED
+
+    if not attempted:
+        cost_proof = CostProof.NOT_EXERCISED
+    elif statuses & {
+        str(ActivationStatus.COST_MISMATCH),
+        str(ActivationStatus.COST_UNVERIFIED),
+    }:
+        cost_proof = CostProof.EXERCISED_NONCONFORMING
+    else:
+        cost_proof = CostProof.EXERCISED_CONFORMING
+
+    mapped_live = any(int(r.get("selections_mapped") or 0) > 0 for r in paid)
+    mapping_proof = MappingProof.OBTAINED_LIVE if mapped_live else MappingProof.NOT_OBTAINED_LIVE
+
+    if not paid:
+        paid_state = PaidActivationState.PREPARED_NOT_EXECUTED
+    elif any(r.get("command") == "additional" for r in paid):
+        paid_state = PaidActivationState.ADDITIONAL_EXECUTED
+    elif mapped_live:
+        paid_state = PaidActivationState.CORE_EXECUTED_COVERAGE_OBSERVED
+    else:
+        paid_state = PaidActivationState.CORE_EXECUTED_NO_COVERAGE
+
+    return {
+        # 1. The adapter itself. A ponctual observation never promotes it.
+        "adapter_state": "IMPLEMENTED_UNVERIFIED",
+        # 2. How far the sequence has gone here.
+        "execution_state": str(execution),
+        # 3. Connectivity, authentication and billing.
+        "connectivity_and_cost_proof": str(cost_proof),
+        # 4. Coverage — a list of scoped observations, never a verdict.
+        "bookmaker_coverage_observations": [
+            {
+                "sport_key": r.get("sport_key", ""),
+                "bookmaker": r.get("bookmaker", ""),
+                "event_tag": r.get("event_tag") or "",
+                "recorded_at": r.get("recorded_at", ""),
+                "bookmaker_state": r.get("bookmaker_state") or "UNKNOWN_SCHEMA_V2",
+                "market_states": r.get("market_states") or {},
+                "status": str(r.get("status")),
+                "schema_version": r.get("schema_version"),
+            }
+            for r in paid
+        ],
+        # 5. Whether the parser and freshness path have been exercised for real.
+        "mapping_freshness_proof": str(mapping_proof),
+        "paid_activation_state": str(paid_state),
+        "accounted_credits_total": sum(int(r.get("accounted_credits") or 0) for r in receipts),
+        "verified_receipts": len(receipts),
+        "unverifiable_receipts": unverifiable,
+        "receipt_directory": str(receipt_dir()),
+        "scope_note": (
+            "Chaque observation de couverture vaut pour un fournisseur, un bookmaker, "
+            "une compétition, un événement tagué, un marché et un instant — rien de plus."
+        ),
+        "model_impact": "aucun — tous les modèles restent BACKTEST_ONLY",
+    }
+
+
+@app.command()
+def status(
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Lire l'état réel de l'activation sur cette installation. Aucun réseau."""
+    receipts, unverifiable = audit_receipts()
+    document = build_activation_state(receipts, unverifiable)
+    lines = [
+        f"Adaptateur          : {document['adapter_state']}",
+        f"Exécution           : {document['execution_state']}",
+        f"Connectivité + coût : {document['connectivity_and_cost_proof']}",
+        f"Mapping + fraîcheur : {document['mapping_freshness_proof']}",
+        f"Activation payante  : {document['paid_activation_state']}",
+        f"Crédits comptés     : {document['accounted_credits_total']}",
+        f"Reçus vérifiés      : {document['verified_receipts']}"
+        f" · non vérifiables : {document['unverifiable_receipts']}",
+        # A local path, printed as a path. It is gitignored and has no remote.
+        f"Répertoire (local)  : {document['receipt_directory']}",
+        "",
+    ]
+    if document["bookmaker_coverage_observations"]:
+        lines.append("Observations de couverture (portée stricte) :")
+        for one in document["bookmaker_coverage_observations"]:
+            lines.append(
+                f"  · {one['recorded_at']}  {one['sport_key']}  {one['bookmaker']}  "
+                f"événement {one['event_tag'][:12]}…  {one['bookmaker_state']}  "
+                f"→ {one['status']}"
+            )
+    else:
+        lines.append("Aucune observation de couverture enregistrée.")
+    lines += ["", document["scope_note"], f"Modèles : {document['model_impact']}."]
+    _emit(document, lines, as_json=json_output)
 
 
 def _iso_z(moment: datetime) -> str:

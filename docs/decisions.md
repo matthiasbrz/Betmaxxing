@@ -811,3 +811,122 @@ criteria (events, competitions, days, observed coverage rate).
 it would make the status mean "it worked once", which is not what a status is for.
 **Coût.** The promotion criteria still have to be written; the roadmap says so.
 **Limite.** Until they are, there is no path to `VERIFIED` at all — deliberately.
+
+---
+
+## Instruction 03B-4 bis — closing the gaps two real calls exposed
+
+Strictly offline: no provider call, no credit. What changed is the *evidence
+model*, because two billed `core` calls produced receipts that could not answer
+the question they were bought to answer.
+
+### D-060 — The bookmaker's presence is its own dimension
+
+**Décision.** A receipt carries `bookmaker_state` (`OBSERVED` /`NOT_RETURNED`)
+independently of `market_states`, and `market_states` gains
+`NOT_EVALUATED_BOOKMAKER_ABSENT`. The map is **total** over `markets_requested`
+on every terminal receipt whose market scope was known, and every derived list
+(`markets_mapped`, `markets_rejected`, `markets_absent`,
+`markets_not_evaluated`) is a strict projection of it, partitioning the requested
+markets exactly once.
+**Raison.** Both live `core` receipts read `markets_requested: ["h2h"]`,
+`market_states: {}`, `markets_absent: []`. That is compatible with two entirely
+different findings — the bookmaker was never quoted, or it was quoted and did not
+offer h2h — and the second is a fact about its offer while the first is a fact
+about nothing at all. Worse, `markets_absent: []` next to a requested market
+invites the reading "nothing was missing". `_book_of` raised *before*
+classification, so the map was empty by construction.
+**Coût.** One more field, one more market state, one more projection; `_book_of`
+returns instead of raising and the caller stops after recording.
+**Limite.** `OBSERVED_REJECTED` still merges "the structure was unusable" with
+"the market-level timestamp was missing". `mapping_rejections` distinguishes
+them; the state does not.
+
+### D-061 — A discovery says which of three things happened
+
+**Décision.** A discovery receipt carries `events_returned`,
+`events_in_window` and `events_admissible`, with
+`0 <= admissible <= in_window <= returned` and
+`admissible == len(set(event_tags))`. Integers only.
+**Raison.** The Ligue 1 attempt could not distinguish an empty provider response
+(a calendar fact) from a response whose fixtures all fell outside the declared
+window (which would point at our own `commenceTimeFrom`/`To` filter) from
+fixtures refused as unusable. Re-running a "free" endpoint to find out is not
+consequence-free, so the counters must be right the first time.
+**Coût.** Three integers per discovery receipt.
+**Limite.** Integers by design: a per-event breakdown would put the schedule back
+into an artefact whose whole point is to carry none of it. So the counters say
+*how many*, never *which*.
+
+### D-062 — Five proof dimensions, and a `status` command to read them
+
+**Décision.** `plan` reports `PLAN_ONLY` and defers; a new read-only `status`
+command reports `adapter_state`, `execution_state`,
+`connectivity_and_cost_proof`, `bookmaker_coverage_observations` and
+`mapping_freshness_proof`, plus a separate `paid_activation_state`.
+`PREPARED_NOT_EXECUTED` survives only where still true: a pre-network refusal, and
+the paid dimension while no paid call has been attempted.
+**Raison.** Two billed calls proved authentication, endpoint, billing, chaining
+and signature, and proved *nothing* about the parser or freshness, and found no
+coverage on the two events they looked at. One label cannot carry that, and
+`PREPARED_NOT_EXECUTED` printed by `plan` had simply become false.
+**Coût.** A fifth command, and a rename that broke two existing assertions —
+correctly.
+**Limite.** `status` reads what is on this installation's disk. Delete the receipt
+directory and it reports `NO_NETWORK_ATTEMPTED` again; it is a local audit trail,
+not an account-level one. `bookmaker_coverage_observations` stays a list of scoped
+observations and is never reduced to a verdict about the provider.
+
+### D-063 — Receipts move to schema v3, and v2 stays readable
+
+**Décision.** `RECEIPT_SCHEMA_VERSION = 3`; `SUPPORTED_SCHEMA_VERSIONS = {2, 3}`.
+A valid v2 receipt is still honoured as authority, is never rewritten and never
+re-signed, and the child records `parent_schema_version` so provenance stays
+traceable. v1 and unknown versions are refused.
+**Raison.** This is a version bump, not v2 with extra fields, because
+`market_states` changed *meaning*: partial in v2, total in v3 with a new state
+value. A reader applying v3's invariants to a v2 file would conclude that nothing
+was missing when in fact nothing was looked at — precisely what a version number
+exists to prevent. v2 nevertheless remains usable because every field the chain
+actually depends on (`event_tags`, `event_tag`, `observed_credits`,
+`accounted_credits`, `selections_mapped`, `parent_receipt_id`, `expires_at`) has
+identical meaning in both; only `market_states` and its projections changed, and
+those are not preconditions.
+**Coût.** Two supported versions to keep testing.
+**Limite.** A v2 receipt's coverage evidence stays ambiguous — it cannot be
+retro-fixed, only read for what it does say.
+
+### D-064 — A synthetic fixture earns `OFFLINE_CONTRACT_VERIFIED`, never a live status
+
+**Décision.** A wholly synthetic grouped-odds fixture exercises response →
+shape check → ingestion → mapping → freshness → signed receipt, with the
+bookmaker and `h2h` both present, order-independent across bookmakers and
+outcomes. Its proof label is `OFFLINE_CONTRACT_VERIFIED`; `MappingProof` keeps
+`OBTAINED_LIVE` for what only a real call can establish.
+**Raison.** Neither real call reached a response containing our bookmaker, so the
+success path had never been walked end to end *through the harness*. The unit
+tests covered each link; nothing covered the chain.
+**Coût.** A fixture that must be visibly synthetic and stay so.
+**Limite.** It proves our code reads the documented shape — not that the provider
+sends it. The instruction asked for a market-level timestamp in a `GROUPED_ODDS`
+fixture; the v4 guide places that field on the *bookmaker* for this endpoint
+(D-048). The fixture therefore carries the bookmaker stamp, and a second variant
+adds a market-level one to prove the grouped parser ignores it. Freshness is
+still reported per market, which is the operationally useful reading of the
+request.
+
+### D-065 — A local receipt path is a path
+
+**Décision.** Receipt paths are rendered as local code paths, never as URLs into
+the repository host. A guard test scans the versioned documents for any `http(s)`
+URL whose path reaches the receipt directory, and the harness output for any URL
+at all. (The pattern is described rather than written out here: spelling one would
+make this very paragraph fail the guard — which it did on the first run, and which
+is the guard working.)
+**Raison.** `.activation-receipts/` is gitignored. Linking to it invents a remote
+artefact that does not exist and must not: the whole point is that these files
+stay on the operator's machine.
+**Coût.** None.
+**Limite.** The guard covers this repository's documents and the harness output.
+It cannot reach conversational reports already written, and those are
+deliberately left alone.

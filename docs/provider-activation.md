@@ -1,9 +1,39 @@
 # Runbook — activation contrôlée de The Odds API
 
-> **État à la date de rédaction : `PREPARED_NOT_EXECUTED`.**
-> Aucun appel n'a été émis vers `api.the-odds-api.com`. Aucune clé réelle n'a été
-> lue, validée ou affichée. Aucun crédit n'a été consommé. L'adaptateur reste
-> `IMPLEMENTED_UNVERIFIED`, les modèles restent `BACKTEST_ONLY`.
+> **État réel : lisez-le, ne le supposez pas.**
+>
+> ```bash
+> python -m betmaxxing.providers.the_odds_api.activation status
+> ```
+>
+> Ce runbook ne peut pas énoncer l'état courant de votre installation, et il n'y a
+> plus un seul label pour le faire. Cinq dimensions sont rapportées séparément
+> (adaptateur, exécution, connectivité + coût, couverture bookmaker, mapping +
+> fraîcheur), parce qu'elles sont indépendantes : des appels payants peuvent avoir
+> prouvé l'authentification et la facturation sans rien prouver du parseur.
+>
+> Ce qui est vrai en toutes circonstances : l'adaptateur reste
+> `IMPLEMENTED_UNVERIFIED` et les modèles restent `BACKTEST_ONLY` jusqu'à une
+> décision de promotion écrite et satisfaite.
+
+### Ce qui a réellement été exercé en réel (opérations 03B-1 à 03B-4)
+
+| Dimension | État | Preuve |
+|---|---|---|
+| Découverte gratuite | **exercée, conforme** | 4 requêtes, `x-requests-last=0` à chaque fois |
+| Authentification et endpoint payant | **exercés** | 2 requêtes `/v4/sports/{sport}/odds` |
+| Comptabilité du coût | **exercée, conforme** | 2 × estimé 1 / observé 1 / comptabilisé 1 ; quota 494 → 492 |
+| Chaînage et signature des reçus | **exercés** | reçus v2 signés, parent vérifié avant réseau |
+| Couverture `winamax_fr` | **absente sur les 2 événements SPL testés**, à ces instants | `bookmaker_state = NOT_RETURNED` |
+| Mapping et fraîcheur | **non obtenus en réel** | 0 sélection cartographiée ; aucun bloc bookmaker à lire |
+| Mapping et fraîcheur, sur contrat documenté | `OFFLINE_CONTRACT_VERIFIED` | fixture **synthétique** de bout en bout |
+
+Coût réel cumulé connu de ces opérations : **2 crédits**. Ce n'est pas une
+constante de configuration, c'est un fait daté.
+
+Les deux absences SPL valent pour **ces deux événements, à ces instants**. Elles
+ne disent rien de la couverture Winamax en général chez le fournisseur, ni de
+cette compétition à un autre moment.
 
 Ce document décrit **comment** l'activation se fera, ce qu'elle coûtera, ce
 qu'elle prouvera — et surtout ce qu'elle ne prouvera pas. Il ne l'exécute pas.
@@ -126,7 +156,8 @@ que soient les régions configurées.
 
 | Statut | Signification | Autorise la suite ? |
 |---|---|---|
-| `PREPARED_NOT_EXECUTED` | rien n'a été exécuté ; statut de tout refus en amont du réseau | non |
+| `PLAN_ONLY` | `plan` a chiffré la séquence et n'affirme rien sur ce qui a été exécuté | sans objet |
+| `PREPARED_NOT_EXECUTED` | refus **avant** toute socket ; également l'état de la dimension payante tant qu'aucun appel payant n'a été tenté | non |
 | `DISCOVERY_VERIFIED` | les deux endpoints gratuits ont répondu, coût observé nul, des événements existent | oui |
 | `CORE_LIVE_VERIFIED` | un prix réel a été obtenu et cartographié pour le bookmaker demandé | oui |
 | `ADDITIONAL_LIVE_VERIFIED` | les cinq marchés sont revenus, horodatés et cartographiés | terminal |
@@ -157,16 +188,71 @@ reçus, en `O_CREAT | O_EXCL` et mode `0600`. Il n'est jamais affiché, jamais
 journalisé, jamais versionné. Les tests injectent un secret déterministe par
 `BETMAXXING_ACTIVATION_RECEIPT_SECRET` et ne dépendent d'aucun aléa réel.
 
-### Contenu
+### Contenu (schéma v3)
 
 `schema_version`, `receipt_id`, `command`, `status`, `recorded_at`, `expires_at`,
 `sport_key`, `bookmaker`, `event_tag` (ou `event_tags` pour `discover`),
 `window_from` / `window_to`, `endpoints` templatés, `attempts`,
 `network_attempted`, `may_have_reached_provider`, `estimated_credits`,
-`observed_credits`, `accounted_credits`, `quota_remaining`, marchés demandés /
-observés / absents / rejetés / cartographiés, `market_states`, `freshness` en
-secondes, `selections_mapped`, `mapping_rejections` généralisés,
-`parent_receipt_id`, `adapter_status`, `model_impact`, `signature`.
+`observed_credits`, `accounted_credits`, `quota_remaining`, **`bookmaker_state`**,
+`markets_requested`, `market_states` et ses projections (`markets_mapped`,
+`markets_rejected`, `markets_absent`, **`markets_not_evaluated`**,
+`markets_observed`), `freshness` en secondes, `selections_mapped`,
+`mapping_rejections` généralisés, `parent_receipt_id`,
+**`parent_schema_version`**, `adapter_status`, `model_impact`, `signature`.
+Pour `discover` uniquement : **`events_returned`**, **`events_in_window`**,
+**`events_admissible`**.
+
+### Deux dimensions, jamais confondues
+
+| `bookmaker_state` | Signification |
+|---|---|
+| `OBSERVED` | le bookmaker demandé est coté sur cet événement |
+| `NOT_RETURNED` | il n'est pas dans la réponse — on n'a rien pu examiner |
+
+Le champ est **absent** d'un reçu `discover` : `/v4/sports/{sport}/events` ne
+renvoie aucune information de bookmaker, donc il n'y a rien à constater. Un défaut
+à `NOT_RETURNED` s'y lirait comme un constat sur le bookmaker.
+
+| État d'un marché demandé | Signification |
+|---|---|
+| `NOT_EVALUATED_BOOKMAKER_ABSENT` | aucun bloc bookmaker à examiner : **on ne sait rien** de ce marché |
+| `NOT_RETURNED` | le bookmaker est coté et ne propose pas ce marché — fait sur son offre |
+| `OBSERVED_REJECTED` | revenu, mais inexploitable par le parseur |
+| `OBSERVED_MAPPED` | revenu, horodaté, cartographié |
+
+Le tableau est **total** : `set(market_states) == set(markets_requested)` sur tout
+reçu terminal dont la portée de marchés était connue. Les listes dérivées
+partitionnent exactement une fois les marchés demandés, donc aucune ne peut
+contredire `market_states`.
+
+Les deux reçus `core` réels illustrent précisément le défaut corrigé : ils
+portaient `markets_requested: ["h2h"]`, `market_states: {}` et
+`markets_absent: []`, ce qui se lit comme « rien ne manquait » alors que rien
+n'avait été regardé.
+
+### Compteurs de découverte
+
+| Compteur | Définition |
+|---|---|
+| `events_returned` | objets événement reçus **avant** filtrage temporel |
+| `events_in_window` | après application stricte de la fenêtre déclarée |
+| `events_admissible` | après validation minimale et déduplication |
+
+Invariants : `0 <= events_admissible <= events_in_window <= events_returned`, et
+`events_admissible == len(set(event_tags))`. Des entiers, jamais un détail par
+événement : cela remettrait le calendrier dans un artefact conçu pour n'en porter
+aucun.
+
+### Versions lues, versions écrites
+
+Les nouveaux reçus sont en **v3**. Les reçus **v2** déjà présents sur le disque
+restent lus, vérifiés et honorés comme preuve d'autorisation — chacun des champs
+dont la chaîne dépend a le même sens dans les deux versions — mais ils ne sont
+**jamais** réécrits, promus ni re-signés, et l'enfant note
+`parent_schema_version`. Le passage à v3 était nécessaire parce que
+`market_states` a changé de **sens** : partiel en v2, total en v3 avec un état
+supplémentaire. Les v1 et toute version inconnue sont refusées.
 
 Un reçu ne contient **jamais** : la clé ni un fragment de clé, le secret de
 signature, une URL non expurgée, un corps de réponse brut, une cote, un nom de
@@ -301,7 +387,9 @@ sans couverture complète → `ADDITIONAL_PARTIAL_COVERAGE` ; les cinq →
 
 ## Après l'exécution
 
-1. Reporter la date, l'événement et l'état **marché par marché** dans
+0. Lire l'état réel : `… activation status`. Il rapporte les cinq dimensions
+   séparément et ne condense rien.
+1. Reporter la date, l'état du bookmaker et l'état **marché par marché** dans
    `docs/source-matrix.md`.
 2. **Ne promouvoir aucun statut global.** Un événement, à un instant, sur une
    compétition, avec un bookmaker, est une **preuve limitée** — pas une

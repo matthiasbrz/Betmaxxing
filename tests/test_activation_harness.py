@@ -144,12 +144,20 @@ class TestPlan:
         run(*self.ARGS)
         assert recorder.requests == []
 
-    def test_it_reports_prepared_not_executed(self, workspace: Path) -> None:
-        assert "PREPARED_NOT_EXECUTED" in run(*self.ARGS).stdout
+    def test_it_reports_plan_only(self, workspace: Path) -> None:
+        """It used to report `PREPARED_NOT_EXECUTED`, which became false.
+
+        Two real `core` calls were made. A label meaning "nothing has been
+        executed", printed by a command that has no idea what has been executed,
+        is a claim it cannot support. `plan` now reports its own scope and defers
+        the activation's actual state to `status` (E3).
+        """
+        assert "PLAN_ONLY" in run(*self.ARGS).stdout
+        assert "PREPARED_NOT_EXECUTED" not in run(*self.ARGS).stdout
 
     def test_it_states_the_per_step_and_total_ceilings(self, workspace: Path) -> None:
         plan = json.loads(run(*self.ARGS, "--json").stdout)
-        assert plan["status"] == "PREPARED_NOT_EXECUTED"
+        assert plan["status"] == "PLAN_ONLY"
         assert plan["total_max_credits"] == 6
         by_step = {step["command"]: step for step in plan["steps"]}
         assert by_step["plan"]["max_credits"] == 0

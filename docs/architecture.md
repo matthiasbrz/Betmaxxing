@@ -233,5 +233,5 @@ pire que s'abstenir.
   persistante.
 - Aucune méthode d'incertitude réelle n'existe, donc `paper` et `live_analysis` ne
   publient rien aujourd'hui.
-- L'adaptateur The Odds API est `IMPLEMENTED_UNVERIFIED` : aucun appel réel n'a validé
+- L'adaptateur The Odds API est `IMPLEMENTED_UNVERIFIED` : 6 appels réels le 2026-08-07 (4 gratuits, 2 payants, 2 crédits) ont validé auth, endpoint payant et comptabilité du coût ; le **mapping des cotes reste non vérifié en réel** (`winamax_fr` absent des 2 événements testés). Aucun appel réel n'a validé
   sa couverture.
