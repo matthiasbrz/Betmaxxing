@@ -21,6 +21,7 @@ claims about PostgreSQL are only made where a PostgreSQL test backs them.
 from __future__ import annotations
 
 import os
+import socket
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,6 +33,71 @@ from betmaxxing.storage.db import create_all, get_engine, reset_engine
 
 #: A fixed instant used wherever a test needs a deterministic "now".
 FIXED_NOW = datetime(2026, 8, 4, 9, 0, 0, tzinfo=UTC)
+
+
+# ---------------------------------------------------------------------------
+# Outbound network guard
+# ---------------------------------------------------------------------------
+#: Hosts a test may legitimately reach: the loopback interface, for the local
+#: PostgreSQL cluster. AF_UNIX is allowed unconditionally — a domain socket is a
+#: file on this machine and cannot leave it.
+_ALLOWED_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "0.0.0.0"})
+
+_real_connect = socket.socket.connect
+_real_connect_ex = socket.socket.connect_ex
+
+
+class OutboundNetworkBlocked(RuntimeError):
+    """A test tried to open a socket to something that is not this machine."""
+
+
+def _permitted(self: socket.socket, address: object) -> bool:
+    if getattr(self, "family", None) == getattr(socket, "AF_UNIX", None):
+        return True
+    if isinstance(address, str | bytes):
+        return True
+    if isinstance(address, tuple) and address:
+        return str(address[0]) in _ALLOWED_HOSTS
+    return False
+
+
+def _guarded_connect(self: socket.socket, address: object) -> object:
+    if not _permitted(self, address):
+        raise OutboundNetworkBlocked(
+            f"refus de connexion sortante vers {address!r}. La suite ne joint jamais "
+            "un fournisseur : utilisez httpx.MockTransport. Seuls AF_UNIX et la "
+            "boucle locale (PostgreSQL de test) sont autorisés."
+        )
+    return _real_connect(self, address)  # type: ignore[arg-type]
+
+
+def _guarded_connect_ex(self: socket.socket, address: object) -> object:
+    if not _permitted(self, address):
+        raise OutboundNetworkBlocked(f"refus de connexion sortante vers {address!r}.")
+    return _real_connect_ex(self, address)  # type: ignore[arg-type]
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_outbound_network() -> Iterator[None]:
+    """Make "no test calls a provider" a property of the runner, not a habit.
+
+    Every provider test already injects a fake transport. That is a convention,
+    and a convention is one forgotten fixture away from a real, billed request
+    to ``api.the-odds-api.com`` from someone's laptop — with a real key in the
+    environment, during the very tranche that is preparing a *controlled*
+    activation. This makes the failure mode impossible instead of unlikely.
+
+    Subprocesses (the Alembic harness) are unaffected: they do not inherit a
+    monkeypatched method, and they only ever touch SQLite files.
+    """
+    socket.socket.connect = _guarded_connect  # type: ignore[method-assign, assignment]
+    socket.socket.connect_ex = _guarded_connect_ex  # type: ignore[method-assign, assignment]
+    try:
+        yield
+    finally:
+        socket.socket.connect = _real_connect  # type: ignore[method-assign]
+        socket.socket.connect_ex = _real_connect_ex  # type: ignore[method-assign]
+
 
 #: Set by CI (and by a developer running a local cluster) to a SQLAlchemy URL.
 #: Unset means the PostgreSQL suites skip — they never silently pass.

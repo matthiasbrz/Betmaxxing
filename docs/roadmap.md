@@ -154,7 +154,9 @@
 | Mode `paper` / `live_analysis` | ⚠️ **ne publie rien** | Conséquence directe de la ligne précédente. C'est correct |
 | Challenge — Montante | ⚠️ `PARTIAL`, désactivé | Persistant et testé, mais **désactivé par défaut** ; aucune validation d'usage réel |
 | `TheOddsApiProvider` | ⚠️ `IMPLEMENTED_UNVERIFIED` | Contrats locaux verts ; **aucun appel réel** |
-| Couverture Winamax | ❓ **non vérifiée** | Annoncée par la documentation ; non confirmée |
+| Activation fournisseur | ⚠️ `PREPARED_NOT_EXECUTED` | Quatre commandes plafonnées (0/0/1/5 crédits), reçus expurgés, garde de socket global. **Aucun appel émis, aucune clé lue, aucun crédit consommé** |
+| Couverture Winamax | ❓ **non vérifiée** | Annoncée par la documentation officielle (lue le 2026-08-05) ; non confirmée par un appel |
+| Migrations historiques | ✅ **figées** | `3ce123580afa` et `b7c1e9d24a10` n'importent plus le paquet applicatif ; rejouables à l'identique et équivalence testée |
 | Interface web | ⛔ non commencée | Tranche 6 |
 
 ---
@@ -163,7 +165,7 @@
 
 | Élément | Raison |
 |---|---|
-| Vérification réelle de The Odds API | Nécessite la clé de l'utilisateur et son accord explicite. `scripts/smoke_the_odds_api.py` est prêt |
+| Vérification réelle de The Odds API | Nécessite la clé de l'utilisateur et trois accords explicites et distincts. L'outillage est prêt et **plafonné** : `plan` (0), `discover` (0), `core` (1 crédit), `additional` (5). Statut : `PREPARED_NOT_EXECUTED`. Runbook : `docs/provider-activation.md` |
 | Méthode d'incertitude réelle | Nécessite des données historiques : bootstrap paramétrique/clusterisé + étude de couverture (D-019) |
 | Endpoints historiques (payants) | Hors périmètre : aucun appel payant sans action de l'utilisateur |
 | Pipeline d'entraînement | Nécessite des données historiques ; les modèles consomment des paramètres fournis |
@@ -204,10 +206,11 @@ Rien ici ne dépend d'un tiers ; ce sont des choix de périmètre de cette tranc
 
 ## Prochaine action recommandée
 
-1. **Exécuter l'instruction d'activation fournisseur, et seulement après validation de
-   cette tranche.** Aucun smoke test, aucune clé et aucun crédit ne doivent être
-   engagés avant. Le socle est prêt ; l'ouverture d'un accès réel est une décision
-   séparée, avec son propre périmètre.
+1. **Exécuter l'activation, étape par étape, après validation de cette tranche.**
+   L'outillage est prêt et plafonné (`docs/provider-activation.md`) ; l'ouverture
+   d'un accès réel reste une décision séparée. Trois autorisations distinctes sont
+   nécessaires, dans cet ordre : `discover` (0 crédit), puis `core` (1 crédit),
+   puis `additional` (5 crédits). Rien ne s'enchaîne tout seul.
 2. **Lire les CGU de The Odds API** et trancher le droit de rétention des réponses
    brutes. En attendant, seul le normalisé est conservé.
 3. **Constituer un jeu historique** — sans lui, ni entraînement, ni incertitude, ni

@@ -14,9 +14,9 @@ What it repairs
 * ``events.participant_pair_key`` — matching key for rows created before it existed;
 * ``event_source_map`` — one row per usable ``events.source_ids`` entry, idempotent,
   refusing rather than overwriting a collision;
-* ``odds_snapshots.line_canonical`` — computed with the domain's own ``canonical_line``
-  so ``2.5``, ``2.50`` and ``2.500`` converge; a value that cannot be represented
-  stops the migration instead of receiving an invented key.
+* ``odds_snapshots.line_canonical`` — computed with a frozen copy of the domain's
+  ``canonical_line`` so ``2.5``, ``2.50`` and ``2.500`` converge; a value that
+  cannot be represented stops the migration instead of receiving an invented key.
 
 What it adds
 ------------
@@ -36,6 +36,22 @@ losing them on the way down is data loss, not a tidy-up. A provider id already
 present in the column with a conflicting value stops the downgrade by name rather
 than being overwritten.
 
+Frozen, deliberately
+--------------------
+The backfills used to call ``betmaxxing.domain.ids.normalize_participant`` and
+``betmaxxing.domain.models.canonical_line``. Both are ordinary domain code and
+both are allowed to change — add a noise token, widen ``MAX_LINE_DP`` — and the
+moment either does, replaying this revision writes different matching keys than
+it wrote the first time, from identical rows. Worse, renaming or moving either
+symbol turns this file into an ``ImportError``, and Alembic imports every script
+in this directory to build its revision map: one broken import disables *every*
+migration command on a database that still needs them.
+
+``_normalize_participant`` and ``_canonical_line`` below are frozen copies,
+pinned against the live domain by ``tests/test_migration_isolation.py``. If the
+domain deliberately moves on, that test fails and the divergence is decided
+explicitly rather than discovered later in the data.
+
 Revision ID: b7c1e9d24a10
 Revises: 3ce123580afa
 Create Date: 2026-08-05 09:10:00.000000
@@ -44,18 +60,92 @@ Create Date: 2026-08-05 09:10:00.000000
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from collections.abc import Sequence
+from decimal import Decimal, InvalidOperation
 
 import sqlalchemy as sa
 from alembic import op
-
-from betmaxxing.domain.ids import normalize_participant
-from betmaxxing.domain.models import canonical_line
 
 revision: str = "b7c1e9d24a10"
 down_revision: str | None = "3ce123580afa"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Frozen copies of the domain rules this revision was written against
+# ---------------------------------------------------------------------------
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+#: Tokens carrying no discriminating information in a team or player name.
+#: Frozen at this revision: adding one later would change the key an already
+#: migrated row received, and matching keys must not move under stored data.
+_NOISE_TOKENS = frozenset(
+    {
+        "fc",
+        "cf",
+        "sc",
+        "ac",
+        "afc",
+        "cd",
+        "ud",
+        "us",
+        "sv",
+        "vfl",
+        "vfb",
+        "bsc",
+        "club",
+        "de",
+        "the",
+    }
+)
+
+#: Decimal places beyond which a line is a parsing error, not a market.
+_MAX_LINE_DP = 3
+
+
+def _slugify(value: str) -> str:
+    """Lower-case, accent-free, punctuation-free token stream."""
+    decomposed = unicodedata.normalize("NFKD", value)
+    ascii_only = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return _NON_ALNUM.sub("-", ascii_only.lower()).strip("-")
+
+
+def _normalize_participant(name: str) -> str:
+    """Frozen copy of ``betmaxxing.domain.ids.normalize_participant``.
+
+    Drops club-name noise tokens but never the last remaining token, so "FC"
+    alone still normalises to something non-empty.
+    """
+    slug = _slugify(name)
+    tokens = [t for t in slug.split("-") if t]
+    meaningful = [t for t in tokens if t not in _NOISE_TOKENS]
+    return "-".join(meaningful or tokens)
+
+
+def _canonical_line(value: Decimal | int | str) -> str:
+    """Frozen copy of ``betmaxxing.domain.models.canonical_line``.
+
+    ``2.50`` and ``2.500`` collapse onto ``2.5`` while genuinely different lines
+    stay apart. Non-finite values and anything finer than three decimal places
+    are refused: they signal a parsing error, and no market key is invented for
+    a number we cannot represent.
+    """
+    try:
+        dec = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"line is not a valid decimal: {value!r}") from exc
+    if not dec.is_finite():
+        raise ValueError(f"line must be finite, got {value!r}")
+    if -int(dec.as_tuple().exponent) > _MAX_LINE_DP:
+        raise ValueError(f"line has more than {_MAX_LINE_DP} decimal places: {value!r}")
+    normalised = dec.normalize()
+    # normalize() renders integers in exponent form (2E+1); expand them back.
+    if normalised == normalised.to_integral_value():
+        normalised = normalised.quantize(Decimal(1))
+    return format(normalised, "f")
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +159,7 @@ def _backfill_participant_pair_key(connection: sa.Connection) -> None:
         )
     ).fetchall()
     for canonical_id, sport, home, away in rows:
-        key = f"{sport}|{normalize_participant(home)}|{normalize_participant(away)}"
+        key = f"{sport}|{_normalize_participant(home)}|{_normalize_participant(away)}"
         connection.execute(
             sa.text("UPDATE events SET participant_pair_key = :key WHERE canonical_id = :cid"),
             {"key": key, "cid": canonical_id},
@@ -136,7 +226,7 @@ def _backfill_line_canonical(connection: sa.Connection) -> None:
     ).fetchall()
     for fingerprint, line in rows:
         try:
-            value = canonical_line(repr(float(line)))
+            value = _canonical_line(repr(float(line)))
         except (ValueError, TypeError, OverflowError) as exc:
             raise RuntimeError(
                 f"Migration refusée : le snapshot {fingerprint!r} porte une ligne "

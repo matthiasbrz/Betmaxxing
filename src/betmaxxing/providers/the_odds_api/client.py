@@ -121,15 +121,66 @@ def parse_quota(headers: Any) -> QuotaInfo:
     )
 
 
-def estimate_cost(*, markets: int, regions: int) -> int:
+#: v4 bills a group of this many bookmakers as one regional unit.
+BOOKMAKERS_PER_REGION_UNIT = 10
+
+
+def _distinct(raw: Any) -> list[str]:
+    """Normalise a bookmaker/region setting to distinct, comparable tokens.
+
+    Accepts what the settings and the callers actually hold: a list, a single
+    string, or a comma-separated string. Padding, blanks, duplicates and case
+    differences all describe the same billed entity, so they collapse — the
+    provider counts what it receives after its own de-duplication, and a bound
+    computed from ``["eu", "EU"]`` as two units refuses calls that cost one.
+    """
+    if raw is None:
+        return []
+    items = [raw] if isinstance(raw, str) else list(raw)
+    tokens = [
+        token.strip().lower() for item in items for token in str(item).split(",") if token.strip()
+    ]
+    return list(dict.fromkeys(tokens))
+
+
+def effective_region_units(*, bookmakers: Any, regions: Any) -> int:
+    """Regional units one odds call will actually be billed for.
+
+    Official rule, re-read at <https://the-odds-api.com/liveapi/guides/v4/> on
+    2026-08-05: *"When both `bookmakers` and `regions` are specified,
+    `bookmakers` takes priority. Every group of 10 bookmakers is the equivalent
+    of 1 region."*
+
+    The adapter counted the *configured regions* even while sending
+    ``bookmakers=winamax_fr``, so a single-bookmaker call under ``regions=eu,fr``
+    reserved two units where the provider charges one. That never overspends —
+    the reservation is an upper bound — but it refuses calls the budget could
+    afford, and a guard that fires on correct requests is a guard that gets
+    widened until it protects nothing.
+
+    Never returns zero: a billable request costs at least one unit, and an empty
+    configuration must not make the bound vanish.
+    """
+    books = _distinct(bookmakers)
+    if books:
+        return -(-len(books) // BOOKMAKERS_PER_REGION_UNIT)
+    return max(1, len(_distinct(regions)))
+
+
+def estimate_cost(*, markets: int, region_units: int) -> int:
     """Estimated credit cost of one odds call.
 
-    The published v4 rule is ``markets x regions`` (so 1 for a single-market,
-    single-region call). Treated strictly as an **upper bound** for the budget
-    guard: the authoritative figure is ``x-requests-last``, read back from the
-    response and used to update the spend counter.
+    The published v4 rule is ``markets x regions``. ``region_units`` is that
+    second factor *as the provider will count it* — see
+    :func:`effective_region_units`, which resolves the bookmakers-take-priority
+    rule. Passing configured regions directly is what this signature exists to
+    prevent.
+
+    Strictly an **upper bound** for the budget guard. The authoritative figure is
+    ``x-requests-last``, read back from the response and used to correct the
+    spend counter afterwards.
     """
-    return max(1, markets) * max(1, regions)
+    return max(1, markets) * max(1, region_units)
 
 
 class TheOddsApiClient:

@@ -190,13 +190,20 @@ Ce qu'il fait, et ce que « fait » veut dire ici :
 « Demandé et persisté » est prouvé **sur fixture locale**, pas contre le service réel.
 La distinction est le sujet de tout ce paragraphe.
 
-Pour vérifier la couverture réelle vous-même :
+Pour vérifier la couverture réelle vous-même — **statut : `PREPARED_NOT_EXECUTED`**,
+aucun appel n'a encore été émis. Quatre étapes indépendantes, plafonnées et
+autorisées séparément (`plan` 0, `discover` 0, `core` 1 crédit, `additional`
+5 crédits) :
 
 ```bash
-export BETMAXXING_THE_ODDS_API_KEY=...   # votre clé, jamais versionnée
-export BETMAXXING_SMOKE_TEST=1
-python scripts/smoke_the_odds_api.py
+export BETMAXXING_THE_ODDS_API_KEY=...   # votre clé, jamais versionnée, jamais en argument
+python -m betmaxxing.providers.the_odds_api.activation plan \
+    --sport soccer_france_ligue_one --bookmaker winamax_fr --max-credits 6
 ```
+
+Runbook complet : **`docs/provider-activation.md`**. L'ancien script `smoke` est une
+redirection : il demandait un booléen puis appelait `collect([FOOTBALL, TENNIS],
+window)`, un éventail dont personne ne pouvait annoncer le coût.
 
 Une réponse valide sans Winamax est `COVERAGE_MISSING`, pas une panne — et ne déclenche
 jamais le mode démo. Détails et marchés refusés : `docs/source-matrix.md`.

@@ -152,16 +152,26 @@ class Recorder:
         if path.endswith("/sports"):
             return httpx.Response(200, json=SPORTS_PAYLOAD, headers=QUOTA_HEADERS)
 
+        # v4 puts `last_update` on the bookmaker for `/odds` and on each market
+        # for `/events/{id}/odds`. Serving one shape for both endpoints made
+        # these fixtures agree with the parser instead of with the API.
+        per_event = "/events/" in path
+
         if TENNIS_KEY in path:
             blocks = [TENNIS_BLOCKS[k] for k in wanted if k in TENNIS_BLOCKS]
             payload = self._event(
-                "evt-tn-1", TENNIS_KEY, "Alejandro Tabilo", "Rafael Jodar", blocks
+                "evt-tn-1",
+                TENNIS_KEY,
+                "Alejandro Tabilo",
+                "Rafael Jodar",
+                blocks,
+                per_event=per_event,
             )
         else:
             blocks = [MARKET_BLOCKS[k] for k in wanted if k in MARKET_BLOCKS]
-            payload = self._event("evt-fb-1", FOOTBALL_KEY, HOME, AWAY, blocks)
+            payload = self._event("evt-fb-1", FOOTBALL_KEY, HOME, AWAY, blocks, per_event=per_event)
 
-        if "/events/" in path:
+        if per_event:
             return httpx.Response(200, json=payload, headers=QUOTA_HEADERS)
         return httpx.Response(200, json=[payload], headers=QUOTA_HEADERS)
 
@@ -172,8 +182,21 @@ class Recorder:
 
     @staticmethod
     def _event(
-        event_id: str, sport_key: str, home: str, away: str, blocks: list[dict[str, Any]]
+        event_id: str,
+        sport_key: str,
+        home: str,
+        away: str,
+        blocks: list[dict[str, Any]],
+        *,
+        per_event: bool,
     ) -> dict[str, Any]:
+        stamp = (NOW - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        book: dict[str, Any] = {"key": "winamax_fr", "title": "Winamax"}
+        if per_event:
+            book["markets"] = [{**block, "last_update": stamp} for block in blocks]
+        else:
+            book["last_update"] = stamp
+            book["markets"] = blocks
         return {
             "id": event_id,
             "sport_key": sport_key,
@@ -181,14 +204,7 @@ class Recorder:
             "commence_time": (NOW + timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "home_team": home,
             "away_team": away,
-            "bookmakers": [
-                {
-                    "key": "winamax_fr",
-                    "title": "Winamax",
-                    "last_update": (NOW - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "markets": blocks,
-                }
-            ],
+            "bookmakers": [book],
         }
 
     # -- inspection ---------------------------------------------------------

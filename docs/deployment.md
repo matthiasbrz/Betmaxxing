@@ -114,18 +114,45 @@ réponse d'API : le client masque `apiKey=` avant toute sortie.
 `BETMAXXING_ODDS_API_KEY` reste accepté par compatibilité mais est **déprécié** ; un
 avertissement le signale, sans jamais afficher la valeur.
 
-### Smoke test (opt-in, consomme des crédits réels)
+### Activation contrôlée (opt-in, consomme des crédits réels)
+
+**Statut : `PREPARED_NOT_EXECUTED`.** Runbook complet :
+**`docs/provider-activation.md`**.
+
+L'activation se fait en quatre commandes indépendantes, chacune plafonnée et
+autorisée séparément :
+
+| Commande | Réseau | Plafond | Endpoints |
+|---|---|---|---|
+| `plan` | non | 0 | aucun — aucun client HTTP construit |
+| `discover` | oui | 0 | `/v4/sports`, `/v4/sports/{sport}/events` |
+| `core` | oui | 1 | `/v4/sports/{sport}/odds?eventIds=…` |
+| `additional` | oui | 5 | `/v4/sports/{sport}/events/{id}/odds` |
 
 ```bash
 export BETMAXXING_THE_ODDS_API_KEY=...
-export BETMAXXING_SMOKE_TEST=1
-python scripts/smoke_the_odds_api.py
+python -m betmaxxing.providers.the_odds_api.activation plan \
+    --sport soccer_france_ligue_one --bookmaker winamax_fr --max-credits 6
 ```
 
-C'est le **seul** code du dépôt qui appelle réellement le service. Il n'est ni
-collecté par pytest, ni exécuté par la CI, et refuse de démarrer sans les deux
-variables. Il ne touche aucun endpoint historique (payant) et ne modifie aucun statut
-de validation.
+C'est le **seul** code du dépôt capable d'appeler réellement le service. Il n'est
+ni collecté par pytest, ni exécuté par la CI. Chaque étape réseau exige
+`--allow-network`, une clé présente dans l'environnement, une portée singulière
+(une compétition, un bookmaker, un événement, 24 h au plus) et — pour les étapes
+payantes — `--max-credits` **et** `--acknowledge-credits` égaux au plafond publié.
+Aucune tentative n'est répétée (`max_retries=0`) : un réessai est une seconde
+requête facturée. Aucun endpoint historique (payant) n'est joignable et aucun
+statut de validation n'est modifié.
+
+`scripts/smoke_the_odds_api.py` est conservé comme **redirection** et n'émet plus
+aucun appel : sa version précédente demandait un booléen puis appelait
+`collect([FOOTBALL, TENNIS], window)`, dont le coût n'était annonçable par
+personne à l'avance.
+
+Les reçus locaux atterrissent sous `.activation-receipts/` (ou
+`BETMAXXING_ACTIVATION_RECEIPTS`). Le répertoire est dans `.gitignore` ; les reçus
+ne contiennent ni clé, ni URL non expurgée, ni corps brut, ni cote, ni nom de
+participant, et l'identifiant d'événement y est haché.
 
 ## Exploitation de l'identité des événements
 

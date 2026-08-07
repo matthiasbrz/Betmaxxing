@@ -64,7 +64,37 @@ def budget_settings(db_settings: Settings, **overrides: Any) -> Settings:
 # ---------------------------------------------------------------------------
 # Fixture payloads
 # ---------------------------------------------------------------------------
-def football_event(*, markets: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def football_event(
+    *, markets: list[dict[str, Any]] | None = None, per_event: bool = False
+) -> dict[str, Any]:
+    """One raw event in whichever v4 shape the endpoint returns.
+
+    ``per_event`` selects the ``/events/{id}/odds`` contract, where the guide
+    states the timestamp *"is only available on the market level in the response
+    and not on the bookmaker level"*. Serving the grouped shape for both
+    endpoints made these fixtures agree with the parser rather than with the API.
+    """
+    stamp = (NOW - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    blocks = (
+        markets
+        if markets is not None
+        else [
+            {
+                "key": "h2h",
+                "outcomes": [
+                    {"name": "Olympique Lyonnais", "price": 1.63},
+                    {"name": "Stade Rennais", "price": 5.00},
+                    {"name": "Draw", "price": 4.20},
+                ],
+            }
+        ]
+    )
+    book: dict[str, Any] = {"key": "winamax_fr", "title": "Winamax"}
+    if per_event:
+        book["markets"] = [{**block, "last_update": stamp} for block in blocks]
+    else:
+        book["last_update"] = stamp
+        book["markets"] = blocks
     return {
         "id": "evt-fb-1",
         "sport_key": FOOTBALL_KEY,
@@ -72,25 +102,7 @@ def football_event(*, markets: list[dict[str, Any]] | None = None) -> dict[str, 
         "commence_time": (NOW + timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "home_team": "Olympique Lyonnais",
         "away_team": "Stade Rennais",
-        "bookmakers": [
-            {
-                "key": "winamax_fr",
-                "title": "Winamax",
-                "last_update": (NOW - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "markets": markets
-                if markets is not None
-                else [
-                    {
-                        "key": "h2h",
-                        "outcomes": [
-                            {"name": "Olympique Lyonnais", "price": 1.63},
-                            {"name": "Stade Rennais", "price": 5.00},
-                            {"name": "Draw", "price": 4.20},
-                        ],
-                    }
-                ],
-            }
-        ],
+        "bookmakers": [book],
     }
 
 
@@ -373,8 +385,9 @@ class TestAdditionalMarketsAreCollected:
                     },
                     *blocks,
                 ]
-            payload = football_event(markets=blocks)
-            if "/events/" in str(request.url):
+            per_event = "/events/" in str(request.url)
+            payload = football_event(markets=blocks, per_event=per_event)
+            if per_event:
                 return httpx.Response(200, json=payload, headers=QUOTA_HEADERS)
             return httpx.Response(200, json=[payload], headers=QUOTA_HEADERS)
 

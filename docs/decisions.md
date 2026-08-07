@@ -585,3 +585,123 @@ that requires hand-written SQL is a place where a control could go.
 **Limite.** Resolving a review governs future attribution. Snapshots already
 recorded are **not** re-attributed: a decision today must not rewrite what a past
 scan is supposed to have seen.
+
+---
+
+## Instruction 03A — preparing a controlled activation
+
+Nothing in this section calls The Odds API. It makes the future call safe,
+bounded and auditable *before* a key exists. Statuses are unchanged: the
+provider stays `IMPLEMENTED_UNVERIFIED`, the activation is
+`PREPARED_NOT_EXECUTED`, models stay `BACKTEST_ONLY`, uncertainty outside the
+demo stays `UNAVAILABLE`, and the Challenge stays `PARTIAL` and off by default.
+
+### D-048 — The response shape is declared by the caller, never inferred
+
+**Décision.** `_ingest_event()` takes a required `shape=` argument
+(`ResponseShape.GROUPED_ODDS` or `EVENT_ODDS`). Grouped `/odds` reads
+`last_update` on the bookmaker; `/events/{id}/odds` reads it on each market and
+keeps the per-market instants distinct.
+**Raison.** v4 says plainly: *"The `last_update` field is only available on the
+market level in the response and not on the bookmaker level."* The adapter read
+`book["last_update"]` for both, and the local fixtures were green because they
+had been written from the code rather than from the contract. The first real
+per-event response would have had every bookmaker rejected for a missing
+timestamp, and the additional markets — five of the seven football markets —
+would have collected nothing while still being billed.
+Inference from the payload was rejected: it would silently accept a response of
+the wrong shape, which is exactly the contract change we want to be told about.
+**Coût.** Both call sites must state their endpoint. Two test fixtures were wrong
+and had to be corrected to the real contract, not the code.
+**Limite.** On the per-event endpoint a bookmaker-level stamp is ignored even if
+present. A missing or unusable stamp rejects only the unit it belongs to, and no
+date is ever substituted — not `received_at`, not `commence_time`, not the
+neighbouring market's.
+
+### D-049 — Cost is estimated in effective regional units
+
+**Décision.** `effective_region_units(bookmakers=…, regions=…)` resolves the
+billing rule; `estimate_cost(markets=…, region_units=…)` no longer accepts
+regions at all.
+**Raison.** Official rule, re-read 2026-08-05: *"When both `bookmakers` and
+`regions` are specified, `bookmakers` takes priority. Every group of 10
+bookmakers is the equivalent of 1 region."* The adapter counted the configured
+regions while sending `bookmakers=winamax_fr`, so a one-bookmaker call under
+`regions=eu,fr` reserved two units where the provider charges one. That never
+overspends — the reservation is an upper bound — but it refuses calls the budget
+could afford, and a guard that fires on correct requests gets widened until it
+guards nothing.
+**Coût.** A signature change and one existing test retargeted.
+**Limite.** Still an upper bound. `x-requests-last` remains the authority after
+the call, and a possibly-billed timeout still keeps its reservation (D-041).
+
+### D-050 — Activation is four commands with separately authorised ceilings
+
+**Décision.** `plan` (0 credits, no network, no client, no key read), `discover`
+(0, two documented-free endpoints), `core` (1, one event/one market/one
+bookmaker), `additional` (5, the five per-event markets). Each paid step requires
+`--allow-network`, `--max-credits` equal to its published ceiling and
+`--acknowledge-credits` repeating it. `max_retries=0`. No command calls another,
+and `additional` refuses without a `CORE_LIVE_VERIFIED` receipt for the same
+event. There is no `--api-key` option.
+**Raison.** The previous script took one boolean and then called
+`collect([FOOTBALL, TENNIS], window)` — a fan-out of one grouped request per
+configured sport key plus one per-event request per football event, bounded only
+by the 50-credit scan budget. A boolean is not a spending limit. Nobody could
+state, before running it, what that script would cost.
+**Coût.** Four invocations instead of one, and two numbers typed by hand per paid
+step.
+**Limite.** Two identical numbers are still a weak proof of intent — but they
+cannot be supplied without knowing what the step costs, which a boolean could.
+
+### D-051 — Receipts are local, sanitised and gitignored
+
+**Décision.** Each successful network step writes one JSON receipt under
+`.activation-receipts/` (or `BETMAXXING_ACTIVATION_RECEIPTS`): command, status,
+instant, templated endpoint, response shape, competition, bookmaker, **hashed**
+event id, ceiling, reported cost, markets requested/observed/absent, per-market
+freshness **in seconds**, mapped selection count, generalised rejection reasons.
+Never: the key or a fragment of it, an unredacted URL, a raw body, an odd, a
+participant name, or the event id in clear.
+**Raison.** An activation has to be auditable months later, and the auditable
+part is what was called, what it cost and whether our parser coped — not the
+prices. Anything else is a liability in a file nobody remembers writing.
+**Coût.** The receipt cannot be used to reconstruct a market state.
+**Limite.** The event-id hash is unsalted, because `additional` must recognise
+the receipt `core` wrote across processes. It resists casual reading, not a
+dictionary attack over a provider's public fixture list.
+
+### D-052 — The suite cannot open an outbound socket
+
+**Décision.** `tests/conftest.py` patches `socket.socket.connect`/`connect_ex`
+for the whole session. `AF_UNIX` and the loopback (the test PostgreSQL) are
+allowed; everything else raises.
+**Raison.** "Every provider test injects a fake transport" was a convention, and
+a convention is one forgotten fixture away from a real, billed request to
+`api.the-odds-api.com` from a machine that has a real key in its environment —
+during the very tranche preparing a controlled activation.
+**Coût.** A test genuinely needing an external host would have to opt out
+explicitly. None does.
+**Limite.** Subprocesses do not inherit the patch. The Alembic harness only ever
+touches SQLite files.
+
+### D-053 — A historical migration depends on nothing that may change
+
+**Décision.** `3ce123580afa` and `b7c1e9d24a10` no longer import `betmaxxing`.
+They carry frozen copies of `to_cents`, `normalize_participant` and
+`canonical_line`. An AST guard plus a loaded-symbol guard forbid the import in
+any version script, an isolation test imports each revision with the package
+blocked from `sys.meta_path`, and equivalence tests pin the frozen copies against
+the live domain.
+**Raison.** The coupling had already bitten: `to_cents` rounded `1.005` to 100
+cents until the previous tranche fixed it to 101, so two databases migrated from
+byte-identical documents carry different balances with nothing recording which
+rule applied. A money value that depends on *when* you ran the upgrade is not an
+audit trail. And renaming or moving any of those symbols would turn an old
+revision into an `ImportError` — Alembic imports every script in the directory to
+build its revision map, so one unreachable import disables every migration
+command, including those unrelated to that revision.
+**Coût.** Three small duplications, each pinned by an equivalence test.
+**Limite.** If the domain deliberately changes a rule, the equivalence test fails
+and the divergence must be decided explicitly: write a corrective revision, or
+leave history as it was. That is the point, not a defect.

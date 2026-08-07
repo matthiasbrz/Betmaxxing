@@ -72,7 +72,7 @@ n'a effectué **aucun appel** vers le service et n'a consommé **aucun crédit**
 | Critère | État | Vérifié le |
 |---|---|---|
 | Sports et marchés couverts | `À vérifier` sur les pages officielles | — |
-| Présence de `winamax_fr` (zones `fr`/`eu`) | **Annoncé** par l'instruction 02 ; **non confirmé** par un appel | — |
+| Présence de `winamax_fr` (zones `fr`/`eu`) | **Annoncé** par la documentation officielle (lue le 2026-08-05) ; **non confirmé** par un appel | — |
 | Winamax présent sur un événement donné | `À vérifier` — la présence dans une liste ne prouve rien par événement | — |
 | Accès aux marchés additionnels selon le plan | `À vérifier` | — |
 | Historique (endpoints payants) | **Non utilisé.** Interfaces et estimateur de coût seulement | — |
@@ -130,6 +130,63 @@ Une compétition inactive n'est pas interrogée du tout — inutile de payer un 
 une réponse vide. Une réponse `/sports` illisible est traitée comme un **échec de
 découverte** (repli sur l'allowlist, avec avertissement), pas comme « rien n'est en
 saison » : la confusion inverse annulerait silencieusement toute la collecte.
+
+### Deux formes de réponse, deux contrats
+
+Vérifié sur <https://the-odds-api.com/liveapi/guides/v4/> le **2026-08-05** :
+
+| Endpoint | Où vit `last_update` |
+|---|---|
+| `GET /v4/sports/{sport}/odds` | sur **chaque bookmaker** |
+| `GET /v4/sports/{sport}/events/{eventId}/odds` | sur **chaque marché** |
+
+Le guide est explicite : *« The `last_update` field is only available on the
+market level in the response and not on the bookmaker level. »*
+
+L'adaptateur lisait `book["last_update"]` pour les deux. Les fixtures locales
+étaient vertes parce qu'elles avaient été écrites d'après le code, pas d'après le
+contrat : la **première** réponse réelle de l'endpoint par événement aurait vu
+tous ses bookmakers rejetés pour horodatage manquant, et les marchés additionnels
+n'auraient rien collecté.
+
+La forme est désormais **déclarée par l'appelant** (`ResponseShape.GROUPED_ODDS`
+ou `EVENT_ODDS`), jamais devinée depuis la charge utile : une déduction
+accepterait silencieusement une réponse de la mauvaise forme, c'est-à-dire
+exactement le changement de contrat dont nous voulons être avertis.
+
+Conséquence gardée volontairement : sur l'endpoint par événement, deux marchés du
+même bookmaker conservent **leurs** horodatages distincts. Les aplatir sur un seul
+instant rendrait indiscernables un prix vieux de cinq minutes et un prix vieux de
+cinq heures — ce qui est précisément l'entrée du contrôle de fraîcheur. Un
+horodatage absent ou illisible rejette **la seule unité concernée** (le bookmaker
+en forme groupée, le marché en forme par événement) et n'invente jamais de date :
+ni `received_at`, ni `commence_time`, ni celle du marché voisin.
+
+### Coût d'un appel : unités régionales effectives
+
+Règle officielle, relue le **2026-08-05** :
+
+> `cost = [number of markets specified] x [number of regions specified]`
+>
+> *« When both `bookmakers` and `regions` are specified, `bookmakers` takes
+> priority. Every group of 10 bookmakers is the equivalent of 1 region. »*
+
+L'estimateur comptait les **régions configurées** alors même que la requête
+envoyait `bookmakers=winamax_fr`. Avec `regions=eu,fr`, un appel à un seul
+bookmaker réservait deux unités là où le fournisseur en facture une. Cela ne fait
+jamais dépenser trop — la réservation est une borne supérieure — mais cela refuse
+des appels que le budget pouvait payer, et un garde qui se déclenche sur des
+requêtes correctes finit élargi jusqu'à ne plus rien garder.
+
+`effective_region_units(bookmakers=…, regions=…)` applique la règle : des
+bookmakers présents priment, par groupes de dix arrondis vers le haut ; sinon les
+régions distinctes ; jamais zéro. `estimate_cost(markets=…, region_units=…)` ne
+prend plus de régions du tout, pour que l'erreur ne puisse pas revenir par la
+signature. Espaces, doublons et casse sont normalisés : `["eu", "EU"]` désigne une
+seule région facturée.
+
+La borne reste conservatrice avant l'appel ; `x-requests-last` reste l'autorité
+après.
 
 ### Marchés explicitement refusés
 
@@ -235,14 +292,31 @@ explicite distinct de celui d'un scan.
 
 ### Comment vérifier vous-même
 
+**Statut de l'activation : `PREPARED_NOT_EXECUTED`.** La procédure complète est
+dans **`docs/provider-activation.md`**. En résumé, quatre étapes indépendantes,
+plafonnées et autorisées séparément :
+
+| Commande | Réseau | Plafond | Endpoints |
+|---|---|---|---|
+| `plan` | non | 0 | aucun — aucun client HTTP construit |
+| `discover` | oui | 0 | `/v4/sports`, `/v4/sports/{sport}/events` |
+| `core` | oui | 1 | `/v4/sports/{sport}/odds?eventIds=…` |
+| `additional` | oui | 5 | `/v4/sports/{sport}/events/{id}/odds` |
+
 ```bash
-export BETMAXXING_THE_ODDS_API_KEY=...   # votre clé, jamais versionnée
-export BETMAXXING_SMOKE_TEST=1
-python scripts/smoke_the_odds_api.py
+export BETMAXXING_THE_ODDS_API_KEY=...   # votre clé, jamais versionnée, jamais en argument
+python -m betmaxxing.providers.the_odds_api.activation plan \
+    --sport soccer_france_ligue_one --bookmaker winamax_fr --max-credits 6
 ```
 
-Le script effectue le minimum d'appels, masque la clé, rapporte les crédits et la
-couverture constatée, et **ne modifie aucun statut de validation**. Reportez la
+L'ancien `scripts/smoke_the_odds_api.py` demandait **un booléen** puis appelait
+`collect([FOOTBALL, TENNIS], window)` : un éventail d'un appel groupé par
+compétition configurée plus un appel par événement football, borné par le seul
+budget de scan. Personne ne pouvait annoncer son coût à l'avance. Le script
+subsiste comme redirection et n'émet plus aucun appel.
+
+Chaque étape masque la clé, rapporte les crédits annoncés, écrit un reçu local
+expurgé (non versionné) et **ne modifie aucun statut de validation**. Reportez la
 date et le constat dans le tableau ci-dessus.
 
 Aucun compte payant n'a été créé et aucun achat n'a été effectué.

@@ -20,3 +20,7 @@ data/runs/
 data/manual/*.csv
 !data/manual/example_odds.csv
 .DS_Store
+
+# Local activation receipts: operating records of real, billed provider calls.
+# They belong to the operator, never to the repository.
+.activation-receipts/

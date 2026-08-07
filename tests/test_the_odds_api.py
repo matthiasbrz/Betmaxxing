@@ -297,9 +297,15 @@ class TestQuotaAndBudget:
     def test_unparseable_quota_header_is_ignored(self) -> None:
         assert parse_quota({"x-requests-remaining": "many"}).remaining is None
 
-    def test_cost_estimate_multiplies_markets_by_regions(self) -> None:
-        assert estimate_cost(markets=2, regions=2) == 4
-        assert estimate_cost(markets=1, regions=1) == 1
+    def test_cost_estimate_multiplies_markets_by_regional_units(self) -> None:
+        """The second factor is now `region_units` — what v4 will actually bill.
+
+        See `tests/test_cost_units.py`: `bookmakers` takes priority over
+        `regions`, so the caller resolves the unit count with
+        `effective_region_units` and passes the result here.
+        """
+        assert estimate_cost(markets=2, region_units=2) == 4
+        assert estimate_cost(markets=1, region_units=1) == 1
 
     def test_a_call_over_budget_is_refused_before_it_runs(self) -> None:
         """The guard fires before the request, so quota cannot be spent by mistake."""

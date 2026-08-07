@@ -15,6 +15,23 @@ Additive by design. Existing rows keep their data:
 ids are *derived* — opaque instead of hashed from date and participants — so no
 existing row needs rewriting.
 
+Frozen, deliberately
+--------------------
+This revision used to compute the bank with ``betmaxxing.challenge.to_cents``.
+That made the result of replaying it depend on whatever the domain means *at
+replay time*, which is not a property a historical record may have — and it had
+already bitten: ``to_cents`` rounded ``1.005`` to 100 cents until the previous
+tranche fixed it to 101, so two databases migrated from byte-identical documents
+carry different balances with nothing recording which rule applied. Renaming or
+moving the symbol would have been worse still: Alembic imports every script in
+this directory to build the revision map, so one unreachable import breaks every
+migration command, including those that have nothing to do with this revision.
+
+``_to_cents`` below is therefore a frozen copy, and it never changes again. If
+the domain's rule is deliberately changed, ``tests/test_migration_isolation.py``
+fails and the choice becomes explicit: either write a corrective revision, or
+leave history as it was.
+
 Revision ID: 3ce123580afa
 Revises: 65c32b5e3f63
 Create Date: 2026-08-05 06:20:24.151443
@@ -25,11 +42,10 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Sequence
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 import sqlalchemy as sa
 from alembic import op
-
-from betmaxxing.challenge import ChallengeError, to_cents
 
 revision: str = "3ce123580afa"
 down_revision: str | None = "65c32b5e3f63"
@@ -53,6 +69,34 @@ QUARANTINE_REASON = (
 
 class UnusableChallengeDocument(RuntimeError):
     """A challenge row whose bank cannot be reconstructed from what was stored."""
+
+
+def _to_cents(amount: object) -> int:
+    """Round half-up to the cent — a frozen copy of the domain's rule.
+
+    Kept identical to ``betmaxxing.challenge.to_cents`` as of this tranche, and
+    pinned against it by ``tests/test_migration_isolation.py``. It is duplicated
+    rather than imported so replaying this revision gives the same answer for
+    ever; see the module docstring.
+
+    ``Decimal(str(amount))`` reads the number as written rather than as the
+    nearest binary double, so a document that says ``1.005`` means 1.005 and
+    lands on 101 cents. ``float(x) * 100`` then ``round()`` is banker's rounding
+    applied to a value that has already drifted, and it answered 100.
+
+    Refuses rather than substituting: a boolean, ``None``, a non-finite value or
+    unreadable text all mean "we do not know this balance", and no bank is
+    invented for a money-tracking record.
+    """
+    if isinstance(amount, bool) or amount is None:
+        raise UnusableChallengeDocument(f"montant invalide : {amount!r}")
+    try:
+        value = Decimal(str(amount).strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise UnusableChallengeDocument(f"montant illisible : {amount!r}") from exc
+    if not value.is_finite():
+        raise UnusableChallengeDocument(f"montant non fini : {amount!r}")
+    return int(value.scaleb(2).quantize(Decimal(1), rounding=ROUND_HALF_UP))
 
 
 def _bank_cents_from(document_json: str | None, steps: list[str]) -> int:
@@ -80,16 +124,9 @@ def _bank_cents_from(document_json: str | None, steps: list[str]) -> int:
     config = document.get("config")
     if not isinstance(config, dict) or "initial_bank" not in config:
         raise UnusableChallengeDocument("config.initial_bank absent")
-    # The domain's own conversion, imported rather than reimplemented. A second
-    # rounding rule for the same money is a second answer to "what is the
-    # balance", and `float(...)` then `round(...)` really was a different rule:
-    # it is binary rounding on a value that has already drifted.
-    raw = config["initial_bank"]
-    if isinstance(raw, bool) or raw is None:
-        raise UnusableChallengeDocument(f"config.initial_bank invalide : {raw!r}")
     try:
-        return to_cents(raw)
-    except ChallengeError as exc:
+        return _to_cents(config["initial_bank"])
+    except UnusableChallengeDocument as exc:
         raise UnusableChallengeDocument(f"config.initial_bank inexploitable ({exc})") from exc
 
 

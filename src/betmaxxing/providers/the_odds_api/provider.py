@@ -1,9 +1,11 @@
 """The Odds API v4 odds provider.
 
 **Status: IMPLEMENTED_UNVERIFIED.** Every behaviour below is exercised against
-recorded local fixtures; none of it has been run against the live service. The
-opt-in smoke test (``scripts/smoke_the_odds_api.py``) is the only thing that can
-change that, and it requires the user's own key and explicit action.
+recorded local fixtures; none of it has been run against the live service. Only
+the bounded activation harness
+(:mod:`betmaxxing.providers.the_odds_api.activation`, runbook in
+``docs/provider-activation.md``) can change that, and it requires the user's own
+key plus a separate authorisation per step.
 
 Behaviour worth stating plainly:
 
@@ -20,6 +22,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from betmaxxing.config import Settings
@@ -42,6 +45,7 @@ from betmaxxing.providers.budget import ProviderBudgetLedger
 from betmaxxing.providers.the_odds_api.client import (
     TheOddsApiAuthError,
     TheOddsApiClient,
+    effective_region_units,
     estimate_cost,
     redact,
 )
@@ -55,6 +59,30 @@ from betmaxxing.providers.the_odds_api.mapping import (
 logger = logging.getLogger("betmaxxing.the_odds_api")
 
 PROVIDER_NAME = "the_odds_api"
+
+
+class ResponseShape(StrEnum):
+    """Which v4 endpoint produced a payload. They are two different contracts.
+
+    Confirmed against <https://the-odds-api.com/liveapi/guides/v4/> on
+    2026-08-05. ``GET /v4/sports/{sport}/odds`` carries ``last_update`` on each
+    **bookmaker**. ``GET /v4/sports/{sport}/events/{eventId}/odds`` carries it on
+    each **market**, and the guide says so explicitly: *"The `last_update` field
+    is only available on the market level in the response and not on the
+    bookmaker level."*
+
+    The parser used to read ``book["last_update"]`` for both, so every bookmaker
+    in a real per-event response would have been rejected for a missing
+    timestamp and the additional markets would have collected nothing. The shape
+    is therefore declared by the caller — the only place that knows which URL was
+    requested — and never inferred from the payload: inference would silently
+    accept a response of the wrong shape, which is precisely the contract change
+    we want to be told about.
+    """
+
+    GROUPED_ODDS = "grouped_odds"
+    EVENT_ODDS = "event_odds"
+
 
 #: Markets requested in the grouped, one-call-per-league request, **per sport**.
 #:
@@ -172,7 +200,12 @@ class TheOddsApiProvider:
             bookmakers=list(self._bookmakers),
         )
         wanted = set(sports)
-        regions = len([r for r in self._settings.the_odds_api_regions.split(",") if r.strip()])
+        # Both odds calls below send `bookmakers=`, which takes priority over
+        # `regions=` in v4's billing. Counting the configured regions instead
+        # over-reserved and refused calls the budget could afford.
+        region_units = effective_region_units(
+            bookmakers=self._bookmakers, regions=self._settings.the_odds_api_regions
+        )
 
         keys = self._sport_keys_to_poll(wanted, batch)
 
@@ -193,7 +226,7 @@ class TheOddsApiProvider:
                 continue
             attempted += 1
             try:
-                cost = estimate_cost(markets=len(markets), regions=regions)
+                cost = estimate_cost(markets=len(markets), region_units=region_units)
                 response = self._client.get(
                     f"sports/{sport_key}/odds",
                     params={
@@ -224,11 +257,18 @@ class TheOddsApiProvider:
 
             for raw_event in response.payload or []:
                 any_event_seen = True
-                seen = self._ingest_event(raw_event, sport, window, received_at, batch)
+                seen = self._ingest_event(
+                    raw_event,
+                    sport,
+                    window,
+                    received_at,
+                    batch,
+                    shape=ResponseShape.GROUPED_ODDS,
+                )
                 any_bookmaker_seen = any_bookmaker_seen or seen
                 if seen and additional_markets_for(sport):
                     self._collect_additional_markets(
-                        sport_key, raw_event, sport, window, received_at, batch, regions
+                        sport_key, raw_event, sport, window, received_at, batch, region_units
                     )
 
         batch.coverage = self._classify_coverage(
@@ -336,7 +376,7 @@ class TheOddsApiProvider:
         window: tuple[datetime, datetime],
         received_at: datetime,
         batch: CollectionBatch,
-        regions: int,
+        region_units: int,
     ) -> None:
         """Fetch the optional markets for one event, if the budget allows.
 
@@ -366,7 +406,7 @@ class TheOddsApiProvider:
                     "dateFormat": "iso",
                     "bookmakers": ",".join(self._bookmakers),
                 },
-                cost=estimate_cost(markets=len(extra), regions=regions),
+                cost=estimate_cost(markets=len(extra), region_units=region_units),
             )
         except BudgetExceeded as exc:
             batch.partial_errors.append(f"{event_id} : marchés additionnels ignorés — {exc}")
@@ -386,7 +426,9 @@ class TheOddsApiProvider:
             payload = payload[0] if payload else None
         if not isinstance(payload, dict):
             return
-        self._ingest_event(payload, sport, window, received_at, batch)
+        self._ingest_event(
+            payload, sport, window, received_at, batch, shape=ResponseShape.EVENT_ODDS
+        )
 
     def _ingest_event(
         self,
@@ -395,8 +437,14 @@ class TheOddsApiProvider:
         window: tuple[datetime, datetime],
         received_at: datetime,
         batch: CollectionBatch,
+        *,
+        shape: ResponseShape,
     ) -> bool:
-        """Map one event. Returns whether a configured bookmaker appeared."""
+        """Map one event under a declared endpoint contract.
+
+        Returns whether a configured bookmaker appeared. ``shape`` is required
+        and not inferred — see :class:`ResponseShape`.
+        """
         try:
             event_id = str(raw_event["id"])
             home = str(raw_event["home_team"])
@@ -431,14 +479,39 @@ class TheOddsApiProvider:
             if self._bookmakers and key not in self._bookmakers:
                 continue
             matched = True
-            try:
-                last_update = parse_iso(str(book["last_update"]), "last_update")
-            except (KeyError, MappingRejected) as exc:
-                batch.partial_errors.append(f"{key}: {exc}")
-                continue
+
+            book_update: datetime | None = None
+            if shape is ResponseShape.GROUPED_ODDS:
+                # The whole bookmaker block shares one instant here, so an
+                # unusable one costs every price it carries. Rejecting the
+                # bookmaker is the honest outcome: without a source time there
+                # is nothing to measure staleness against, and `received_at`
+                # would claim the price was fresh at the moment we read it.
+                try:
+                    book_update = _last_update_of(book, f"{key} (réponse groupée)")
+                except MappingRejected as exc:
+                    batch.partial_errors.append(f"{key}: {exc}")
+                    continue
 
             for market_block in book.get("markets") or []:
                 market_key = str(market_block.get("key", ""))
+
+                if book_update is not None:
+                    last_update = book_update
+                else:
+                    # Event-odds: the stamp lives on the market, and only there.
+                    # A bookmaker-level value on this endpoint is ignored even if
+                    # present — the contract says it is absent, so trusting it
+                    # would hide a contract change instead of surfacing one. One
+                    # unusable market must not discard the ones beside it.
+                    try:
+                        last_update = _last_update_of(
+                            market_block, f"{key}/{market_key} (réponse par événement)"
+                        )
+                    except MappingRejected as exc:
+                        batch.partial_errors.append(f"{key}/{market_key}: {exc}")
+                        continue
+
                 try:
                     mapped = map_market(
                         provider_market_key=market_key,
@@ -504,6 +577,20 @@ class TheOddsApiProvider:
     @property
     def coverage(self) -> CollectionStatus:
         return self._coverage
+
+
+def _last_update_of(block: Any, label: str) -> datetime:
+    """Read one ``last_update`` field, or refuse.
+
+    Absent, null, and unparseable are all the same answer: we do not know when
+    this price was true. Nothing is substituted for it — not ``received_at``, not
+    the event's ``commence_time``, not a neighbouring market's stamp. A fabricated
+    source time makes a stale price look fresh, which is the one error the
+    staleness check exists to catch.
+    """
+    if not isinstance(block, dict) or block.get("last_update") in (None, ""):
+        raise MappingRejected(f"last_update absent de {label} — aucune date n'est supposée")
+    return parse_iso(str(block["last_update"]), "last_update")
 
 
 def _iso_z(moment: datetime) -> str:

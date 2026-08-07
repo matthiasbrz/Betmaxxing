@@ -1,124 +1,77 @@
 #!/usr/bin/env python
-"""Opt-in smoke test against the real The Odds API.
+"""Deprecated entry point. The activation is now four separate, bounded steps.
 
-**This is the only code in the repository that performs a real, credit-consuming
-call, and it never runs by itself.** It is not collected by pytest, not run by
-CI, and refuses to start without an explicit environment variable.
+What this script used to do
+---------------------------
+Ask for one boolean (``BETMAXXING_SMOKE_TEST=1``) and then call
+``provider.collect([FOOTBALL, TENNIS], window)``. That is a fan-out: one grouped
+odds request per configured sport key, then one per-event request for every
+football event returned, bounded only by the per-scan budget. A boolean is not a
+spending limit. Nobody could state, before running it, what it would cost.
 
-    export BETMAXXING_THE_ODDS_API_KEY=...        # your key, never committed
-    export BETMAXXING_SMOKE_TEST=1                # explicit consent
-    python scripts/smoke_the_odds_api.py
+What replaces it
+----------------
+:mod:`betmaxxing.providers.the_odds_api.activation` — four commands, each with a
+ceiling checked before any socket is opened, each authorised on its own:
 
-What it does
-------------
-* one grouped odds request per configured sport key (a handful of credits);
-* reports the quota headers the service returned;
-* reports whether the configured bookmaker actually appeared, and which markets
-  were mapped or rejected.
+    python -m betmaxxing.providers.the_odds_api.activation plan \\
+        --sport soccer_france_ligue_one --bookmaker winamax_fr --max-credits 6
 
-What it does **not** do
------------------------
-* touch a historical (paid) endpoint;
-* create a candidate, write a scan, or change any model's validation status;
-* print the API key, in any form, anywhere.
+    # 0 credits, two endpoints documented as free
+    ... discover --sport … --bookmaker … --allow-network
 
-Until this succeeds, the adapter's status stays ``IMPLEMENTED_UNVERIFIED``. A
-green run tells you the coverage you actually have; it does not validate a model.
+    # 1 credit, one event, one market
+    ... core --sport … --bookmaker … --event-id … \\
+        --max-credits 1 --acknowledge-credits 1 --allow-network
+
+    # 5 credits, same event, five per-event markets
+    ... additional --sport … --bookmaker … --event-id … \\
+        --max-credits 5 --acknowledge-credits 5 --allow-network
+
+The key comes from ``BETMAXXING_THE_ODDS_API_KEY`` in the environment. There is
+no ``--api-key`` option, by construction.
+
+This file is kept only so an operator following an older note is redirected
+rather than left with a missing script. It performs no network call of its own.
+See ``docs/provider-activation.md`` for the full runbook.
 """
 
 from __future__ import annotations
 
-import os
 import sys
-from collections import Counter
-from datetime import timedelta
 
-from betmaxxing.config import get_settings
-from betmaxxing.domain.enums import Sport
-from betmaxxing.domain.timeutil import format_display, utc_now
-from betmaxxing.providers.base import ProviderError
-from betmaxxing.providers.the_odds_api import TheOddsApiProvider
+from betmaxxing.providers.the_odds_api.activation import app
 
-CONSENT_VARIABLE = "BETMAXXING_SMOKE_TEST"
+MESSAGE = """\
+Ce script est remplacé. Il consommait un nombre de crédits que personne ne
+pouvait annoncer à l'avance (un appel groupé par compétition configurée, puis
+un appel par événement).
+
+L'activation se fait désormais en quatre étapes plafonnées et autorisées
+séparément :
+
+  python -m betmaxxing.providers.the_odds_api.activation plan \\
+      --sport <clé> --bookmaker <clé> --max-credits 6
+
+  ... discover   --allow-network                                     0 crédit
+  ... core       --event-id <id> --max-credits 1 --acknowledge-credits 1
+  ... additional --event-id <id> --max-credits 5 --acknowledge-credits 5
+
+La clé provient de BETMAXXING_THE_ODDS_API_KEY, jamais d'un argument.
+Runbook complet : docs/provider-activation.md
+"""
 
 
-def main() -> int:
-    if os.environ.get(CONSENT_VARIABLE) != "1":
-        print(
-            f"Refus : {CONSENT_VARIABLE}=1 est requis.\n"
-            "Ce script consomme des crédits réels chez The Odds API. "
-            "Il ne s'exécute jamais sans consentement explicite."
-        )
+def main(argv: list[str] | None = None) -> int:
+    """Print the redirection, or forward explicit arguments to the harness."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args:
+        print(MESSAGE)
         return 2
-
-    settings = get_settings()
-    if not settings.resolved_the_odds_api_key:
-        print(
-            "Refus : aucune clé configurée. Définissez BETMAXXING_THE_ODDS_API_KEY "
-            "dans votre environnement (jamais dans un fichier versionné)."
-        )
-        return 2
-
-    for warning in settings.deprecation_warnings():
-        print(f"! {warning}")
-
-    now = utc_now()
-    window = (now, now + timedelta(hours=settings.window_hours))
-    provider = TheOddsApiProvider(settings, now=now)
-
-    print("=" * 72)
-    print("SMOKE TEST — The Odds API v4 (appels réels, crédits consommés)")
-    print(f"Fenêtre        : {format_display(window[0])} → {format_display(window[1])}")
-    print(f"Bookmakers     : {', '.join(settings.bookmaker_list) or '(aucun)'}")
-    print(f"Régions        : {settings.the_odds_api_regions}")
-    print(f"Sports         : {', '.join(settings.the_odds_api_sport_key_list)}")
-    print(f"Budget/scan    : {settings.provider_budget_per_scan} crédits")
-    print("=" * 72)
-
-    try:
-        batch = provider.collect([Sport.FOOTBALL, Sport.TENNIS], window)
-    except ProviderError as exc:
-        # Provider errors already carry redacted URLs.
-        print(f"\nÉCHEC : {exc}")
-        return 1
-
-    print(f"\nÉvénements     : {len(batch.events)}")
-    print(f"Snapshots      : {len(batch.snapshots)}")
-    print(f"Couverture     : {batch.coverage}")
-    print(
-        "Quota          : "
-        f"restants={batch.quota.remaining} utilisés={batch.quota.used} "
-        f"coût du dernier appel={batch.quota.last_cost}"
-    )
-
-    if batch.snapshots:
-        markets = Counter(f"{s.selection.market}/{s.selection.period}" for s in batch.snapshots)
-        print("\nMarchés cartographiés :")
-        for name, count in sorted(markets.items()):
-            print(f"  · {name}: {count} sélection(s)")
-
-        books = Counter(s.bookmaker for s in batch.snapshots)
-        print("\nBookmakers observés :")
-        for name, count in sorted(books.items()):
-            print(f"  · {name}: {count}")
-    else:
-        print(
-            "\nAucun snapshot. Couverture manquante n'est PAS une panne : la réponse "
-            "peut être correcte sans contenir le bookmaker demandé."
-        )
-
-    if batch.partial_errors:
-        print("\nRejets et erreurs partielles (aucune donnée valide perdue) :")
-        for error in batch.partial_errors[:20]:
-            print(f"  · {error}")
-
-    print("\n" + "=" * 72)
-    print(
-        "Ce test confirme (ou non) la couverture observée à cet instant.\n"
-        "Il ne valide aucun modèle : tous restent BACKTEST_ONLY.\n"
-        "Mettez à jour docs/source-matrix.md avec la date et le constat."
-    )
-    return 0 if batch.snapshots else 1
+    # An operator who already knows the new interface can reach it from here;
+    # every ceiling and consent check still applies, unchanged.
+    app(args=args, standalone_mode=False)
+    return 0
 
 
 if __name__ == "__main__":
