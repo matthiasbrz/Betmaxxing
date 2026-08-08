@@ -63,7 +63,27 @@ rien qui serait faux.
 | Crédits comptabilisés | |
 | Autorisation d'activation reçue | `oui` / `non` / `sans objet` |
 
+## Quatre décisions distinctes
+
+Ouvrir cette PR, la voir verte, la passer en `ready for review` et la **fusionner**
+sont **quatre décisions distinctes**, prises séparément :
+
+| Décision | Qui, et sur quoi |
+| --- | --- |
+| **Ouvrir** la PR | l'auteur ; n'autorise rien d'autre |
+| Les checks **verts** | la CI ; un constat, pas une permission |
+| Passer en `ready for review` | le propriétaire, explicitement — une PR reste **brouillon** tant qu'il ne l'a pas demandé |
+| **Fusionner** | le propriétaire, par une **autorisation explicite** et séparée |
+
+Une PR verte n'est donc pas une PR relue, et une PR relue n'est pas une PR
+autorisée à fusionner. Fermer la PR et supprimer sa branche sont encore deux
+décisions de plus.
+
 ## Checklist
+
+Cochez ce que vous avez réellement fait. Une case cochée est une **déclaration de
+l'auteur**, pas une preuve : elle ne remplace ni les checks, ni la relecture du
+diff.
 
 - [ ] Aucun secret, clé, jeton ni mot de passe dans le diff
 - [ ] `.env.example` ne contient que des noms de variables et des valeurs vides
@@ -76,7 +96,8 @@ rien qui serait faux.
       ajouté pour obtenir du vert
 - [ ] Je comprends que **l'ouverture de cette PR n'autorise pas sa fusion** :
       les checks `quality` et `secrets` doivent passer, les conversations être
-      résolues, et la fusion exige l'autorisation explicite du propriétaire
+      résolues, le passage en `ready for review` être demandé par le
+      propriétaire, et la fusion exige son autorisation explicite
 
 <!-- Si une case ne s'applique pas, laissez-la décochée et écrivez `sans objet` à
 côté. Une case cochée à tort est pire qu'une case vide. -->

@@ -81,11 +81,28 @@ partir d'un clone à jour de la branche par défaut
 → fusionner, et seulement après autorisation explicite du propriétaire
 ```
 
-Avant fusion, GitHub exige :
+Avant fusion, le ruleset de la branche par défaut est **configuré**, d'après
+l'**attestation du propriétaire**, pour exiger :
 
 - les deux checks requis en succès : **`quality`** et **`secrets`** ;
-- la branche source **à jour** avec la branche cible ;
+- la branche source **à jour** avec la branche cible (mode strict) ;
 - toutes les **conversations résolues**.
+
+Ce que valent ces trois lignes comme preuve n'est pas identique, et la nuance est
+utile le jour où une fusion est refusée sans explication :
+
+- l'exigence des deux checks a une **preuve comportementale observée** : un push
+  vers une branche de travail a été refusé par le ruleset avec
+  `GH013 — 2 of 2 required status checks are expected`, ce qui n'aurait pas pu se
+  produire si les checks n'étaient pas requis ;
+- le **mode strict « branche à jour »** et la **résolution des conversations**
+  restent **attestés** et non relus : les endpoints REST de protection de branche
+  et de rulesets répondent `403` dans l'environnement d'audit, y compris sur un
+  endpoint de contrôle, donc la configuration détaillée n'est pas lisible ici.
+
+Cette distinction ne change rien à ce que vous devez faire : appliquez les trois
+règles. Elle dit seulement lesquelles ont été vérifiées et lesquelles reposent sur
+une déclaration.
 
 Deux points qu'on confond souvent :
 

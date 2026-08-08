@@ -1081,13 +1081,30 @@ together, and each of which is useless alone:
 4. **the history scan**, because a clean tip proves nothing: a value emptied by a
    later commit still lives in the blob its first commit points at;
 5. **versioned policy** — `CONTRIBUTING.md`, `SECURITY.md` and the pull-request
-   template, with static tests over them, so the rules cannot quietly drift away
-   from the repository they describe.
+   template, with static tests over them, so a rule that is *removed* from the
+   repository stops being invisible.
 
 The pull-request template belongs on that list for a reason that is easy to
 dismiss: it forces a *declaration*. Provider calls, endpoints, attempts and
 credits have to be written down even when they are all zero. Zero is an answer;
 silence is not, and silence is what preceded both incidents.
+
+**How much the static tests over that policy actually guarantee.** Less than the
+first version of this entry claimed, and the correction matters because an
+overstated guarantee is itself a governance defect. A pre-merge review of the
+first pull request took `CONTRIBUTING.md`, rewrote it to assert the *opposite* of
+every rule — direct pushes fine, checks optional, secrets acceptable — and ran the
+suite: 46 of 47 tests passed, and the single failure was an accident of line
+wrapping rather than a detection. `tests/test_repository_governance.py` matches
+markers, so it cannot distinguish a rule from its inversion, and it does not see a
+contradiction between two paragraphs or a qualifier quietly deleted from a
+sentence. What it does catch is the **removal** of a topic or of a name the
+repository still uses — a deleted section, a job renamed in `ci.yml` while the
+policy keeps the old name. That is a real property and it is the whole of it.
+Meaning stays with the human review of the diff, and no count of passing tests
+replaces it. The suite's own docstring now says so, and its phrase searches go
+through one normalisation function, because the near-miss above was decided by a
+newline.
 
 **What is observed and what is merely attested.** `protected: true` is read back
 from GitHub for the default branch. Everything underneath it — pull request

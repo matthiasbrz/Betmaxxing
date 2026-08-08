@@ -21,16 +21,38 @@ Aucune version n'est distribuée sous forme de paquet ou de release : il n'y a r
 
 ## Signaler un problème
 
-Utilisez le **Private Vulnerability Reporting** de GitHub s'il est activé sur ce
-dépôt (onglet *Security* → *Report a vulnerability*). À défaut, passez par un canal
-privé déjà établi avec le propriétaire du dépôt.
+Dans cet ordre, en s'arrêtant au premier qui est disponible.
+
+1. **Private Vulnerability Reporting** de GitHub, **s'il est activé** sur ce dépôt
+   (onglet *Security* → *Report a vulnerability*). C'est la voie préférée : le
+   rapport est privé dès la première ligne.
+2. Un **canal privé déjà établi** avec le propriétaire du dépôt, si vous en avez un.
+3. À défaut des deux — et c'est le cas d'un rapporteur externe si le premier n'est
+   pas activé — ouvrez une **issue publique minimale** qui demande **uniquement un
+   moyen de contact privé**. Par exemple, en entier :
+
+   > Bonjour. J'ai un rapport de sécurité concernant ce dépôt et je ne vois pas de
+   > canal privé. Pouvez-vous activer le Private Vulnerability Reporting, ou
+   > indiquer un moyen de contact privé ?
+
+   Rien de plus : **aucun détail technique**, aucune description du défaut, aucun
+   chemin de fichier, aucun exploit, aucun extrait de journal, **aucune valeur
+   sensible**. Le contenu du rapport n'existe qu'une fois le canal privé ouvert.
 
 **N'ouvrez jamais une issue publique, une pull request ou un commentaire contenant
 un secret**, même partiellement masqué, même « expiré ». Un dépôt public est
-indexable, et un commentaire supprimé reste souvent récupérable.
+indexable, et un commentaire supprimé reste souvent récupérable. Cette interdiction
+est absolue et s'applique aussi au point 3 ci-dessus.
 
-Aucune adresse de contact n'est publiée ici volontairement : ce dépôt n'expose pas
-de coordonnées personnelles.
+**Si ce que vous avez trouvé est une clé exposée, la première action n'est pas de
+la signaler : c'est la révocation ou la rotation chez le fournisseur**, par qui en
+a le pouvoir. Un signalement, même privé, ne neutralise rien ; voir la procédure
+plus bas. Si la clé n'est pas la vôtre, le point 3 reste le bon geste — demander un
+canal, sans dire de quelle clé il s'agit.
+
+Aucune adresse e-mail, aucun formulaire et aucun délai de réponse ne sont promis
+ici : ce dépôt n'expose pas de coordonnées personnelles, et un canal inventé ne
+serait pas un canal.
 
 ## Trois choses différentes, à ne pas confondre
 
@@ -107,8 +129,11 @@ Les fichiers de gouvernance eux-mêmes sont testés contre ces règles, dans
 - Un hook pre-commit applique le même garde **avant** que le commit existe.
 - La CI le rejoue en filet de sécurité, sur l'arbre suivi et sur tous les blobs
   atteignables de l'historique.
-- La branche par défaut est protégée par un ruleset : pas de push direct, deux
-  checks requis, branche à jour, conversations résolues.
+- La branche par défaut est protégée par un ruleset, configuré d'après
+  l'attestation du propriétaire pour refuser le push direct et exiger deux checks,
+  une branche à jour et les conversations résolues. Le refus du push et l'exigence
+  des deux checks ont été observés ; le reste est attesté et non relu, la
+  configuration détaillée répondant `403`. Voir `CONTRIBUTING.md`.
 - La suite de tests bloque les connexions sortantes et efface les variables
   secrètes de l'environnement ambiant, pour qu'un échec de test ne puisse pas
   imprimer une clé réelle.
