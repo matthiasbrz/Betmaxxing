@@ -45,22 +45,30 @@ What does *not* fail it is a rule losing its normative force while its
 vocabulary stays inside the inspected section. Measured, not supposed: a review
 deleted the prohibition on direct pushes, and separately the requirement for
 explicit merge authorisation, each time leaving the same words in the same
-section as a non-binding remark — **74 of 74 tests passed both times**. Move the
-same words further away and a test does fail, which shows what is really being
-watched: the marker's presence in a scope, not the obligation.
+section as a non-binding remark — **74 of 74 tests passed both times**, and it
+has stayed green at every test count since. Move the same words further away and
+a test does fail, which shows what is really being watched: the marker's
+presence in a scope, not the obligation.
 
 So a green run here means the shapes are still in place. Whether they still
 oblige anyone — their meaning — is a question for the human review of the diff,
 and no result from this file substitutes for it.
 
-Why the searches stay loose about phrasing
-------------------------------------------
+Why the searches stay loose about phrasing, and where they do not
+----------------------------------------------------------------
 A test that pins a sentence gets deleted the first time someone improves the
-sentence, and its rule leaves with it. So these look for identifiers and short
-propositions rather than sentences, and everything goes through `normalise` so a
-line wrap or a pair of asterisks cannot decide the outcome. The negative guards
-below are a handful of named regressions, chosen because a review found them —
-not an attempt to enumerate every way a document could lie.
+sentence, and its rule leaves with it. So most of these look for identifiers and
+short propositions rather than sentences, and everything goes through `normalise`
+so a line wrap or a pair of asterisks cannot decide the outcome.
+
+One place is deliberately strict instead. The positive contract below pins the
+reviewed D-070 proposition. It does not judge novel prose: changing the
+proposition requires changing its test in the same diff, making the decision
+visible to human review. That replaced a regex that claimed to *recognise*
+overclaiming prose and was measured catching 4 of 10 rule-level rewrites —
+including the one a review asked it to catch. `OVERCLAIMS` remains a short list
+of exact phrases already rejected; it is explicitly not a family, and a rewrite
+avoiding those words passes it.
 """
 
 from __future__ import annotations
@@ -143,34 +151,40 @@ def mentions_any(haystack: str, *needles: str) -> bool:
     return any(needle in haystack for needle in needles)
 
 
-#: Crude sentence split on normalised text. `:` counts as a boundary because the
-#: claim this guards against was written as "… stating plainly: <claim>".
-_SENTENCE_BOUNDARY = re.compile(r"(?<=[.;:!?])\s+")
-
-_RULE_WORD = re.compile(r"\brules?\b|\brègles?\b")
-_VISIBILITY_CLAIM = re.compile(
-    r"becomes? visible|devien\w* visible|stops? being invisible|cesse\w* d'être invisible"
-    r"|cannot drift|cannot quietly drift|prevents? (?:the )?(?:rules?|drift)"
+#: The reviewed wording of D-070's fifth barrier item, normalised. Pinned rather
+#: than pattern-matched: an earlier attempt tried to *recognise* overclaiming
+#: prose and a review measured it catching 4 of 10 rule-level rewrites, including
+#: the one it was asked to catch. Equality of the whole item is checkable; open
+#: paraphrase is not.
+D070_VERSIONED_POLICY_ITEM = (
+    "5. versioned policy — contributing.md, security.md and the pull-request "
+    "template, with static tests over them, so the absence of a required "
+    "governance artefact or section, the disappearance of a selected marker from "
+    "the scope actually inspected, or a stale name cross-checked with the "
+    "repository becomes visible."
 )
 
+#: One numbered item of D-070's list, with its indented continuation lines. Stops
+#: at the blank line that ends the list item, so an appended clause stays inside
+#: the captured text and therefore breaks the equality.
+_D070_ITEM_5 = re.compile(r"^5\.[ \t]+.*(?:\n[ \t]+.*)*", re.MULTILINE)
 
-def sentences_claiming_a_rule_becomes_visible(text: str) -> list[str]:
-    """Sentences that promise rule-level detection — a formulation guard, not semantics.
 
-    The suite matches markers. Saying so is fine; saying that *a rule* becomes
-    visible is not, because a review removed two normative rules while leaving
-    their vocabulary in the inspected section and the whole suite stayed green.
-    Sentence-scoped on purpose: a sentence may name a rule, and a sentence may
-    talk about visibility, but one sentence claiming both is the overclaim.
+def d070_versioned_policy_items() -> list[str]:
+    """Every occurrence of item 5 in D-070, normalised. Expected: exactly one.
 
-    This is a string check on one paragraph. It cannot tell whether a document is
-    honest — only whether it repeats the one phrasing a review rejected.
+    A narrow extraction on purpose. Returning a list rather than a string lets
+    the caller distinguish "absent" from "duplicated" instead of guessing.
     """
-    return [
-        sentence
-        for sentence in _SENTENCE_BOUNDARY.split(normalise(text))
-        if _RULE_WORD.search(sentence) and _VISIBILITY_CLAIM.search(sentence)
-    ]
+    text = read(DECISIONS)
+    heading = re.compile(r"^#{1,6}[ \t]+D-070", re.MULTILINE).search(text)
+    if heading is None:
+        pytest.fail("docs/decisions.md has no D-070 entry")
+    body = text[heading.end() :]
+    closing = re.search(r"^#{1,3}[ \t]+\S", body, re.MULTILINE)
+    if closing is not None:
+        body = body[: closing.start()]
+    return [normalise(item) for item in _D070_ITEM_5.findall(body)]
 
 
 class TestTheGovernanceArtefactsExist:
@@ -455,43 +469,46 @@ class TestTheNormalisationDoesNotDecideTheOutcome:
         assert "autorisation explicite du propriétaire" in flat(CONTRIBUTING)
 
 
-class TestTheRuleVisibilityGuardIsItselfTested:
-    """Synthetic strings only — the formulation guard must not be taken on trust."""
+class TestTheReviewedD070PropositionIsPinned:
+    """A positive contract on one exact location, not a judge of new prose.
 
-    @pytest.mark.parametrize(
-        "claim",
-        (
-            "The guarantee: a rule deleted outright becomes visible.",
-            "Ainsi, une règle supprimée devient visible.",
-            "Static tests over them, so a rule that is removed stops being invisible.",
-            "These tests prevent the rules from drifting.",
-        ),
-    )
-    def test_it_catches_a_sentence_promising_rule_level_detection(self, claim: str) -> None:
-        assert sentences_claiming_a_rule_becomes_visible(claim) != []
+    The previous mechanism tried to *recognise* prose that overclaims. A review
+    measured it: 4 of 10 rule-level rewrites were caught, and the one the review
+    asked for was not. So this asks a question a string comparison can answer —
+    is item 5 still the proposition that was reviewed? — and leaves the question
+    it cannot answer to the human reading the diff.
 
-    @pytest.mark.parametrize(
-        "honest",
-        (
-            "A missing section becomes visible; a rule losing its normative force does not.",
-            "It matches markers, so it cannot tell a rule from its inverse.",
-            "Removing a rule while its vocabulary stays in the inspected section leaves 74 green.",
-            "An absent artefact becomes visible.",
-        ),
-    )
-    def test_it_does_not_fire_on_an_honest_limit_statement(self, honest: str) -> None:
-        assert sentences_claiming_a_rule_becomes_visible(honest) == []
+    What this buys: changing that proposition also fails this test, so the change
+    cannot land without someone editing the expected text in the same diff. What
+    it does not buy: any opinion on whether the new wording is honest, and no
+    cover at all for an overclaim added somewhere else.
+    """
 
-    def test_it_is_sentence_scoped_not_document_scoped(self) -> None:
-        """Naming a rule in one sentence and visibility in another is not a claim."""
-        text = "A deleted section becomes visible. A rule may still be weakened silently."
-        assert sentences_claiming_a_rule_becomes_visible(text) == []
+    def test_the_item_appears_exactly_once(self) -> None:
+        items = d070_versioned_policy_items()
+        assert len(items) == 1, (
+            f"D-070 must carry exactly one `versioned policy` item numbered 5; found {len(items)}"
+        )
+
+    def test_it_is_still_the_reviewed_proposition(self) -> None:
+        items = d070_versioned_policy_items()
+        assert items, "D-070 has no item 5 to compare"
+        assert items[0] == normalise(D070_VERSIONED_POLICY_ITEM), (
+            "D-070's `versioned policy` item no longer matches the reviewed wording. "
+            "That is not necessarily wrong — but it is a decision, so update "
+            "D070_VERSIONED_POLICY_ITEM in the same diff and let a human read both.\n"
+            f"  in D-070 : {items[0]}\n"
+            f"  reviewed : {normalise(D070_VERSIONED_POLICY_ITEM)}"
+        )
 
 
 class TestTheSuiteStatesWhatItDoesNotProve:
     """A test suite that oversells itself is a governance defect of its own."""
 
-    #: The claim a review rejected: these tests do not stop a rule being inverted.
+    #: Exact phrases two reviews rejected — a short list of *named* regressions,
+    #: deliberately not a family. It cannot be exhaustive and is not meant to be:
+    #: a rewrite that avoids these words passes, which is why the reviewed D-070
+    #: proposition is pinned by equality instead.
     OVERCLAIMS = (
         "cannot quietly drift",
         "cannot drift",
@@ -511,22 +528,6 @@ class TestTheSuiteStatesWhatItDoesNotProve:
         )
         assert mentions_any(doc, "inversion", "inverted", "contradiction", "reversed"), (
             "must say an inverted rule can still pass"
-        )
-
-    @pytest.mark.parametrize("where", ("module docstring", "D-070"))
-    def test_no_sentence_promises_rule_level_detection(self, where: str) -> None:
-        """A formulation guard on both places this repository states the guarantee.
-
-        Not a semantic validator: it only refuses the one phrasing two reviews
-        rejected. Applied to D-070 as well as to this docstring, because the
-        claim was corrected here first and left standing there.
-        """
-        text = (__doc__ or "") if where == "module docstring" else section(DECISIONS, "D-070")
-        offenders = sentences_claiming_a_rule_becomes_visible(text)
-        assert offenders == [], (
-            f"{where} promises rule-level detection; the suite detects artefacts, "
-            f"sections, markers in the inspected scope and cross-checked names — "
-            f"offending sentence(s): {offenders}"
         )
 
     def test_the_docstring_names_the_objects_it_can_actually_detect(self) -> None:
