@@ -30,10 +30,28 @@ suite, because the markers it looks for were all still there. Contradictions
 between two paragraphs, a qualifier silently dropped, an obligation turned into
 a suggestion — none of that is detected here.
 
-The guarantee is therefore narrow and worth stating plainly: a rule *deleted*
-outright, or a name that no longer exists in the repository, becomes visible.
-Anything about meaning stays with the human reading the diff, and no result from
-this file substitutes for that human review.
+The guarantee is therefore narrow, and it is about *objects in the text*, not
+about rules. Four things fail this suite, each demonstrated by a mutation
+experiment rather than assumed:
+
+* a governance file that is absent;
+* a required section that is absent;
+* a selected marker gone from the scope a test actually inspects — the whole
+  file for some, one `section()` for others;
+* a name cross-checked against the real repository, such as a `ci.yml` job name,
+  that no longer matches.
+
+What does *not* fail it is a rule losing its normative force while its
+vocabulary stays inside the inspected section. Measured, not supposed: a review
+deleted the prohibition on direct pushes, and separately the requirement for
+explicit merge authorisation, each time leaving the same words in the same
+section as a non-binding remark — **74 of 74 tests passed both times**. Move the
+same words further away and a test does fail, which shows what is really being
+watched: the marker's presence in a scope, not the obligation.
+
+So a green run here means the shapes are still in place. Whether they still
+oblige anyone — their meaning — is a question for the human review of the diff,
+and no result from this file substitutes for it.
 
 Why the searches stay loose about phrasing
 ------------------------------------------
@@ -123,6 +141,36 @@ def section(path: Path, heading: str) -> str:
 
 def mentions_any(haystack: str, *needles: str) -> bool:
     return any(needle in haystack for needle in needles)
+
+
+#: Crude sentence split on normalised text. `:` counts as a boundary because the
+#: claim this guards against was written as "… stating plainly: <claim>".
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[.;:!?])\s+")
+
+_RULE_WORD = re.compile(r"\brules?\b|\brègles?\b")
+_VISIBILITY_CLAIM = re.compile(
+    r"becomes? visible|devien\w* visible|stops? being invisible|cesse\w* d'être invisible"
+    r"|cannot drift|cannot quietly drift|prevents? (?:the )?(?:rules?|drift)"
+)
+
+
+def sentences_claiming_a_rule_becomes_visible(text: str) -> list[str]:
+    """Sentences that promise rule-level detection — a formulation guard, not semantics.
+
+    The suite matches markers. Saying so is fine; saying that *a rule* becomes
+    visible is not, because a review removed two normative rules while leaving
+    their vocabulary in the inspected section and the whole suite stayed green.
+    Sentence-scoped on purpose: a sentence may name a rule, and a sentence may
+    talk about visibility, but one sentence claiming both is the overclaim.
+
+    This is a string check on one paragraph. It cannot tell whether a document is
+    honest — only whether it repeats the one phrasing a review rejected.
+    """
+    return [
+        sentence
+        for sentence in _SENTENCE_BOUNDARY.split(normalise(text))
+        if _RULE_WORD.search(sentence) and _VISIBILITY_CLAIM.search(sentence)
+    ]
 
 
 class TestTheGovernanceArtefactsExist:
@@ -407,6 +455,39 @@ class TestTheNormalisationDoesNotDecideTheOutcome:
         assert "autorisation explicite du propriétaire" in flat(CONTRIBUTING)
 
 
+class TestTheRuleVisibilityGuardIsItselfTested:
+    """Synthetic strings only — the formulation guard must not be taken on trust."""
+
+    @pytest.mark.parametrize(
+        "claim",
+        (
+            "The guarantee: a rule deleted outright becomes visible.",
+            "Ainsi, une règle supprimée devient visible.",
+            "Static tests over them, so a rule that is removed stops being invisible.",
+            "These tests prevent the rules from drifting.",
+        ),
+    )
+    def test_it_catches_a_sentence_promising_rule_level_detection(self, claim: str) -> None:
+        assert sentences_claiming_a_rule_becomes_visible(claim) != []
+
+    @pytest.mark.parametrize(
+        "honest",
+        (
+            "A missing section becomes visible; a rule losing its normative force does not.",
+            "It matches markers, so it cannot tell a rule from its inverse.",
+            "Removing a rule while its vocabulary stays in the inspected section leaves 74 green.",
+            "An absent artefact becomes visible.",
+        ),
+    )
+    def test_it_does_not_fire_on_an_honest_limit_statement(self, honest: str) -> None:
+        assert sentences_claiming_a_rule_becomes_visible(honest) == []
+
+    def test_it_is_sentence_scoped_not_document_scoped(self) -> None:
+        """Naming a rule in one sentence and visibility in another is not a claim."""
+        text = "A deleted section becomes visible. A rule may still be weakened silently."
+        assert sentences_claiming_a_rule_becomes_visible(text) == []
+
+
 class TestTheSuiteStatesWhatItDoesNotProve:
     """A test suite that oversells itself is a governance defect of its own."""
 
@@ -418,6 +499,8 @@ class TestTheSuiteStatesWhatItDoesNotProve:
         "ne peuvent pas dériver",
         "empêche les règles de dériver",
         "deleting a rule must not",
+        "a rule deleted outright",
+        "une règle supprimée",
     )
 
     def test_the_module_docstring_names_its_own_limits(self) -> None:
@@ -429,6 +512,35 @@ class TestTheSuiteStatesWhatItDoesNotProve:
         assert mentions_any(doc, "inversion", "inverted", "contradiction", "reversed"), (
             "must say an inverted rule can still pass"
         )
+
+    def test_no_sentence_of_the_docstring_promises_rule_level_detection(self) -> None:
+        """A formulation guard on this file's own claim. Not a semantic validator."""
+        offenders = sentences_claiming_a_rule_becomes_visible(__doc__ or "")
+        assert offenders == [], (
+            "the suite detects files, sections, markers and cross-checked names — "
+            f"not rules; offending sentence(s): {offenders}"
+        )
+
+    def test_the_docstring_names_the_objects_it_can_actually_detect(self) -> None:
+        """The four things the mutation experiments showed do fail the suite."""
+        doc = normalise(__doc__ or "")
+        assert mentions_any(doc, "file", "artefact", "artifact"), "an absent artefact"
+        assert mentions_any(doc, "section", "heading", "rubric"), "an absent required section"
+        assert mentions_any(doc, "marker"), "a marker gone from the scope actually inspected"
+        assert mentions_any(doc, "cross-check", "cross check", "job name", "name it cross"), (
+            "a name checked against the real repository, such as a CI job"
+        )
+
+    def test_the_docstring_admits_a_rule_can_lose_its_force_silently(self) -> None:
+        """The measured limit: c3b and c3c removed a rule and nothing failed."""
+        doc = normalise(__doc__ or "")
+        assert mentions_any(doc, "normative", "force"), (
+            "must say a rule can lose its normative force undetected"
+        )
+        assert mentions_any(doc, "vocabulary", "wording stays", "words stay", "keywords"), (
+            "must say the vocabulary staying in the inspected section is what hides it"
+        )
+        assert mentions_any(doc, "74"), "must state the measured count, not a vague caveat"
 
     def test_the_d070_entry_states_the_limited_guarantee(self) -> None:
         text = section(DECISIONS, "D-070")
@@ -470,7 +582,7 @@ class TestContributingQualifiesTheRulesetRequirements:
         )
         assert mentions_any(text, "attestation", "attesté", "attestés", "attested")
 
-    def test_the_two_required_checks_are_marked_as_behaviourally_observed(self) -> None:
+    def test_the_check_requirement_cites_an_observation_and_not_a_read_back(self) -> None:
         text = section(CONTRIBUTING, self.MERGE_SECTION)
         assert mentions_any(text, "observé", "observée", "observed")
         assert mentions_any(text, "comportement", "comportemental", "behavioural", "behavioral")
@@ -483,12 +595,51 @@ class TestContributingQualifiesTheRulesetRequirements:
         assert mentions_any(text, "conversation", "discussion")
         assert "403" in text, "the reason these two are only attested must be stated"
 
+    def test_the_gh013_observation_is_dated_and_scoped(self) -> None:
+        """It happened on another ref, under a ruleset since retargeted."""
+        text = section(CONTRIBUTING, self.MERGE_SECTION)
+        assert "gh013" in text
+        assert mentions_any(text, "branche de travail", "work branch"), (
+            "the refusal was observed on a work-branch ref, not on the default branch"
+        )
+        assert mentions_any(text, "reciblage", "reciblé", "reciblée", "retarget"), (
+            "the ruleset was retargeted after that refusal, so it is not current evidence"
+        )
+
+    def test_the_gh013_message_is_described_as_a_count_not_as_names(self) -> None:
+        text = section(CONTRIBUTING, self.MERGE_SECTION)
+        assert mentions_any(text, "compte", "nombre", "count"), (
+            "the message said '2 of 2', which is a count"
+        )
+        assert mentions_any(text, "ne nomme", "sans nommer", "does not name", "pas les noms"), (
+            "it never named quality or secrets"
+        )
+
+    def test_the_blocked_to_clean_sequence_is_offered_as_compatible_not_causal(self) -> None:
+        text = section(CONTRIBUTING, self.MERGE_SECTION)
+        assert "blocked" in text and "clean" in text
+        assert mentions_any(text, "compatible"), "the sequence is compatible with the requirement"
+        assert mentions_any(
+            text, "ne prouve pas", "ne prouvent pas", "ne suffit pas", "does not prove"
+        ), "other conditions can produce those states; it is not proof on its own"
+
+    def test_the_two_check_names_remain_attested_for_the_current_ruleset(self) -> None:
+        text = section(CONTRIBUTING, self.MERGE_SECTION)
+        for check in REQUIRED_CHECKS:
+            assert check in text
+        assert mentions_any(text, "attesté", "attestés", "attestation", "attested")
+        assert "403" in text
+
     def test_the_procedure_still_binds_the_contributor(self) -> None:
         """Qualifying the evidence must not soften a single obligation."""
         text = section(CONTRIBUTING, self.MERGE_SECTION)
         assert mentions_any(text, "push direct", "direct push")
         assert mentions_any(text, "interdit", "forbidden", "refusé")
         assert "autorisation explicite" in text
+        assert mentions_any(text, "à jour", "up to date")
+        assert mentions_any(text, "conversation", "discussion")
+        for check in REQUIRED_CHECKS:
+            assert check in text
 
 
 class TestTheTemplateSeparatesReadyForReview:

@@ -88,21 +88,37 @@ l'**attestation du propriétaire**, pour exiger :
 - la branche source **à jour** avec la branche cible (mode strict) ;
 - toutes les **conversations résolues**.
 
-Ce que valent ces trois lignes comme preuve n'est pas identique, et la nuance est
-utile le jour où une fusion est refusée sans explication :
+Ce qui est **observé** et ce qui est **attesté** ne se recouvre pas, et la nuance
+est utile le jour où une fusion est refusée sans explication. Voici la chronologie
+probatoire exacte, sans l'arrondir :
 
-- l'exigence des deux checks a une **preuve comportementale observée** : un push
-  vers une branche de travail a été refusé par le ruleset avec
-  `GH013 — 2 of 2 required status checks are expected`, ce qui n'aurait pas pu se
-  produire si les checks n'étaient pas requis ;
-- le **mode strict « branche à jour »** et la **résolution des conversations**
-  restent **attestés** et non relus : les endpoints REST de protection de branche
-  et de rulesets répondent `403` dans l'environnement d'audit, y compris sur un
-  endpoint de contrôle, donc la configuration détaillée n'est pas lisible ici.
+1. **Observé, mais ailleurs et avant.** Un push vers une **branche de travail** a
+   été refusé par le ruleset avec
+   `GH013 — 2 of 2 required status checks are expected`. Cela établit qu'un
+   ruleset attendait alors **deux** checks sur *cette* référence.
+2. **Ce que ce message ne dit pas.** Il donne un **compte**, pas des noms : il
+   **ne nomme** ni `quality` ni `secrets`. Et il précède le **reciblage** du
+   ruleset sur la seule branche par défaut — la configuration a changé après
+   l'observation, qui ne décrit donc pas l'état actuel.
+3. **Observé, sur cette PR.** L'état de la pull request #1 est passé de `blocked`
+   pendant l'exécution des deux jobs à `clean` après leur succès.
+4. **Ce que valent ces deux observations.** Elles sont **comportementales** :
+   elles disent ce que GitHub a *fait*, pas ce que sa configuration *déclare*.
+   Elles sont **compatibles** avec l'application de checks requis, mais elles
+   **ne prouvent pas** à elles seules la causalité ni la configuration exacte —
+   d'autres conditions peuvent produire l'état `blocked`.
+5. **Attesté, non relu.** Que le ruleset actuel de la branche par défaut exige
+   précisément **`quality`** et **`secrets`**, en **mode strict**, avec les
+   **conversations résolues**, repose sur l'**attestation du propriétaire** : les
+   endpoints REST de protection de branche et de rulesets répondent `403` dans cet
+   environnement, y compris sur un endpoint de contrôle, donc la configuration
+   détaillée n'est pas lisible ici.
 
-Cette distinction ne change rien à ce que vous devez faire : appliquez les trois
-règles. Elle dit seulement lesquelles ont été vérifiées et lesquelles reposent sur
-une déclaration.
+Cette distinction ne change **rien** à ce que vous devez faire. La politique du
+dépôt exige la branche de travail, la pull request, `quality` et `secrets` verts,
+la branche à jour, les conversations résolues et l'autorisation de fusion — que
+GitHub les impose techniquement ou non. Ce qui précède dit seulement ce qui a été
+vu et ce qui est déclaré.
 
 Deux points qu'on confond souvent :
 
