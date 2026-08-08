@@ -1049,3 +1049,67 @@ making the stripping look unnecessary.
 The rule this leaves: assert on behaviour and on declared interfaces; where a
 test must read rendered output, strip the styling first; and never send a data
 contract through a renderer.
+
+### D-070 — Detection was the easy half; the barrier is what was missing
+
+A provider key was published from this repository twice, on 7 and 8 August. Both
+times CI refused it: the `secrets` job failed on the step that asserts the
+template carries no values, four seconds after the push. Both commits were
+published anyway, and both keys had to be rotated and the history rewritten.
+
+Nothing was wrong with the detection. What was missing was everything that turns
+a finding into a refusal:
+
+* nothing blocked the push, so a red check was advisory;
+* CI had been red on every commit for unrelated reasons, so one more red carried
+  no signal — the key's red was indistinguishable from the ambient red;
+* the only check ran *after* the commit object existed, which is after the point
+  where the leak becomes permanent;
+* the assertion that caught it interpolated the offending line into its own
+  failure message, copying the key into a CI log.
+
+So the barrier is not one more scanner. It is five things that only work
+together, and each of which is useless alone:
+
+1. **the ruleset** on the default branch — a check that cannot block is a logging
+   statement;
+2. **the pre-commit hook** — the same rule moved before the commit exists, which
+   is the only moment at which the leak is still preventable;
+3. **`secret_hygiene` as one implementation** called by the hook, by CI and by the
+   test suite — two entry points with two opinions produce an argument, not a
+   verdict — and whose verdict never reprints what it caught;
+4. **the history scan**, because a clean tip proves nothing: a value emptied by a
+   later commit still lives in the blob its first commit points at;
+5. **versioned policy** — `CONTRIBUTING.md`, `SECURITY.md` and the pull-request
+   template, with static tests over them, so the rules cannot quietly drift away
+   from the repository they describe.
+
+The pull-request template belongs on that list for a reason that is easy to
+dismiss: it forces a *declaration*. Provider calls, endpoints, attempts and
+credits have to be written down even when they are all zero. Zero is an answer;
+silence is not, and silence is what preceded both incidents.
+
+**What is observed and what is merely attested.** `protected: true` is read back
+from GitHub for the default branch. Everything underneath it — pull request
+required, zero approvals, required checks `quality` and `secrets`, strict
+up-to-date mode, conversation resolution, admins included, no bypass, force-push
+and deletion refused — is **attested by the owner** and was **not** read back:
+the REST endpoints for branch protection and rulesets answer `403` in this
+environment, including on a control endpoint, so the sub-rules are unverifiable
+here. That distinction is kept deliberately. `protected: true` on its own proves
+that *some* policy applies, not which one.
+
+**A limit of the mechanism itself.** GitHub currently accepts `success`,
+`skipped` **or** `neutral` as satisfying a required check. A required check that
+is skipped therefore satisfies the ruleset. This is not hypothetical here: ten
+steps of `quality` sat `skipped` for days behind an upstream failure, and a
+skipped step reports nothing at all. The workflow's own guards remain necessary
+for that reason — neither `quality` nor `secrets` is conditioned by an `if:`,
+neither uses `continue-on-error`, and `tests/test_ci_workflow.py` pins that the
+expensive checks are still invoked.
+
+**Five distinct mutations.** Opening a pull request, marking it ready for review,
+merging it, closing it and deleting its branch are five separate acts requiring
+five separate authorisations. An instruction that permits "fix and push" permits
+a push to a *work branch*; it never permits a push to the default branch, and a
+green pull request is not permission to merge.
