@@ -90,20 +90,44 @@ jobs:
       - name: The PostgreSQL concurrency suite actually ran
         # `-m postgres` with `--strict-markers`: if every one of these skipped,
         # nothing proved the claims the documentation makes about PostgreSQL.
+        #
+        # This guard could not see what it was looking for, in two ways. Both
+        # only became visible once the step above stopped failing, because until
+        # then this step was skipped rather than run:
+        #
+        #   * `-q` suppresses the summary counts. The captured log was a single
+        #     line of progress dots, so `grep "[0-9]+ passed"` never matched and
+        #     the step failed even with all 24 tests passing;
+        #   * `^[0-9]+ skipped` is anchored, but pytest writes
+        #     `24 skipped, 1431 deselected in …`. It matched neither a passing nor
+        #     a skipped run, so the guard could never detect a skipped suite —
+        #     the one thing it exists to detect.
+        #
+        # `pipefail` is new: `tee` returns 0, so pytest's own exit code used to be
+        # swallowed and only the greps spoke. tests/test_ci_workflow.py pins all
+        # three properties so they cannot regress quietly.
         run: |
-          pytest -W error -m postgres -q -rs | tee /tmp/pg.log
-          if grep -qE "^[0-9]+ skipped" /tmp/pg.log; then
+          set -o pipefail
+          pytest -W error -m postgres -rs | tee /tmp/pg.log
+          if grep -qE "[0-9]+ skipped" /tmp/pg.log; then
             echo "::error::the PostgreSQL suite was skipped — the cluster was unreachable"
             exit 1
           fi
           grep -qE "[0-9]+ passed" /tmp/pg.log
 
       - name: The two pytest invocations collect the same suite
+        # `--collect-only -q` ends with a blank line, so `tail -1` returned the
+        # empty string for both invocations and this compared nothing to nothing:
+        # it could not fail. Summing the per-module counts yields a number, and
+        # asserting it is non-zero means an empty collection is a failure too.
         run: |
-          script_count=$(pytest --collect-only -q | tail -1)
-          module_count=$(python -m pytest --collect-only -q | tail -1)
-          echo "pytest:          $script_count"
+          set -o pipefail
+          count() { "$@" --collect-only -q | awk -F': ' '/: [0-9]+$/ {s+=$2} END {print s+0}'; }
+          script_count=$(count pytest)
+          module_count=$(count python -m pytest)
+          echo "pytest:           $script_count"
           echo "python -m pytest: $module_count"
+          test "$script_count" -gt 0
           test "$script_count" = "$module_count"
 
       - name: python -m pytest also passes with warnings fatal
