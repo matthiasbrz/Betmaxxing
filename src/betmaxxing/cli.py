@@ -48,6 +48,26 @@ app.add_typer(budget_app, name="budget")
 
 console = Console()
 
+#: Progress and confirmation messages go here. They are for the operator, not
+#: part of any command's output contract, so they must not land in a stream a
+#: caller is parsing — `scan --json | jq` has to see JSON and nothing else.
+notice = Console(stderr=True)
+
+
+def emit_json(payload: str) -> None:
+    """Write machine-readable output verbatim, never through the styled console.
+
+    ``console.print_json`` syntax-highlights JSON and wraps it to the console
+    width. Both are reasonable for a human looking at a terminal and wrong for a
+    contract. Whenever colour is active — an interactive terminal, ``FORCE_COLOR``
+    set, a CI runner — the bytes a caller pipes into ``jq`` carry ANSI escapes and
+    are not JSON at all; and a long string value can be split by a soft wrap even
+    without colour. ``--json`` is an interface, so it is written as bytes.
+
+    The console stays where it belongs: human-readable output.
+    """
+    typer.echo(payload)
+
 
 def _probability_line(
     value: ValueAssessment, uncertainty: UncertaintyEstimate, half_width: float | None
@@ -236,14 +256,17 @@ def scan(
     result = outcome.scan
 
     if save:
-        console.print(
+        # stderr: a confirmation that rows were written is progress information.
+        # On stdout it prefixed the `--json` payload, so the flagship
+        # machine-readable command was not parseable either.
+        notice.print(
             f"[dim]Scan {result.scan_id} enregistré · "
             f"{outcome.events_persisted} événement(s), "
             f"{outcome.snapshots_persisted} snapshot(s) écrit(s).[/]"
         )
 
     if as_json:
-        console.print_json(result.model_dump_json(indent=2))
+        emit_json(result.model_dump_json(indent=2))
     else:
         _render(result, settings)
 
@@ -276,7 +299,7 @@ def explain(
 def config() -> None:
     """Affiche la configuration effective, secrets masqués."""
     settings = get_settings()
-    console.print_json(json.dumps(settings.redacted(), indent=2, default=str))
+    emit_json(json.dumps(settings.redacted(), indent=2, default=str))
     console.print(f"\nEmpreinte de configuration : [bold]{settings.fingerprint()}[/]")
     console.print(f"[dim]{DISCLAIMER}[/]")
 
@@ -414,7 +437,7 @@ def identity_reviews_list(
     """Ambiguïtés en attente d'une décision humaine."""
     pending = _identity_service().pending_review()
     if as_json:
-        console.print_json(json.dumps(pending, ensure_ascii=False))
+        emit_json(json.dumps(pending, ensure_ascii=False))
         return
     if not pending:
         console.print("[green]Aucune ambiguïté en attente.[/green]")
@@ -569,7 +592,7 @@ def identity_aliases_import(
 
     report = _identity_service().import_aliases(rows)
     if as_json:
-        console.print_json(json.dumps(report.as_dict(), ensure_ascii=False))
+        emit_json(json.dumps(report.as_dict(), ensure_ascii=False))
         return
 
     console.print(
@@ -595,7 +618,7 @@ def identity_aliases_list(
     """Alias déclarés, consultés par le rapprochement inter-fournisseurs."""
     rows = _identity_service().aliases(sport=sport or None, source=source or None)
     if as_json:
-        console.print_json(json.dumps(rows, ensure_ascii=False))
+        emit_json(json.dumps(rows, ensure_ascii=False))
         return
     if not rows:
         console.print("Aucun alias déclaré.")

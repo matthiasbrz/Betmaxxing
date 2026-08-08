@@ -1000,3 +1000,52 @@ Shape, not path, on purpose: a path rule would have missed a key pasted into a
 document, whereas the shape rule catches a credential wherever it sits. That the
 two agreed here — every credential-shaped occurrence was inside `.env.example` —
 is a verified fact about this history, not an assumption the rule depends on.
+
+### D-069 — `--json` is an interface, not a display
+
+CI's `quality` job had been red for days on a suite that passed locally. The
+difference was colour: Rich decides styling from the environment, so the same
+commit rendered plainly through a local pipe and with ANSI escapes on the
+runner. Two different defects hid behind that one symptom, and only the second
+one is a test problem.
+
+**The product defect.** Five commands emitted machine-readable output through
+`console.print_json`, which syntax-highlights JSON and wraps it to the console
+width. Whenever colour is active — an interactive terminal, `FORCE_COLOR` set, a
+CI runner — the bytes a caller pipes into `jq` are not JSON, they are JSON with
+escape sequences in them. A test in `test_identity_cli.py` is literally named
+`test_the_listing_is_machine_readable`, and under colour the listing was not.
+Soft wrapping is the same class of hazard without colour: a long string value can
+be broken by a line break the caller never asked for.
+
+So JSON now goes through `emit_json`, which writes it verbatim with
+`typer.echo`. The console keeps doing what it is good at, which is output for a
+human. `config` is the one deliberate mixture — a JSON object followed by a
+styled human trailer — and its guard asserts the object leads and is unstyled,
+not that the whole stream parses.
+
+**The test defect.** `test_there_is_no_automatic_resolution_command` asserted
+`"--event-id" in result.stdout` against Typer's help. Rich styles an option name
+as its own span, so with colour on an escape sequence lands *inside* the token
+and the substring is absent even though the help plainly advertises the option.
+That assertion now strips styling first: it reads what the help says, not how a
+terminal painted it.
+
+**What was tried and rejected.** An autouse fixture pinning `TERM=dumb` and
+clearing `FORCE_COLOR` looked like a tidy one-line fix and was removed again: it
+cannot work. `cli.py` builds its `Console` at import time, so the colour decision
+is already baked in before any fixture runs — the fixture measurably left ANSI in
+`--json` output. Keeping it would have given false assurance while the real bug
+survived. The suite is instead colour-independent because the product and the
+assertions are, which is checked by running the whole suite with `FORCE_COLOR=1`.
+
+Nothing was relaxed to get green: no `skip`, no `xfail`, no warning filter, no
+coverage, PostgreSQL or migration change. Four guards force colour back on, one
+of which asserts that colour really is enabled — otherwise the others could pass
+by quietly staying plain — and one of which pins the splitting mechanism, so if a
+future Rich stops splitting the token that fails loudly instead of silently
+making the stripping look unnecessary.
+
+The rule this leaves: assert on behaviour and on declared interfaces; where a
+test must read rendered output, strip the styling first; and never send a data
+contract through a renderer.

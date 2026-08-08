@@ -7,11 +7,15 @@ and nothing synthetic is ever labelled as real.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
-from betmaxxing.config import RunMode, Settings
+from betmaxxing.cli import app
+from betmaxxing.config import RunMode, Settings, reset_settings_cache
 from betmaxxing.domain.enums import (
     CollectionStatus,
     RejectionCode,
@@ -19,6 +23,7 @@ from betmaxxing.domain.enums import (
     UncertaintyStatus,
 )
 from betmaxxing.engine.acquisition import run_scan
+from betmaxxing.storage.db import reset_engine
 
 
 @pytest.fixture
@@ -245,3 +250,35 @@ class TestDataHealth:
 
     def test_stale_snapshots_are_counted(self, result) -> None:  # type: ignore[no-untyped-def]
         assert result.data_health.stale_snapshots >= 1
+
+
+class TestTheJsonOutputIsAContract:
+    """`scan --json` must emit JSON and nothing else, whatever the terminal does.
+
+    Two ways it failed before. The confirmation that rows were persisted was
+    printed to stdout, so it prefixed the payload; and the payload itself went
+    through Rich's JSON highlighter, so with colour active it carried ANSI
+    escapes. Either one is enough to break `betmaxxing scan --json | jq`, which
+    is the only reason the flag exists. CI ran `scan --json > /dev/null`, which
+    checks the exit code and cannot notice that the bytes are unusable.
+    """
+
+    def test_stdout_is_pure_json_even_with_colour_forced_and_rows_saved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        monkeypatch.setenv("BETMAXXING_DATABASE_URL", f"sqlite+pysqlite:///{tmp_path / 'x.db'}")
+        reset_settings_cache()
+        reset_engine()
+        try:
+            result = CliRunner().invoke(app, ["scan", "--json"])
+            assert result.exit_code == 0, result.output
+            assert "\x1b[" not in result.stdout, "a data contract must never be styled"
+            payload = json.loads(result.stdout)
+            assert payload["status"] in {s.value for s in ScanStatus}
+            # The operator still gets the confirmation, on the other stream.
+            assert "enregistré" in result.stderr
+        finally:
+            reset_settings_cache()
+            reset_engine()

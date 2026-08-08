@@ -19,6 +19,7 @@ The rules being pinned, beyond "the commands exist":
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -38,6 +39,21 @@ from betmaxxing.storage.tables import (
 
 NOW = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
 runner = CliRunner()
+
+#: SGR escape sequences, as Rich emits them when colour is enabled.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def plain(rendered: str) -> str:
+    """Strip styling so an assertion reads content instead of presentation.
+
+    Typer renders help through Rich, which styles an option name as its own
+    span. With colour on, that puts an escape sequence *inside* the token, so
+    ``"--event-id" in stdout`` is false even though the help plainly advertises
+    the option. Colour depends on the environment, not on the code under test,
+    so a raw substring match on rendered help asserts the terminal's mood.
+    """
+    return _ANSI.sub("", rendered)
 
 
 @pytest.fixture
@@ -315,9 +331,101 @@ class TestReviewResolution:
         make_ambiguity(cli_env)
         result = runner.invoke(app, ["identity", "reviews", "resolve", "--help"])
         assert result.exit_code == 0
-        assert "--event-id" in result.stdout
+        rendered = plain(result.stdout)
+        assert "--event-id" in rendered
         for forbidden in ("--auto", "--best", "--guess"):
-            assert forbidden not in result.stdout
+            assert forbidden not in rendered
+
+
+class TestOutputDoesNotDependOnColour:
+    """What the CI failure of run #11 was really about, pinned permanently.
+
+    Rich decides styling from the environment, so the same commit rendered
+    differently on a laptop (plain pipe) and on the runner (colour enabled).
+    Two distinct consequences had to be separated:
+
+    * help text is a *display*. A styled option name contains an escape
+      sequence, so an assertion must strip styling and read content;
+    * ``--json`` is an *interface*. It must be byte-for-byte parseable whatever
+      the terminal thinks, which is a property of the product, not of the test.
+
+    Every test here forces colour on, because the coloured path is the one that
+    broke and the one that has to stay asserted.
+    """
+
+    @staticmethod
+    def _force_colour(monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setenv("FORCE_COLOR", "1")
+
+    def _coloured_help(self, monkeypatch: pytest.MonkeyPatch) -> str:
+        self._force_colour(monkeypatch)
+        result = runner.invoke(app, ["identity", "reviews", "resolve", "--help"])
+        assert result.exit_code == 0
+        return result.stdout
+
+    def test_colour_really_is_enabled_for_these_tests(
+        self, cli_env: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without this, every guard below could pass by quietly staying plain."""
+        assert "\x1b[" in self._coloured_help(monkeypatch)
+
+    def test_the_option_survives_styling_once_escapes_are_stripped(
+        self, cli_env: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert "--event-id" in plain(self._coloured_help(monkeypatch))
+
+    def test_a_raw_substring_match_is_what_used_to_fail(
+        self, cli_env: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pins the mechanism, so nobody "simplifies" ``plain()`` away again.
+
+        Rich splits the styled token, so the raw rendering does not contain the
+        option name contiguously. If a future Rich stops splitting it, this
+        fails loudly and ``plain()`` gets reconsidered on purpose rather than by
+        accident.
+        """
+        assert "--event-id" not in self._coloured_help(monkeypatch)
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["identity", "reviews", "list", "--json"],
+            ["identity", "aliases", "list", "--json"],
+        ],
+    )
+    def test_json_output_stays_parseable_with_colour_forced_on(
+        self, cli_env: Settings, monkeypatch: pytest.MonkeyPatch, argv: list[str]
+    ) -> None:
+        """``--json`` is a contract, and styling it makes the contract unhonourable.
+
+        These commands used to write through ``console.print_json``, which
+        syntax-highlights. With colour active the caller received ANSI escapes,
+        so ``json.loads`` — and ``jq`` — choked on output that a test elsewhere
+        in this file calls "machine readable".
+        """
+        self._force_colour(monkeypatch)
+        result = runner.invoke(app, argv)
+        assert result.exit_code == 0, result.stdout
+        assert "\x1b[" not in result.stdout, "machine-readable output must never be styled"
+        json.loads(result.stdout)
+
+    def test_the_config_dump_leads_with_unstyled_json(
+        self, cli_env: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`config` prints a JSON object and then a human trailer, by design.
+
+        The trailer is styled on purpose, so the whole of stdout is not JSON and
+        must not be asserted as such. What has to hold is that the object itself
+        is emitted verbatim, because it is what someone pipes into `jq` to read
+        the effective configuration — with its secrets already masked.
+        """
+        self._force_colour(monkeypatch)
+        result = runner.invoke(app, ["config"])
+        assert result.exit_code == 0, result.stdout
+        payload, end = json.JSONDecoder().raw_decode(result.stdout)
+        assert "\x1b[" not in result.stdout[:end], "the JSON object must not be styled"
+        assert payload["odds_api_key"] == ""
 
 
 # ---------------------------------------------------------------------------
