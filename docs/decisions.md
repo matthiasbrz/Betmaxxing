@@ -930,3 +930,73 @@ stay on the operator's machine.
 **Limite.** The guard covers this repository's documents and the harness output.
 It cannot reach conversational reports already written, and those are
 deliberately left alone.
+
+### D-066 — Detection was never the problem; enforcement was
+
+A provider key was committed to `.env.example` twice. Both times CI refused it:
+the `secrets` job failed on the step that asserts the template carries no
+values, four seconds after the push. Both commits were published anyway.
+
+Nothing was wrong with the check. What was missing was everything around it:
+
+* no rule blocked the push, so a red check was advisory;
+* CI had been red on every commit for other reasons, so one more red carried no
+  signal at all;
+* the only check ran *after* the commit object existed, which is after the point
+  where the leak becomes permanent.
+
+So the hardening is not another scanner. It is the same rule moved earlier (a
+pre-commit hook), made single-sourced (one module, three callers), extended to
+what the old check could not see (the whole history, not just the tip), and
+paired with a branch-protection recommendation — because a guard that cannot
+block is a logging statement.
+
+Corollary recorded deliberately: emptying the value is not remediation. The
+value stays reachable in the blob its first commit points at, in every existing
+clone, and in the forge's caches. Rotation at the provider is the remediation;
+rewriting history only removes the object from active references.
+
+### D-067 — A guard must not reprint what it caught
+
+The assertion that caught the committed key rendered its own failure as
+`f"{line} must not carry a value"`. It therefore printed the key into the CI
+log. A caught secret became a second copy of the secret, in a surface with
+different retention and different access rules from the repository.
+
+Every verdict in `secret_hygiene` now carries a path, a line number, a variable
+name and a reason, and nothing derived from the value — not the value, not its
+length, not a prefix, not a hash, not an entropy estimate. Tests assert the
+absence of the value *and of every 8-, 12- and 16-character window of it* from
+the rendered finding, the captured stdout, and the output of the module run as a
+subprocess.
+
+The same reasoning applied to the test suite itself. `Settings` is a pydantic
+settings model, so any field a test does not pass is filled from the
+environment. An operator with a real key exported — exactly the state during a
+controlled activation — ran a different suite from CI, and the mismatch printed
+the real key as pytest's "actual" value. An autouse fixture now clears the
+secret variables for every test, so the suite depends only on what a test
+passes. `BETMAXXING_TEST_POSTGRES_URL` is left alone on purpose: it is a local
+database address, and the PostgreSQL suites must keep skipping loudly when it is
+absent rather than being quietly neutered.
+
+### D-068 — The purge is keyed on the variable name and the value's shape
+
+Rewriting history to remove the keys could not simply blank every assignment of
+`BETMAXXING_THE_ODDS_API_KEY` in every blob. Twenty-eight of the thirty
+assignments reachable in this repository are documentation placeholders — in
+`README.md`, `docs/deployment.md`, `docs/provider-activation.md`,
+`docs/source-matrix.md` and `scripts/smoke_the_odds_api.py`. Blanking those
+would have changed the current tree, which is the one thing the operation was
+required not to do.
+
+The transformation therefore matched the variable **name** and the credential
+**shape** (a bare hexadecimal run), and never a list of the compromised values —
+which it was never given. Two occurrences matched, both in `.env.example`, and
+both were emptied; the twenty-eight placeholders were preserved byte for byte,
+so the tree at the tip is identical before and after.
+
+Shape, not path, on purpose: a path rule would have missed a key pasted into a
+document, whereas the shape rule catches a credential wherever it sits. That the
+two agreed here — every credential-shaped occurrence was inside `.env.example` —
+is a verified fact about this history, not an assumption the rule depends on.

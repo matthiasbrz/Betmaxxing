@@ -231,11 +231,69 @@ Quand c'est faux, toutes les routes `/challenges` répondent 404.
 
 ## Secrets
 
+**La règle, en une phrase :** `.env.example` ne contient que des **noms** et des valeurs
+**vides** ; les valeurs réelles vont dans `.env` (ignoré par Git) ou dans un gestionnaire
+de secrets, jamais dans un fichier suivi.
+
 - Aucun secret dans Git. `.gitignore` exclut `.env` et les bases locales.
 - `.env.example` liste les variables **sans valeur**, et un test le vérifie.
 - `Settings.redacted()` masque tout champ finissant par `_key`, `_token`, `_password` ou
   `_secret`. C'est ce que renvoient `/settings` et `betmaxxing config`.
 - Un test parcourt `src/` à la recherche de secrets codés en dur.
+- La suite de tests efface les variables secrètes de l'environnement ambiant : sinon une
+  clé réelle exportée dans le shell devient la valeur testée, et un échec d'assertion
+  imprime cette clé réelle dans la sortie de `pytest`.
+
+### Le garde `secret_hygiene`
+
+Une seule implémentation, `src/betmaxxing/security/secret_hygiene.py`, appelée par trois
+points d'entrée : le hook pre-commit, la CI et la suite de tests. Un garde qui rend un
+verdict différent selon l'appelant n'est pas un garde.
+
+```bash
+python -m betmaxxing.security.secret_hygiene                 # tous les fichiers suivis
+python -m betmaxxing.security.secret_hygiene .env.example    # des chemins précis
+```
+
+Deux règles, parce que les deux situations ne sont pas la même :
+
+| Où | Ce qui est refusé | Pourquoi |
+| --- | --- | --- |
+| Fichier d'environnement (`.env`, `.env.example`, `.env.*`) | **toute** valeur non vide, même un placeholder | ce format existe pour être copié tel quel |
+| Tout autre fichier suivi | seulement une valeur ayant la **forme** d'un identifiant réel | la documentation doit pouvoir montrer la forme d'un réglage |
+
+Ni guillemets, ni espaces, ni préfixe `export`, ni casse ne contournent le contrôle. Le
+verdict nomme la variable et la ligne et **ne reproduit jamais la valeur** : un garde dont
+la sortie doit elle-même être expurgée n'a fait que déplacer la fuite.
+
+### Installer le hook
+
+```bash
+pip install pre-commit && pre-commit install
+```
+
+À faire **une fois par clone**. `pre-commit install` est local et ne peut pas être imposé
+depuis le dépôt : la CI rejoue donc le même garde en filet de sécurité, sur l'arbre suivi
+**et sur tous les blobs atteignables de l'historique**. Un sommet propre ne prouve rien sur
+ce qui reste atteignable — une clé vidée par un commit ultérieur survit dans le blob
+pointé par le premier.
+
+### Recommandation : protéger la branche par défaut
+
+**À activer manuellement dans les réglages GitHub** (le dépôt ne modifie aucun réglage) :
+une règle de protection de branche exigeant que la CI passe avant toute mise à jour de la
+branche par défaut.
+
+Sans cette règle, la détection existe mais n'empêche rien. La clé qui a rendu nécessaire la
+réécriture de l'historique a été détectée par la CI **quatre secondes** après le push, et
+publiée quand même : rien ne bloquait le push, et la CI était déjà rouge pour d'autres
+raisons — un rouge de plus ne signalait rien à personne.
+
+### Si une valeur a déjà été poussée
+
+Vider la valeur ne suffit pas. Elle reste atteignable dans l'historique, dans les clones
+existants et dans les caches de la forge. La seule remédiation est la **rotation chez le
+fournisseur** ; réécrire l'historique ne fait que retirer l'objet des références actives.
 
 ## Sauvegarde
 

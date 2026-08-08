@@ -1,0 +1,42 @@
+# Install once per clone:
+#
+#     pip install pre-commit && pre-commit install
+#
+# The secret guard is the reason this file exists. CI already refused a
+# populated `.env.example` and went red four seconds after the push that
+# committed a provider key — but by then the commit existed, it had been
+# published, and the key had to be rotated and the history rewritten. A check
+# that runs before the commit object is created is the only one that prevents
+# the leak rather than reporting it.
+#
+# `pre-commit install` is per-clone and cannot be enforced from the repository,
+# so CI runs the same guard as a backstop. Two entry points, one implementation:
+# see src/betmaxxing/security/secret_hygiene.py.
+repos:
+  - repo: local
+    hooks:
+      - id: secret-hygiene
+        name: no populated secret variable in a tracked file
+        entry: python -m betmaxxing.security.secret_hygiene
+        language: system
+        # Only the staged files are passed, so the hook stays fast; CI scans the
+        # whole tree and the whole history.
+        pass_filenames: true
+        require_serial: true
+
+  - repo: local
+    hooks:
+      - id: no-committed-env
+        name: .env is never committed
+        entry: >-
+          bash -c 'if git ls-files --error-unmatch .env >/dev/null 2>&1;
+          then echo ".env must never be tracked; it belongs in .gitignore"; exit 1; fi'
+        language: system
+        pass_filenames: false
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.1
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format

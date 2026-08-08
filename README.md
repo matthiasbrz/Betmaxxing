@@ -18,6 +18,7 @@ Le résultat normal d'un scan peut être **`NO_BET`**. C'est une réponse, pas u
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]" -c constraints.txt   # résolution reproductible
+pip install pre-commit && pre-commit install # garde anti-secret, une fois par clone
 
 betmaxxing scan            # scan complet en mode démo
 betmaxxing scan --json     # sortie JSON brute

@@ -103,6 +103,43 @@ def _no_outbound_network() -> Iterator[None]:
 #: Unset means the PostgreSQL suites skip — they never silently pass.
 POSTGRES_URL_VARIABLE = "BETMAXXING_TEST_POSTGRES_URL"
 
+#: Settings read the ambient environment, so a real key exported in the operator's
+#: shell silently becomes the value under test. Cleared for every test.
+_AMBIENT_SECRETS = (
+    "BETMAXXING_THE_ODDS_API_KEY",
+    "BETMAXXING_ODDS_API_KEY",
+    "BETMAXXING_SPORTSDATA_API_KEY",
+    "BETMAXXING_ACTIVATION_RECEIPT_SECRET",
+    "BETMAXXING_TELEGRAM_BOT_TOKEN",
+    "BETMAXXING_SMTP_PASSWORD",
+    "BETMAXXING_API_TOKEN",
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the operator's real credentials out of the suite entirely.
+
+    ``Settings`` is a pydantic settings model, so any field not passed explicitly
+    is filled from the environment. A developer with a real key exported — which
+    is precisely the state during a controlled activation — therefore ran a
+    different suite from CI: assertions comparing a synthetic key to
+    ``resolved_the_odds_api_key`` failed, and pytest printed the *real* key into
+    the diff of expected versus actual. That is a live credential in a terminal,
+    a scrollback buffer and any captured log, produced by the test suite itself.
+
+    Clearing these makes the suite depend only on what a test passes, so it
+    behaves identically on a laptop with credentials and on a runner without
+    them. Tests that need a key pass an explicit synthetic one; the activation
+    harness has its own fixtures for the receipt secret.
+
+    ``BETMAXXING_TEST_POSTGRES_URL`` is deliberately untouched: it is a local
+    database address, not a credential, and the PostgreSQL suites must keep
+    skipping loudly when it is absent rather than being silently neutered here.
+    """
+    for name in _AMBIENT_SECRETS:
+        monkeypatch.delenv(name, raising=False)
+
 
 @pytest.fixture
 def now() -> datetime:

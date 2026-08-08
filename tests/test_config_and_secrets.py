@@ -7,13 +7,21 @@ data, and thresholds must be versioned and reproducible.
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from betmaxxing.config import CONFIG_SCHEMA_VERSION, RunMode, Settings
+from betmaxxing.security import secret_hygiene
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+#: A value that is shaped exactly like a real provider key and is not one. Every
+#: test below asserts on the *verdict* and on the absence of this string from the
+#: output, never on the string being echoed back.
+SYNTHETIC_CREDENTIAL = "0123456789abcdef0123456789abcdef"
 
 
 class TestFingerprint:
@@ -151,15 +159,24 @@ class TestParsedLists:
 
 class TestRepositoryHygiene:
     def test_env_example_exists_and_has_no_values_for_secrets(self) -> None:
-        content = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
-        secret_lines = [
-            line
+        """The template names the secret variables and gives none of them a value.
+
+        This assertion used to interpolate the offending line into its own
+        message. When a key was actually committed the guard fired correctly and
+        printed the key into the CI log, which turned a caught mistake into a
+        second copy of it. The verdict now names the variable and the line
+        number, and the value stays where it is.
+        """
+        path = REPO_ROOT / ".env.example"
+        content = path.read_text(encoding="utf-8")
+        named = [
+            match.group("name")
             for line in content.splitlines()
-            if re.match(r"^[A-Z_]*(API_KEY|TOKEN|PASSWORD|SECRET)=", line)
+            if (match := secret_hygiene.ASSIGNMENT.match(line)) is not None
         ]
-        assert secret_lines, "the example file should list the secret variables"
-        for line in secret_lines:
-            assert line.split("=", 1)[1] == "", f"{line} must not carry a value"
+        assert named, "the example file should list the secret variables"
+        findings = secret_hygiene.scan_text(content, path=".env.example")
+        assert findings == [], "; ".join(str(finding) for finding in findings)
 
     def test_gitignore_excludes_env_and_databases(self) -> None:
         content = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
@@ -177,3 +194,185 @@ class TestRepositoryHygiene:
                 if pattern.search(line):
                     offenders.append(f"{path.relative_to(REPO_ROOT)}:{number}")
         assert offenders == []
+
+
+class TestTheSecretGuardAcceptsAnEmptyValue:
+    """An empty assignment is the whole point of the template and must pass."""
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "BETMAXXING_THE_ODDS_API_KEY=",
+            "BETMAXXING_THE_ODDS_API_KEY=   ",
+            'BETMAXXING_THE_ODDS_API_KEY=""',
+            "BETMAXXING_THE_ODDS_API_KEY=''",
+            "export BETMAXXING_THE_ODDS_API_KEY=",
+            "  BETMAXXING_THE_ODDS_API_KEY =  ",
+        ],
+    )
+    def test_an_empty_assignment_is_accepted_in_an_environment_file(self, line: str) -> None:
+        assert secret_hygiene.scan_text(line, path=".env.example") == []
+
+    def test_naming_the_variable_is_not_itself_a_violation(self) -> None:
+        template = "\n".join(f"{name}=" for name in secret_hygiene.SECRET_VARIABLES)
+        assert secret_hygiene.scan_text(template, path=".env.example") == []
+
+
+class TestTheSecretGuardRefusesAPopulatedValue:
+    """A synthetic value is refused, and never reproduced in the verdict."""
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "BETMAXXING_THE_ODDS_API_KEY=VALUE",
+            'BETMAXXING_THE_ODDS_API_KEY="VALUE"',
+            "BETMAXXING_THE_ODDS_API_KEY='VALUE'",
+            "  BETMAXXING_THE_ODDS_API_KEY=VALUE",
+            "export BETMAXXING_THE_ODDS_API_KEY=VALUE",
+            "  export  BETMAXXING_THE_ODDS_API_KEY = VALUE  ",
+            'export BETMAXXING_THE_ODDS_API_KEY = "VALUE"',
+            "betmaxxing_the_odds_api_key=VALUE",
+        ],
+    )
+    def test_quotes_spaces_export_and_case_do_not_bypass_the_check(self, line: str) -> None:
+        """Every syntactic dressing an env file allows still counts as a value."""
+        findings = secret_hygiene.scan_text(
+            line.replace("VALUE", SYNTHETIC_CREDENTIAL), path=".env.example"
+        )
+        assert len(findings) == 1
+        assert findings[0].variable == "BETMAXXING_THE_ODDS_API_KEY"
+        assert findings[0].line == 1
+
+    def test_every_known_secret_variable_is_covered(self) -> None:
+        for name in secret_hygiene.SECRET_VARIABLES:
+            findings = secret_hygiene.scan_text(
+                f"{name}={SYNTHETIC_CREDENTIAL}", path=".env.example"
+            )
+            assert len(findings) == 1, name
+            assert findings[0].variable == name.upper()
+
+
+class TestTheVerdictNeverReproducesTheValue:
+    """A guard whose own output must be redacted has just moved the leak."""
+
+    def test_the_finding_carries_no_part_of_the_value(self) -> None:
+        finding = secret_hygiene.scan_text(
+            f"BETMAXXING_THE_ODDS_API_KEY={SYNTHETIC_CREDENTIAL}", path=".env.example"
+        )[0]
+        rendered = str(finding)
+        assert SYNTHETIC_CREDENTIAL not in rendered
+        # Not even a fragment: no window of the value survives anywhere.
+        for size in (8, 12, 16):
+            for start in range(0, len(SYNTHETIC_CREDENTIAL) - size + 1):
+                assert SYNTHETIC_CREDENTIAL[start : start + size] not in rendered
+        assert repr(finding).count(SYNTHETIC_CREDENTIAL) == 0
+
+    def test_the_command_line_output_carries_no_part_of_the_value(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        target = tmp_path / ".env.example"
+        target.write_text(f"BETMAXXING_THE_ODDS_API_KEY={SYNTHETIC_CREDENTIAL}\n", encoding="utf-8")
+        assert secret_hygiene.main([str(target)]) == 1
+        captured = capsys.readouterr()
+        assert SYNTHETIC_CREDENTIAL not in captured.out + captured.err
+        assert "BETMAXXING_THE_ODDS_API_KEY" in captured.out
+
+    def test_the_module_is_runnable_as_a_subprocess_without_leaking(self, tmp_path: Path) -> None:
+        """The pre-commit hook and CI both invoke it this way, not as an import."""
+        target = tmp_path / ".env.example"
+        target.write_text(f"BETMAXXING_THE_ODDS_API_KEY={SYNTHETIC_CREDENTIAL}\n", encoding="utf-8")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-W",
+                "error",
+                "-m",
+                "betmaxxing.security.secret_hygiene",
+                str(target),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 1
+        assert SYNTHETIC_CREDENTIAL not in completed.stdout + completed.stderr
+        assert "BETMAXXING_THE_ODDS_API_KEY" in completed.stdout
+
+
+class TestTheGuardDistinguishesProseFromCredentials:
+    """Documentation must keep showing the shape of a setting, or nobody reads it."""
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "BETMAXXING_THE_ODDS_API_KEY=<your-key>",
+            "BETMAXXING_THE_ODDS_API_KEY=…",
+            "BETMAXXING_THE_ODDS_API_KEY=votre-cle",
+            "BETMAXXING_THE_ODDS_API_KEY=$THE_ODDS_API_KEY",
+            "BETMAXXING_THE_ODDS_API_KEY=xxxxxxxx-remplacer",
+        ],
+    )
+    def test_a_placeholder_in_prose_is_allowed(self, line: str) -> None:
+        assert secret_hygiene.scan_text(line, path="docs/deployment.md") == []
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "BETMAXXING_THE_ODDS_API_KEY=VALUE",
+            'BETMAXXING_THE_ODDS_API_KEY="VALUE"',
+            "export BETMAXXING_THE_ODDS_API_KEY=VALUE",
+        ],
+    )
+    def test_a_credential_shaped_value_is_refused_even_in_prose(self, line: str) -> None:
+        findings = secret_hygiene.scan_text(
+            line.replace("VALUE", SYNTHETIC_CREDENTIAL), path="docs/deployment.md"
+        )
+        assert len(findings) == 1
+        assert findings[0].reason == secret_hygiene.LOOKS_LIKE_A_CREDENTIAL
+
+    def test_a_placeholder_is_still_refused_inside_an_environment_file(self) -> None:
+        """`.env.example` is copied verbatim, so even a placeholder is a value there."""
+        findings = secret_hygiene.scan_text(
+            "BETMAXXING_THE_ODDS_API_KEY=<your-key>", path=".env.example"
+        )
+        assert len(findings) == 1
+        assert findings[0].reason == secret_hygiene.IN_ENVIRONMENT_FILE
+
+    def test_a_comment_about_an_assignment_is_not_an_assignment(self) -> None:
+        prose = (
+            "# Put your key in `.env`, for example:\n"
+            f"#     export BETMAXXING_THE_ODDS_API_KEY='{SYNTHETIC_CREDENTIAL}'\n"
+        )
+        assert secret_hygiene.scan_text(prose, path=".env.example") == []
+
+    @pytest.mark.parametrize("name", [".env", ".env.example", ".env.local", "deploy/.env.ci"])
+    def test_every_environment_file_variant_is_treated_strictly(self, name: str) -> None:
+        assert secret_hygiene.is_environment_file(name)
+
+    @pytest.mark.parametrize("name", ["README.md", "docs/deployment.md", "src/a.py"])
+    def test_other_files_are_not_treated_as_environment_files(self, name: str) -> None:
+        assert not secret_hygiene.is_environment_file(name)
+
+
+class TestTheGuardCoversTheRealRepository:
+    """The check that would have stopped the incident, run on this very tree."""
+
+    def test_no_tracked_file_carries_a_populated_secret(self) -> None:
+        findings = secret_hygiene.scan_paths(
+            REPO_ROOT / name for name in secret_hygiene.tracked_files(REPO_ROOT)
+        )
+        assert findings == [], "; ".join(str(finding) for finding in findings)
+
+    def test_the_variable_list_matches_the_template(self) -> None:
+        """A new secret setting must be added to SECRET_VARIABLES, not just to the file."""
+        content = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+        declared = {
+            match.group(1)
+            for line in content.splitlines()
+            if (match := re.match(r"^([A-Z_]*(?:API_KEY|TOKEN|PASSWORD|SECRET))=", line))
+        }
+        known = {name.upper() for name in secret_hygiene.SECRET_VARIABLES}
+        assert declared <= known, f"not covered by the guard: {sorted(declared - known)}"
+
+    def test_env_is_not_tracked(self) -> None:
+        assert ".env" not in secret_hygiene.tracked_files(REPO_ROOT)

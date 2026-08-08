@@ -159,6 +159,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install the package (the guard ships with it)
+        run: pip install -e . -c constraints.txt
+
       - name: No committed .env file
         run: |
           if git ls-files --error-unmatch .env 2>/dev/null; then
@@ -167,17 +174,60 @@ jobs:
           fi
           echo "ok — no .env tracked"
 
-      - name: .env.example carries no secret values
-        run: |
-          if grep -nE '^[A-Z_]*(API_KEY|TOKEN|PASSWORD|SECRET)=.+' .env.example; then
-            echo "::error::.env.example must list secret variables without values"
-            exit 1
-          fi
-          echo "ok — no populated secrets in .env.example"
+      - name: No populated secret variable in any tracked file
+        # One implementation, shared with the pre-commit hook and the test suite:
+        # src/betmaxxing/security/secret_hygiene.py. This replaces an inline grep
+        # that looked only at .env.example, only in upper case, and only at the
+        # very start of a line. The verdict names the variable and the line and
+        # never echoes the value, so a caught secret is not copied into this log.
+        run: python -m betmaxxing.security.secret_hygiene
 
-      - name: Scan history for common secret patterns
+      - name: No credential-shaped value anywhere in the history
+        # A clean tip proves nothing about what stays reachable: a key emptied by
+        # a later commit still lives in the blob its first commit points at. That
+        # is exactly how a key survived here until the history was rewritten.
+        # `fetch-depth: 0` above is what makes this step possible.
         run: |
-          # Deliberately narrow: real provider key shapes, not every long string.
+          python - <<'PY'
+          import subprocess
+          import sys
+
+          from betmaxxing.security import secret_hygiene
+
+
+          def git(*args: str) -> bytes:
+              return subprocess.run(["git", *args], capture_output=True, check=True).stdout
+
+
+          kinds = git("cat-file", "--batch-check", "--batch-all-objects").decode()
+          blobs = [
+              parts[0]
+              for line in kinds.splitlines()
+              if len(parts := line.split()) >= 2 and parts[1] == "blob"
+          ]
+          # A blob is content-addressed and carries no path, so every one is
+          # judged by the rule that does not depend on the filename: a value
+          # shaped like a real credential. Documentation placeholders stay legal.
+          offenders = 0
+          for sha in blobs:
+              payload = git("cat-file", "blob", sha)
+              upper = payload.upper()
+              if b"BETMAXXING" not in upper and b"ANTHROPIC" not in upper:
+                  continue
+              text = payload.decode("utf-8", errors="replace")
+              for finding in secret_hygiene.scan_text(text, path=f"blob {sha[:12]}"):
+                  if finding.reason == secret_hygiene.LOOKS_LIKE_A_CREDENTIAL:
+                      print(f"::error::{finding}")
+                      offenders += 1
+          print(f"scanned {len(blobs)} reachable blobs; credential-shaped values: {offenders}")
+          sys.exit(1 if offenders else 0)
+          PY
+
+      - name: Scan for other vendors' secret patterns
+        run: |
+          # Complements the guard above, which knows only this project's own
+          # variables. Deliberately narrow: real vendor key shapes, not every
+          # long string.
           pattern='(sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
           if git grep -nEI "$pattern" -- . ':!.github/workflows/ci.yml'; then
             echo "::error::possible secret committed"
@@ -188,7 +238,12 @@ jobs:
       - name: The smoke test is never wired into CI
         run: |
           # It consumes real provider credits; it must stay opt-in and manual.
-          if grep -rn "smoke_the_odds_api" .github/workflows/ | grep -v "never wired"; then
+          # Only an actual invocation counts. The previous form matched any
+          # mention of the script, including this workflow's own explanatory
+          # comments, so the step could never pass and its red told nobody
+          # anything. Comment lines are excluded and the match is anchored to a
+          # command that would actually run the script.
+          if grep -rnE '^[^#]*(python|bash|sh|\./)[^#]*smoke_the_odds_api' .github/workflows/; then
             echo "::error::the credit-consuming smoke test must not run in CI"
             exit 1
           fi
