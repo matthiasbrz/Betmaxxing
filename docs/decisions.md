@@ -1081,8 +1081,10 @@ together, and each of which is useless alone:
 4. **the history scan**, because a clean tip proves nothing: a value emptied by a
    later commit still lives in the blob its first commit points at;
 5. **versioned policy** — `CONTRIBUTING.md`, `SECURITY.md` and the pull-request
-   template, with static tests over them, so a rule that is *removed* from the
-   repository stops being invisible.
+   template, with static tests over them, so the absence of a required governance
+   artefact or section, the disappearance of a selected marker from the scope
+   actually inspected, or a stale name cross-checked with the repository becomes
+   visible.
 
 The pull-request template belongs on that list for a reason that is easy to
 dismiss: it forces a *declaration*. Provider calls, endpoints, attempts and

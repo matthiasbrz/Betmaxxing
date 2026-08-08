@@ -513,12 +513,20 @@ class TestTheSuiteStatesWhatItDoesNotProve:
             "must say an inverted rule can still pass"
         )
 
-    def test_no_sentence_of_the_docstring_promises_rule_level_detection(self) -> None:
-        """A formulation guard on this file's own claim. Not a semantic validator."""
-        offenders = sentences_claiming_a_rule_becomes_visible(__doc__ or "")
+    @pytest.mark.parametrize("where", ("module docstring", "D-070"))
+    def test_no_sentence_promises_rule_level_detection(self, where: str) -> None:
+        """A formulation guard on both places this repository states the guarantee.
+
+        Not a semantic validator: it only refuses the one phrasing two reviews
+        rejected. Applied to D-070 as well as to this docstring, because the
+        claim was corrected here first and left standing there.
+        """
+        text = (__doc__ or "") if where == "module docstring" else section(DECISIONS, "D-070")
+        offenders = sentences_claiming_a_rule_becomes_visible(text)
         assert offenders == [], (
-            "the suite detects files, sections, markers and cross-checked names — "
-            f"not rules; offending sentence(s): {offenders}"
+            f"{where} promises rule-level detection; the suite detects artefacts, "
+            f"sections, markers in the inspected scope and cross-checked names — "
+            f"offending sentence(s): {offenders}"
         )
 
     def test_the_docstring_names_the_objects_it_can_actually_detect(self) -> None:
@@ -547,7 +555,8 @@ class TestTheSuiteStatesWhatItDoesNotProve:
         assert mentions_any(text, "human review", "human reader", "review of the diff")
         assert mentions_any(text, "inversion", "inverted", "contradiction", "reversed")
         assert mentions_any(text, "deletion", "deleted", "removal", "removed"), (
-            "the real guarantee is that a deleted rule becomes visible"
+            "the limited guarantee concerns removed topics or sections and stale "
+            "cross-checked names, not rule semantics"
         )
 
     @pytest.mark.parametrize(
