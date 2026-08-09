@@ -191,6 +191,24 @@
 Ces deux blocages nécessitent une action ou des données extérieures. Ils ne sont **pas**
 la seule chose qui reste : voir « Limites internes connues » ci-dessous.
 
+## Gouvernance du dépôt
+
+| Fait | Niveau de preuve |
+|---|---|
+| Branche par défaut `claude/prompt-markdown-file-wag9jw` exposée comme protégée | **observé** — `protected: true` relu depuis GitHub |
+| Mécanisme : ruleset actif, sans protection classique parallèle | **attesté par le propriétaire** — les endpoints REST de protection et de rulesets répondent `403` ici |
+| Sous-règles : PR obligatoire, 0 approbation, checks requis `quality` et `secrets`, mode strict, conversations résolues, administrateurs inclus, sans bypass, force-push et suppression interdits | **attesté par le propriétaire**, non relu — ne pas présenter comme vérifié par l'API |
+| Gouvernance versionnée : `CONTRIBUTING.md`, `SECURITY.md`, `.github/pull_request_template.md`, avec tests statiques | **fait** |
+| Premier exercice du flux PR-only | **en cours** — pull request en brouillon, non fusionnée |
+
+Le flux est désormais : branche de travail → PR vers la branche par défaut →
+`quality` et `secrets` verts → branche à jour → conversations résolues → fusion sur
+autorisation explicite du propriétaire. Aucun push direct sur la branche par défaut.
+
+Rappel de limite GitHub : un check requis est satisfait par `success`, `skipped`
+**ou** `neutral`. La protection ne garantit donc pas à elle seule une conclusion
+`success` ; les gardes du workflow restent nécessaires. Voir D-070.
+
 ## Limites internes connues
 
 Rien ici ne dépend d'un tiers ; ce sont des choix de périmètre de cette tranche.
