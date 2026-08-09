@@ -153,7 +153,7 @@
 | Incertitude | ⛔ `UNAVAILABLE` | Aucune méthode défendable. `SYNTHETIC` en démo seulement |
 | Mode `paper` / `live_analysis` | ⚠️ **ne publie rien** | Conséquence directe de la ligne précédente. C'est correct |
 | Challenge — Montante | ⚠️ `PARTIAL`, désactivé | Persistant et testé, mais **désactivé par défaut** ; aucune validation d'usage réel |
-| `TheOddsApiProvider` | ⚠️ `IMPLEMENTED_UNVERIFIED` | Contrats locaux verts. 6 appels réels le 2026-08-07 (4 gratuits, 2 payants, 2 crédits) ont validé auth, endpoint payant et comptabilité du coût ; le **mapping des cotes reste non vérifié en réel** (`winamax_fr` absent des 2 événements testés) |
+| `TheOddsApiProvider` | ⚠️ `IMPLEMENTED_UNVERIFIED` | Contrats locaux verts. 6 appels réels le 2026-08-07 (4 gratuits, 2 payants, 2 crédits) ont validé auth, endpoint payant et comptabilité du coût ; le **mapping des cotes reste non vérifié en réel** (`winamax_fr` absent des 2 événements testés). Critères de qualification préenregistrés en D-071, aucun satisfait |
 | Activation fournisseur | ◐ **partiellement exercée en réel** | Connectivité, authentification, endpoint payant, comptabilité du coût, chaînage et signature : **vérifiés en réel** (4 requêtes gratuites + 2 payantes, 2 crédits, quota 494 → 492). Mapping et fraîcheur : **non obtenus en réel**, seulement `OFFLINE_CONTRACT_VERIFIED` sur fixture. L'état courant se lit avec `activation status`, qui sépare les cinq dimensions |
 | Couverture `winamax_fr` sur `soccer_spl` | ⛔ **absente** sur les 2 événements testés | Constat daté et borné : deux événements, deux instants. Aucune généralisation au fournisseur |
 | Couverture Winamax | ❓ **non vérifiée** | Annoncée par la documentation officielle (lue le 2026-08-05) ; non confirmée par un appel |
@@ -167,7 +167,8 @@
 | Élément | Raison |
 |---|---|
 | Vérification réelle du mapping The Odds API | Exige un événement où `winamax_fr` est effectivement coté. Les deux tentatives SPL du 2026-08-07 ne l'ont pas trouvé. Chaque nouvelle tentative demande une autorisation explicite et distincte. Runbook : `docs/provider-activation.md` |
-| Promotion de l'adaptateur en `VERIFIED` | Une activation réussie est une preuve **limitée** (un endpoint, un bookmaker, une compétition, un événement, un marché, un instant). Les critères de promotion globale — nombre d'événements, de compétitions, de jours, taux de couverture — restent à écrire |
+| Promotion de l'adaptateur en `VERIFIED` | Une activation réussie est une preuve **limitée** (un endpoint, un bookmaker, une compétition, un événement, un marché, un instant). Les critères de promotion sont désormais **écrits et préenregistrés** — `PROVIDER_VALIDATION_PROTOCOL_VERSION = 1`, `docs/provider-validation-protocol.md`, D-071 — et **aucun n'est encore satisfait** : la campagne n'a pas été exécutée. `activation status` dit précisément ce qui manque. La promotion elle-même reste une décision humaine ; la machine plafonne à `CRITERIA_MET_AWAITING_HUMAN_REVIEW` |
+| Exécution de la campagne de qualification | Préparée en deux pistes (parser générique, couverture Winamax), bornée à **12 requêtes et 16 crédits maximum**, avec arrêts anticipés écrits. Chaque appel exige une autorisation humaine distincte ; aucun n'a été lancé dans cette tranche |
 | Méthode d'incertitude réelle | Nécessite des données historiques : bootstrap paramétrique/clusterisé + étude de couverture (D-019) |
 | Endpoints historiques (payants) | Hors périmètre : aucun appel payant sans action de l'utilisateur |
 | Pipeline d'entraînement | Nécessite des données historiques ; les modèles consomment des paramètres fournis |
@@ -199,11 +200,16 @@ la seule chose qui reste : voir « Limites internes connues » ci-dessous.
 | Mécanisme : ruleset actif, sans protection classique parallèle | **attesté par le propriétaire** — les endpoints REST de protection et de rulesets répondent `403` ici |
 | Sous-règles : PR obligatoire, 0 approbation, checks requis `quality` et `secrets`, mode strict, conversations résolues, administrateurs inclus, sans bypass, force-push et suppression interdits | **attesté par le propriétaire**, non relu — ne pas présenter comme vérifié par l'API |
 | Gouvernance versionnée : `CONTRIBUTING.md`, `SECURITY.md`, `.github/pull_request_template.md`, avec tests statiques | **fait** |
-| Premier exercice du flux PR-only | **en cours** — pull request en brouillon, non fusionnée |
+| Premier exercice du flux PR-only | **fait** — PR #1 fusionnée par merge commit `df846003`, cinq commits audités conservés, branche de travail non supprimée |
+| CI post-fusion sur la branche par défaut | **observé** — run #24 `31308176620`, événement `push`, tentative 1, `quality = success`, `secrets = success`, aucune étape fonctionnelle skippée |
 
 Le flux est désormais : branche de travail → PR vers la branche par défaut →
 `quality` et `secrets` verts → branche à jour → conversations résolues → fusion sur
 autorisation explicite du propriétaire. Aucun push direct sur la branche par défaut.
+
+Cet exercice a coûté cinq commits et six audits successifs, dont quatre ont trouvé
+une garantie surévaluée dans la documentation elle-même. Le résultat utile n'est pas
+le flux — c'est que chaque revendication survivante a été mesurée.
 
 Rappel de limite GitHub : un check requis est satisfait par `success`, `skipped`
 **ou** `neutral`. La protection ne garantit donc pas à elle seule une conclusion

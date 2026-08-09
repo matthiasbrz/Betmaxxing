@@ -1942,8 +1942,16 @@ def build_activation_state(receipts: list[dict[str, Any]], unverifiable: int) ->
     else:
         paid_state = PaidActivationState.CORE_EXECUTED_NO_COVERAGE
 
+    # Sixth block, added by 03C-1: the pre-registered qualification criteria,
+    # evaluated over the same receipts. Imported here rather than at module level
+    # because `qualification` imports this module for its vocabularies.
+    from .qualification import evaluate as evaluate_qualification
+
+    qualification = evaluate_qualification(receipts, unverifiable)
+
     return {
-        # 1. The adapter itself. A ponctual observation never promotes it.
+        # 1. The adapter itself. A ponctual observation never promotes it —
+        # including when every criterion below is satisfied.
         "adapter_state": "IMPLEMENTED_UNVERIFIED",
         # 2. How far the sequence has gone here.
         "execution_state": str(execution),
@@ -1970,6 +1978,9 @@ def build_activation_state(receipts: list[dict[str, Any]], unverifiable: int) ->
         "verified_receipts": len(receipts),
         "unverifiable_receipts": unverifiable,
         "receipt_directory": str(receipt_dir()),
+        # 6. Whether the pre-registered criteria are met. Deleting the receipt
+        # directory resets this to zero evidence, exactly as D-062 says.
+        **qualification,
         "scope_note": (
             "Chaque observation de couverture vaut pour un fournisseur, un bookmaker, "
             "une compétition, un événement tagué, un marché et un instant — rien de plus."
@@ -2008,6 +2019,9 @@ def status(
             )
     else:
         lines.append("Aucune observation de couverture enregistrée.")
+    from .qualification import summary_lines
+
+    lines += summary_lines(document)
     lines += ["", document["scope_note"], f"Modèles : {document['model_impact']}."]
     _emit(document, lines, as_json=json_output)
 

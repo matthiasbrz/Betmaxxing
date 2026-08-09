@@ -213,3 +213,30 @@ appels réels au fournisseur.
 Ne s'y trouvent **jamais** : la clé API, le secret de signature, une URL non
 expurgée, un corps de réponse brut, une cote, un nom de participant, un horaire
 individuel, ni l'identifiant d'événement en clair.
+
+## Bloc de qualification fournisseur (D-071)
+
+Produit par `qualification.evaluate()` et fusionné dans la sortie de
+`activation status`. Calcul pur : aucun réseau, aucune clé, aucun reçu modifié.
+Le protocole complet est dans `docs/provider-validation-protocol.md`.
+
+| Champ | Type | Sens |
+|---|---|---|
+| `qualification_protocol_version` | `int` | version des seuils appliqués ; deux versions ne se comparent pas |
+| `qualification_state` | `str` | `INSUFFICIENT_EVIDENCE`, `EVIDENCE_CONFLICT` ou `CRITERIA_MET_AWAITING_HUMAN_REVIEW`. Il n'existe pas de `VERIFIED` |
+| `criteria_results` | `list` | un élément par critère, ordre stable |
+| `criteria_results[].criterion_id` | `str` | identifiant stable, ex. `CORE_MAPPING_FOOTBALL` |
+| `criteria_results[].passed` | `bool` | seuils atteints pour ce critère seul |
+| `criteria_results[].observed` | `dict` | compteurs après déduplication : `events`, `competitions`, `utc_days` |
+| `criteria_results[].required` | `dict` | seuils préenregistrés, mêmes clés |
+| `criteria_results[].missing` | `list[str]` | ce qui manque, en clair, ou vide |
+| `criteria_results[].scope` | `str` | sport, commande, marché, âge maximal |
+| `criteria_results[].limit` | `str` | ce que le critère **n'**établit pas |
+| `eligible_for_human_promotion_review` | `bool` | vrai seulement à `CRITERIA_MET_AWAITING_HUMAN_REVIEW`. N'autorise aucune promotion |
+| `evidence_conflicts` | `list[str]` | contradictions internes nommées ; non vide ⇒ échec fermé |
+| `admissible_observations` | `int` | observations retenues, toutes dédupliquées |
+| `unverifiable_receipts` | `int` | fichiers comptés et **jamais lus** : signature invalide, schéma inconnu, v1 |
+
+Aucun de ces champs ne porte de cote, de nom d'équipe, d'identifiant d'événement en
+clair, de clé ni de payload. `adapter_state` reste `IMPLEMENTED_UNVERIFIED` quelle
+que soit la valeur de ce bloc.

@@ -412,3 +412,48 @@ entraînement ou backtest sur données nouvelles, promotion de modèle, publicat
 de candidat en `paper` ou `live_analysis`, démarrage d'un ordonnanceur réel,
 envoi de notification, pari ou automatisme de mise, interface web, et
 versionnement d'un payload fournisseur brut.
+
+## Lire la qualification (D-071)
+
+`activation status` porte, depuis 03C-1, un sixième bloc : l'évaluation des
+critères **préenregistrés** de `docs/provider-validation-protocol.md`
+(`PROVIDER_VALIDATION_PROTOCOL_VERSION = 1`).
+
+```bash
+betmaxxing-the-odds-api activation status          # lecture humaine
+betmaxxing-the-odds-api activation status --json    # même contenu, parseable
+```
+
+Ce que le bloc dit, et ce qu'il ne dit pas :
+
+- `qualification_state` vaut au mieux `CRITERIA_MET_AWAITING_HUMAN_REVIEW`. Le
+  vocabulaire de l'évaluateur ne contient aucun statut « vérifié » : la promotion
+  est une décision humaine, prise ailleurs. Voir `QualificationState` ;
+- chaque `criteria_results[]` porte son `observed`, son `required` et son `missing`.
+  Lisez `missing` : c'est la réponse à « qu'est-ce qu'il manque encore » ;
+- `limit` dit ce que le critère **n'**établit pas. Un `CORE_MAPPING_FOOTBALL` vert
+  ne dit rien d'un bookmaker, d'une compétition non observée ou d'une autre date ;
+- `evidence_conflicts` non vide est un **échec fermé**, pas une preuve à pondérer ;
+- `unverifiable_receipts` compte les fichiers refusés — signature invalide, schéma
+  inconnu, v1. Ils sont comptés et jamais lus ;
+- supprimer le répertoire de reçus remet la preuve à zéro. C'est voulu.
+
+Aucun appel réseau n'est fait par `status`, et aucune clé n'est lue.
+
+## Campagne de qualification — préparée, non lancée
+
+Le plan complet, ses seuils argumentés, son budget et ses arrêts anticipés sont
+dans `docs/provider-validation-protocol.md` §8. Résumé opérationnel :
+
+| | |
+|---|---|
+| Piste A | vérifier le parser avec un bookmaker documenté comme susceptible d'être couvert — choix, source officielle et date à écrire **avant** le premier appel |
+| Piste B | couverture `winamax_fr`, indépendante ; le constat du 2026-08-07 reste borné aux deux événements SPL testés |
+| Requêtes maximales | **12** |
+| Crédits maximaux | **16** — borne tarifaire relue, pas une garantie de facture |
+| Autorisations humaines | **12**, une par appel |
+| Arrêt immédiat | `COVERAGE_MISSING`, `COST_MISMATCH`, mapping rejeté |
+| Substitution automatique | **aucune**, ni de bookmaker ni d'événement |
+
+Aucune de ces commandes n'a été exécutée par la tranche 03C-1 : elle n'écrit que le
+protocole, l'évaluateur et leurs tests.

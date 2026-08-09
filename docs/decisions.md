@@ -1132,3 +1132,67 @@ merging it, closing it and deleting its branch are five separate acts requiring
 five separate authorisations. An instruction that permits "fix and push" permits
 a push to a *work branch*; it never permits a push to the default branch, and a
 green pull request is not permission to merge.
+
+### D-071 — Écrire les seuils avant les appels, et n'en tirer qu'une invitation
+
+Le manque restant après 03B-4 n'était pas une observation. C'était qu'aucun texte
+ne disait, à l'avance, **combien** de preuve live justifierait de demander une
+promotion de l'adaptateur. Deux appels `core` réels ont abouti, n'ont trouvé aucune
+couverture Winamax, et ont malgré tout été résumés comme une activation qui
+« fonctionnait ». Sans seuil préenregistré, tout résultat se relit comme
+encourageant — et le seuil qu'on écrit après avoir vu les chiffres n'est pas un
+critère, c'est une description.
+
+`docs/provider-validation-protocol.md` porte donc
+`PROVIDER_VALIDATION_PROTOCOL_VERSION = 1`, et toute modification d'un seuil, d'une
+portée ou d'une règle d'admissibilité incrémente ce nombre. Deux rapports calculés
+sous des versions différentes ne se comparent pas : c'est ce qui rend visible un
+critère assoupli après coup.
+
+**Neuf faits tenus séparés**, parce qu'un mot ne les porte pas : implémentation,
+connectivité, coût, présence ponctuelle d'un bookmaker, mapping d'un marché,
+fraîcheur, diversité de l'échantillon, qualification globale, promotion humaine.
+L'absence de `winamax_fr` sur un événement est un fait sur l'offre de ce bookmaker,
+pas un échec de notre parser ; et un mapping réussi avec un autre bookmaker ne
+prouve aucune couverture Winamax.
+
+**Huit critères, seuils argumentés avant observation.** Trois événements, deux
+compétitions et deux jours UTC pour `core` — un événement ne se distingue pas d'une
+réponse chanceuse, et le `last_update` change d'emplacement selon la forme de
+réponse, ce qui est exactement là où cet adaptateur s'était trompé. Deux événements
+et un seul jour pour chacun des cinq marchés `additional`, parce que l'endpoint
+coûte cinq fois plus ; le protocole écrit ce que ce compromis coûte en confiance
+plutôt que de le taire. Le seuil de fraîcheur est `Settings.max_odds_age_seconds`,
+non un nombre inventé ici : si le scan appelle un snapshot périmé, la qualification
+ne peut pas l'appeler frais.
+
+**v2 contribue à ce que son schéma peut établir, et à rien de plus.** Sa carte
+`market_states` était partielle, donc il ne peut pas établir l'état d'**un** marché
+nommé — aucun critère `additional` ne l'accepte. Mais `selections_mapped` a le même
+sens en v2 et v3, donc un `core` v2 compte. C'est plus étroit qu'un refus global de
+v2, et la raison est écrite.
+
+**Expiration : deux questions.** Un reçu de plus de six heures n'autorise plus
+l'étape suivante — `load_parent()` refuse, sans exception. Il atteste toujours
+qu'un appel a eu lieu, et l'évaluateur le lit à ce titre. La TTL empêche de
+réutiliser une preuve périmée pour engager une dépense ; elle ne fait pas
+dis-arriver l'appel.
+
+**Échec fermé.** Un reçu qui se contredit — sélections cartographiées sans marché
+`OBSERVED_MAPPED`, bookmaker absent avec des sélections, statut live sans tentative
+réseau, `accounted_credits` sous `observed_credits` — donne `EVIDENCE_CONFLICT` et
+la contradiction est nommée. Ce n'est pas une preuve faible à pondérer : un de ses
+champs est faux et on ne sait pas lequel.
+
+**Plafond.** La machine peut conclure `INSUFFICIENT_EVIDENCE`,
+`EVIDENCE_CONFLICT` ou `CRITERIA_MET_AWAITING_HUMAN_REVIEW`. Il n'y a pas de
+`VERIFIED` dans le vocabulaire, et `adapter_state` reste
+`IMPLEMENTED_UNVERIFIED` même tous critères satisfaits. `eligible_for_human_promotion_review`
+ouvre une conversation, pas une porte — un programme capable d'écrire « vérifié »
+a déjà pris la décision qu'un humain devait prendre.
+
+Ce que cette décision **ne** fait pas : elle n'implémente rien de D-060 à D-064,
+qui étaient déjà en place et sont désormais épinglées par
+`tests/test_activation_characterisation.py`. Aucun schéma v4 : l'évaluation se fait
+avec les champs v2/v3 existants, et un v4 exigerait une nécessité démontrée, un
+test rouge et une décision séparée.
