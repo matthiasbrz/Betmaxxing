@@ -1135,6 +1135,21 @@ green pull request is not permission to merge.
 
 ### D-071 — Écrire les seuils avant les appels, et n'en tirer qu'une invitation
 
+> **Supersédée pour la qualification par D-072.** L'intention et les huit critères
+> restent ; cinq propriétés que ce texte revendiquait n'étaient pas tenues **au
+> runtime**, ce qu'un audit indépendant en lecture seule a reproduit avant tout
+> appel : (1) le seuil de fraîcheur venait du réglage `max_odds_age_seconds`, donc
+> d'un `.env`, sous un numéro de version inchangé ; (2) aucune date d'effet ni
+> liaison à une version d'implémentation, si bien que des reçus antérieurs de vingt
+> jours satisfaisaient les huit critères ; (3) l'admissibilité était une liste
+> noire, donc un statut inconnu ou celui de l'autre commande produisait une preuve
+> positive ; (4) les contradictions n'étaient détectées que dans un sens ; (5) les
+> « jours UTC » étaient des dates civiles non normalisées. Les paragraphes
+> ci-dessous sont conservés tels qu'écrits, y compris ce qui est maintenant faux :
+> le seuil n'est plus `max_odds_age_seconds`, v2 ne contribue plus à rien, et le
+> schéma v4 dont ce texte disait qu'il exigerait « une nécessité démontrée, un test
+> rouge et une décision séparée » a reçu exactement cela.
+
 Le manque restant après 03B-4 n'était pas une observation. C'était qu'aucun texte
 ne disait, à l'avance, **combien** de preuve live justifierait de demander une
 promotion de l'adaptateur. Deux appels `core` réels ont abouti, n'ont trouvé aucune
@@ -1196,3 +1211,104 @@ qui étaient déjà en place et sont désormais épinglées par
 `tests/test_activation_characterisation.py`. Aucun schéma v4 : l'évaluation se fait
 avec les champs v2/v3 existants, et un v4 exigerait une nécessité démontrée, un
 test rouge et une décision séparée.
+
+### D-072 — Une preuve de qualification est fermée, datée et versionnée
+
+D-071 avait raison sur l'intention et faux sur l'exécution. Un audit indépendant en
+lecture seule, mené **avant** tout nouvel appel, a reproduit cinq défauts qui
+rendaient trois de ses revendications fausses au runtime. Cette décision les ferme
+et n'efface pas la première : D-071 reste lisible, annotée, avec ses erreurs.
+
+**Le seuil est un littéral.** `PROTOCOL_MAX_ODDS_AGE_SECONDS = 900` vit dans le
+protocole. v1 lisait le réglage runtime `max_odds_age_seconds`, si bien qu'un `.env`
+portant `BETMAXXING_MAX_ODDS_AGE_SECONDS=123` produisait un protocole *différent*
+sous le même numéro de version — et dans le sens qui desserre, puisque relever le
+seuil laisse une cote périmée soutenir une prétention de fraîcheur. Le module de
+qualification ne lit désormais **aucune** configuration : ni réglage, ni `.env`, ni
+variable d'environnement, ce qu'un test structurel et un sous-processus vérifient.
+Le réglage du produit reste configurable pour le scan ; ce sont deux objets aux rôles
+distincts, qui valent tous deux 900 par défaut et sont censés coïncider. S'ils
+divergent, le protocole garde son 900 et aucun reçu ne devient plus admissible.
+
+**Deux versions, dans le reçu signé.** `PROVIDER_VALIDATION_PROTOCOL_VERSION = 2` et
+`PROVIDER_ADAPTER_EVIDENCE_VERSION = 1` sont écrits dans chaque reçu par le chemin
+commun de création, donc sur `discover`, `core` et `additional`, et **couverts par la
+signature HMAC** : altérer l'un des deux champs invalide le reçu. Une preuve ne
+qualifie que si ses deux versions correspondent exactement aux versions courantes.
+La première règle empêche de comparer des résultats calculés sous des seuils
+différents ; la seconde empêche qu'une preuve produite par un parser que nous avons
+depuis modifié soit relue comme une preuve sur le parser que nous livrons. Ce que la
+version de preuve d'adaptateur **ne** fait pas : valider le payload du fournisseur.
+Aucun numéro de version ne valide un payload.
+
+**Le schéma de reçu passe à v4**, parce que l'absence de ces deux champs est
+signifiante : un reçu v3 ne peut pas dire sous quel protocole il serait jugé ni quel
+parser l'a produit, donc il ne peut pas être une preuve *courante*. v2 et v3 restent
+lus, vérifiés, honorés comme autorité de chaînage, jamais réécrits ni re-signés, et
+comptés dans le bloc historique. Ils ne qualifient plus **aucun** critère, y compris
+`COST_CONFORMITY`. C'est le prix assumé de la correction : la preuve déjà sur disque
+devient de l'histoire. Aucun reçu réel n'a été migré, ouvert ni supprimé.
+
+**Une date d'effet.** `QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC =
+"2026-08-09T19:38:29+00:00"` — l'instant du début de cette tranche, choisi une fois,
+écrit à l'identique dans le code, ici et dans le protocole, jamais recalculé au
+runtime. Un `recorded_at` doit être un ISO 8601 avec timezone, normalisé en UTC, et
+supérieur ou égal à cet instant. Aucun appel fournisseur n'étant autorisé par cette
+tranche, toute preuve réelle future lui sera postérieure — et les deux appels réels
+du 7 août, qui alimentaient auparavant 2/6 du compteur de coût sans rien prouver sur
+le parser, n'y contribuent plus.
+
+**L'admissibilité est une table positive.** `core → CORE_LIVE_VERIFIED` ;
+`additional → ADDITIONAL_LIVE_VERIFIED | ADDITIONAL_PARTIAL_COVERAGE`. Tout statut
+inconnu, futur, ou associé à la mauvaise commande est refusé par défaut. La liste
+noire de v1 reste, comme défense supplémentaire et jamais comme seule barrière —
+c'est précisément ce qu'elle était, et un statut inventé produisait alors une preuve
+positive. Le coût a sa propre définition, cumulative : reçu admissible, commande
+payante, socket ouverte et requête servie, `estimated_credits` entier sous le plafond
+de la commande, `observed_credits` entier — jamais booléen — dans le même intervalle,
+`accounted_credits == observed_credits`, statut établissant un coût. Un
+`COVERAGE_MISSING` postérieur compte donc pour le coût et jamais pour le mapping ; un
+coût seulement supposé après un timeout ne compte pas du tout.
+
+**Les contradictions sont réciproques.** Six invariants, sur les cartes totales v3 et
+v4 : un marché `OBSERVED_MAPPED` sans sélection cartographiée ; des sélections sans
+aucun marché `OBSERVED_MAPPED` ; `NOT_RETURNED` avec un marché `OBSERVED_MAPPED` ;
+`NOT_RETURNED` avec un `markets_mapped` non vide ; `markets_mapped` en désaccord avec
+la carte ; un marché `OBSERVED_MAPPED` sans âge de fraîcheur entier positif. v1 ne
+tenait que la deuxième, et un reçu déclarant *le bookmaker jamais retourné* et *zéro
+sélection* « prouvait » cinq marchés cartographiés sans lever le moindre conflit.
+
+**Les jours UTC sont des jours UTC.** `astimezone(UTC)` avant de prendre la date.
+`00:30+02:00` et `23:30+00:00` sont le même jour ; v1 en comptait deux, et trois
+observations d'une seule journée UTC satisfaisaient « deux jours UTC ».
+
+**Compteurs séparés.** Le bloc de qualification expose
+`qualification_admissible_receipts`, `qualification_historical_nonqualifying_receipts`,
+`qualification_unverifiable_receipts` et une table de raisons agrégées — schéma
+ancien, protocole différent, version d'adaptateur différente, antérieur à la date
+d'effet, horodatage inexploitable, reçu contradictoire, non vérifié ou schéma
+inconnu. Des comptes seulement : aucun chemin, aucun reçu, aucun tag, aucun
+identifiant. Le champ D-062 `unverifiable_receipts` garde son propre sens : il était
+écrasé par étalement de dictionnaire, chaque clé est désormais listée explicitement.
+
+**Tags HMAC : politique tranchée.** Le tag local reste visible dans
+`bookmaker_coverage_observations` et nulle part ailleurs — c'est ce qui borne une
+observation à un événement sans jamais le nommer, conformément à D-062. Il n'est pas
+l'identifiant fournisseur en clair et ne doit jamais être présenté comme tel.
+L'assertion qui prétendait l'inverse cherchait une sentinelle absente de sa propre
+fixture, donc ne pouvait pas échouer ; elle est remplacée par des tests portant sur
+les valeurs réellement injectées.
+
+**Budget corrigé.** Une invocation CLI n'est pas une requête HTTP : `discover` en
+fait deux. La campagne préparée vaut 12 invocations, 12 autorisations humaines, 16
+requêtes HTTP dont 8 payantes, et 16 crédits contractuels. v1 annonçait « 12
+requêtes » et sous-estimait donc le trafic de quatre, en chiffrant les crédits
+correctement. Les cinq totaux sont dérivés de `CAMPAIGN_INVOCATIONS`, `LOCAL_BOUNDS`
+et `STEP_CEILINGS`, et un test compare la dérivation au document.
+
+**Ce que cette décision ne fait pas.** Aucun appel fournisseur, aucun crédit, aucune
+promotion, aucun changement de statut métier : l'adaptateur reste
+`IMPLEMENTED_UNVERIFIED`, les modèles `BACKTEST_ONLY`. Aucune preuve réelle n'a
+encore été collectée sous protocole v2 et schéma v4 — l'état courant est
+`INSUFFICIENT_EVIDENCE` avec zéro reçu admissible, ce qui est exactement ce qu'un
+protocole préenregistré doit afficher avant sa première campagne.

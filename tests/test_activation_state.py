@@ -498,12 +498,16 @@ class TestTheSchemaIsVersionedForTheNewContract:
     ) -> None:
         attempt_core(monkeypatch, keyed, odds_payload())
         for receipt in receipts_in(keyed):
-            assert receipt["schema_version"] == 3
+            assert receipt["schema_version"] == 4
+            # v4's reason to exist: the receipt names the protocol that would
+            # judge it and the parser that produced it, both under the signature.
+            assert receipt["qualification_protocol_version"] == 2
+            assert receipt["provider_adapter_evidence_version"] == 1
 
-    def test_the_reader_accepts_both_supported_versions(self) -> None:
+    def test_the_reader_accepts_every_supported_version(self) -> None:
         from betmaxxing.providers.the_odds_api.activation import SUPPORTED_SCHEMA_VERSIONS
 
-        assert set(SUPPORTED_SCHEMA_VERSIONS) == {2, 3}
+        assert set(SUPPORTED_SCHEMA_VERSIONS) == {2, 3, 4}
 
     def test_an_unknown_version_is_refused(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None

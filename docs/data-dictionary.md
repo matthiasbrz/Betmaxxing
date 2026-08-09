@@ -186,12 +186,13 @@ appels réels au fournisseur.
 
 | Champ | Sens |
 |---|---|
-| `schema_version` | 3 pour tout reçu écrit désormais. Les v2 restent **lus** et honorés, jamais réécrits ni re-signés ; v1 et inconnues sont refusées |
+| `schema_version` | 4 pour tout reçu écrit désormais. Les v2 et v3 restent **lus** et honorés comme autorité de chaînage, jamais réécrits ni re-signés, et ne qualifient plus rien (D-072) ; v1 et inconnues sont refusées |
+| `qualification_protocol_version` / `provider_adapter_evidence_version` | v4 seulement : sous quel protocole ce reçu serait jugé, et quel parser l'a produit. **Couverts par la signature** — altérer l'un invalide le reçu |
 | `receipt_id` | identifiant local du reçu |
 | `parent_receipt_id` / `parent_schema_version` | le reçu qui a autorisé cette étape, et sous quel schéma il a été accepté |
 | `command`, `status`, `recorded_at`, `expires_at` | étape, issue terminale, instant, péremption (6 h) |
 | `sport_key`, `bookmaker` | portée demandée |
-| `event_tag` / `event_tags` | identifiant(s) d'événement en **HMAC local**, jamais en clair |
+| `event_tag` / `event_tags` | identifiant(s) d'événement en **HMAC local**, jamais en clair. Volontairement visible dans `bookmaker_coverage_observations` et nulle part ailleurs : c'est ce qui borne une observation à un événement sans le nommer (D-062). Ce n'est pas l'identifiant fournisseur et ne doit jamais être présenté comme tel |
 | `window_from`, `window_to` | fenêtre déclarée |
 | `endpoints`, `endpoint`, `attempts` | endpoints **templatés** (jamais d'URL avec query string) et nombre exact de requêtes tentées |
 | `network_attempted`, `may_have_reached_provider` | une socket a-t-elle été ouverte ; la requête a-t-elle pu être servie (un timeout de lecture vaut « oui ») |
@@ -214,15 +215,19 @@ Ne s'y trouvent **jamais** : la clé API, le secret de signature, une URL non
 expurgée, un corps de réponse brut, une cote, un nom de participant, un horaire
 individuel, ni l'identifiant d'événement en clair.
 
-## Bloc de qualification fournisseur (D-071)
+## Bloc de qualification fournisseur (D-071, corrigé par D-072)
 
-Produit par `qualification.evaluate()` et fusionné dans la sortie de
-`activation status`. Calcul pur : aucun réseau, aucune clé, aucun reçu modifié.
-Le protocole complet est dans `docs/provider-validation-protocol.md`.
+Produit par `qualification.evaluate()` et recopié champ par champ dans la sortie
+de `activation status` — jamais étalé, pour qu'une clé du protocole ne puisse pas
+écraser un champ D-062 du même nom. Calcul pur : aucun réseau, aucune clé, aucune
+configuration, aucun reçu modifié. Le protocole complet est dans
+`docs/provider-validation-protocol.md`.
 
 | Champ | Type | Sens |
 |---|---|---|
-| `qualification_protocol_version` | `int` | version des seuils appliqués ; deux versions ne se comparent pas |
+| `qualification_protocol_version` | `int` | version des seuils appliqués — `2` ; deux versions ne se comparent pas |
+| `qualification_adapter_evidence_version` | `int` | version du parser sous laquelle une preuve compte — `1` |
+| `qualification_evidence_not_before` | `str` | instant UTC littéral avant lequel un reçu est historique et jamais qualifiant |
 | `qualification_state` | `str` | `INSUFFICIENT_EVIDENCE`, `EVIDENCE_CONFLICT` ou `CRITERIA_MET_AWAITING_HUMAN_REVIEW`. Il n'existe pas de `VERIFIED` |
 | `criteria_results` | `list` | un élément par critère, ordre stable |
 | `criteria_results[].criterion_id` | `str` | identifiant stable, ex. `CORE_MAPPING_FOOTBALL` |
@@ -234,8 +239,10 @@ Le protocole complet est dans `docs/provider-validation-protocol.md`.
 | `criteria_results[].limit` | `str` | ce que le critère **n'**établit pas |
 | `eligible_for_human_promotion_review` | `bool` | vrai seulement à `CRITERIA_MET_AWAITING_HUMAN_REVIEW`. N'autorise aucune promotion |
 | `evidence_conflicts` | `list[str]` | contradictions internes nommées ; non vide ⇒ échec fermé |
-| `admissible_observations` | `int` | observations retenues, toutes dédupliquées |
-| `unverifiable_receipts` | `int` | fichiers comptés et **jamais lus** : signature invalide, schéma inconnu, v1 |
+| `qualification_admissible_receipts` | `int` | reçus qui sont une preuve **courante** : v4, versions `2/1`, postérieurs à la date d'effet, non contradictoires |
+| `qualification_historical_nonqualifying_receipts` | `int` | reçus valides et lisibles qui ne qualifient rien : v2/v3, autre version, antérieurs, contradictoires |
+| `qualification_unverifiable_receipts` | `int` | fichiers comptés et **jamais lus** : signature invalide, schéma inconnu, v1. Distinct du champ D-062 `unverifiable_receipts`, qui compte la même idée sur la population de l'audit local |
+| `qualification_reasons` | `dict[str, int]` | taxonomie agrégée : `stale_schema`, `other_protocol_version`, `other_adapter_evidence_version`, `before_effective_instant`, `unusable_recorded_at`, `self_contradictory`, `unverified_or_unknown_schema`. **Des comptes seulement** — aucun chemin, reçu, tag ni identifiant |
 
 Aucun de ces champs ne porte de cote, de nom d'équipe, d'identifiant d'événement en
 clair, de clé ni de payload. `adapter_state` reste `IMPLEMENTED_UNVERIFIED` quelle

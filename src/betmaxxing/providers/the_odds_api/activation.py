@@ -165,16 +165,25 @@ MAX_WINDOW_HOURS = 24
 #: ``NOT_EVALUATED_BOOKMAKER_ABSENT``. A reader that applied v3's invariants to a
 #: v2 file would draw a wrong conclusion, which is exactly what a version number
 #: is for.
-RECEIPT_SCHEMA_VERSION = 3
+#:
+#: v4 adds ``qualification_protocol_version`` and
+#: ``provider_adapter_evidence_version``, both covered by the signature. It is a
+#: new version rather than v3 with extra fields because their *absence* is
+#: meaningful: a v3 receipt cannot say which protocol judged it or which parser
+#: produced it, so it cannot be current qualification evidence. See D-072.
+RECEIPT_SCHEMA_VERSION = 4
 
-#: v2 receipts already on an operator's disk stay usable as authority. Every
-#: field the chain actually depends on — ``event_tags``, ``event_tag``,
+#: v2 and v3 receipts already on an operator's disk stay usable as authority.
+#: Every field the chain actually depends on — ``event_tags``, ``event_tag``,
 #: ``observed_credits``, ``accounted_credits``, ``selections_mapped``,
-#: ``parent_receipt_id``, ``expires_at`` — has the same meaning in both versions;
-#: only ``market_states`` and its projections changed, and those are not
-#: preconditions. So a valid v2 receipt is read, verified and honoured, never
-#: rewritten and never re-signed. Anything outside this set is refused.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({2, RECEIPT_SCHEMA_VERSION})
+#: ``parent_receipt_id``, ``expires_at`` — has the same meaning in all three
+#: versions; only ``market_states`` and its projections changed at v3, and only
+#: the two version stamps arrived at v4. None of those are preconditions, so a
+#: valid v2 or v3 receipt is read, verified and honoured for chaining, never
+#: rewritten and never re-signed. Whether it *qualifies* anything is a different
+#: question, answered by the protocol and not here. Anything outside this set is
+#: refused.
+SUPPORTED_SCHEMA_VERSIONS = frozenset({2, 3, RECEIPT_SCHEMA_VERSION})
 
 SIGNATURE_FIELD = "signature"
 
@@ -631,8 +640,22 @@ def build_receipt(attempt: Attempt, status: ActivationStatus, secret: str) -> di
     in what state, how fresh they were, and whether our parser coped — the whole
     question an activation is meant to answer.
     """
+    # The single common path, so `discover`, `core` and `additional` all carry the
+    # two version stamps and all three are covered by the signature below.
+    # Imported here rather than at module level because `qualification` imports
+    # this module for its vocabularies.
+    from .qualification import (
+        PROVIDER_ADAPTER_EVIDENCE_VERSION,
+        PROVIDER_VALIDATION_PROTOCOL_VERSION,
+    )
+
     document: dict[str, Any] = {
         "schema_version": RECEIPT_SCHEMA_VERSION,
+        # Which protocol would judge this receipt, and which parser produced it.
+        # Without them a proof cannot be told apart from a proof about code we
+        # have since changed — see D-072.
+        "qualification_protocol_version": PROVIDER_VALIDATION_PROTOCOL_VERSION,
+        "provider_adapter_evidence_version": PROVIDER_ADAPTER_EVIDENCE_VERSION,
         "receipt_id": secrets.token_hex(8),
         "command": attempt.command,
         "status": str(status),
@@ -1976,11 +1999,31 @@ def build_activation_state(receipts: list[dict[str, Any]], unverifiable: int) ->
         "paid_activation_state": str(paid_state),
         "accounted_credits_total": sum(int(r.get("accounted_credits") or 0) for r in receipts),
         "verified_receipts": len(receipts),
+        # D-062's own audit counter: files this installation could not verify.
+        # Spelled out rather than spread from the block below, because the
+        # qualification block counts the same idea over a different population
+        # and a dict spread let it silently win the key.
         "unverifiable_receipts": unverifiable,
         "receipt_directory": str(receipt_dir()),
         # 6. Whether the pre-registered criteria are met. Deleting the receipt
-        # directory resets this to zero evidence, exactly as D-062 says.
-        **qualification,
+        # directory resets this to zero evidence, exactly as D-062 says. Every key
+        # is listed, so adding one to the protocol can never overwrite one here.
+        "qualification_protocol_version": qualification["qualification_protocol_version"],
+        "qualification_adapter_evidence_version": qualification[
+            "qualification_adapter_evidence_version"
+        ],
+        "qualification_evidence_not_before": qualification["qualification_evidence_not_before"],
+        "qualification_state": qualification["qualification_state"],
+        "criteria_results": qualification["criteria_results"],
+        "eligible_for_human_promotion_review": qualification["eligible_for_human_promotion_review"],
+        "evidence_conflicts": qualification["evidence_conflicts"],
+        "qualification_admissible_receipts": qualification["qualification_admissible_receipts"],
+        "qualification_historical_nonqualifying_receipts": qualification[
+            "qualification_historical_nonqualifying_receipts"
+        ],
+        "qualification_unverifiable_receipts": qualification["qualification_unverifiable_receipts"],
+        "qualification_reasons": qualification["qualification_reasons"],
+        "qualification_note": qualification["qualification_note"],
         "scope_note": (
             "Chaque observation de couverture vaut pour un fournisseur, un bookmaker, "
             "une compétition, un événement tagué, un marché et un instant — rien de plus."

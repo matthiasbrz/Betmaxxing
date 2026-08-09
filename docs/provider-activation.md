@@ -413,11 +413,12 @@ de candidat en `paper` ou `live_analysis`, démarrage d'un ordonnanceur réel,
 envoi de notification, pari ou automatisme de mise, interface web, et
 versionnement d'un payload fournisseur brut.
 
-## Lire la qualification (D-071)
+## Lire la qualification (D-071, corrigée par D-072)
 
 `activation status` porte, depuis 03C-1, un sixième bloc : l'évaluation des
 critères **préenregistrés** de `docs/provider-validation-protocol.md`
-(`PROVIDER_VALIDATION_PROTOCOL_VERSION = 1`).
+(`PROVIDER_VALIDATION_PROTOCOL_VERSION = 2`,
+`PROVIDER_ADAPTER_EVIDENCE_VERSION = 1`).
 
 ```bash
 betmaxxing-the-odds-api activation status          # lecture humaine
@@ -434,8 +435,26 @@ Ce que le bloc dit, et ce qu'il ne dit pas :
 - `limit` dit ce que le critère **n'**établit pas. Un `CORE_MAPPING_FOOTBALL` vert
   ne dit rien d'un bookmaker, d'une compétition non observée ou d'une autre date ;
 - `evidence_conflicts` non vide est un **échec fermé**, pas une preuve à pondérer ;
-- `unverifiable_receipts` compte les fichiers refusés — signature invalide, schéma
-  inconnu, v1. Ils sont comptés et jamais lus ;
+- trois compteurs distincts, et leurs noms disent la différence :
+  `qualification_admissible_receipts` (preuve courante : v4, versions `2/1`,
+  postérieure à la date d'effet, non contradictoire),
+  `qualification_historical_nonqualifying_receipts` (valide et lisible, mais pas
+  une preuve courante) et `qualification_unverifiable_receipts` (comptés, jamais
+  lus). `qualification_reasons` agrège **pourquoi**, en comptes seulement ;
+- un reçu v2 ou v3 reste lisible et peut encore autoriser l'étape suivante ; il ne
+  qualifie plus aucun critère, `COST_CONFORMITY` inclus. C'est le prix assumé de
+  la correction D-072 ;
+- une preuve enregistrée avant `qualification_evidence_not_before` est de
+  l'histoire. Aucune preuve réelle n'a encore été collectée sous protocole v2 et
+  schéma v4 : l'état courant est `INSUFFICIENT_EVIDENCE` avec zéro reçu
+  admissible ;
+- le seuil de fraîcheur du protocole est le littéral **900 s**. Le réglage runtime
+  `max_odds_age_seconds` du produit vaut aussi 900 par défaut et reste
+  configurable pour le scan : les deux sont censés coïncider, mais reconfigurer le
+  second ne déplace **pas** le premier ;
+- les tags HMAC locaux apparaissent dans `bookmaker_coverage_observations`, et
+  nulle part ailleurs — pas dans `criteria_results`, pas dans les raisons. Ce sont
+  des substituts locaux, jamais l'identifiant fournisseur en clair ;
 - supprimer le répertoire de reçus remet la preuve à zéro. C'est voulu.
 
 Aucun appel réseau n'est fait par `status`, et aucune clé n'est lue.
@@ -449,11 +468,12 @@ dans `docs/provider-validation-protocol.md` §8. Résumé opérationnel :
 |---|---|
 | Piste A | vérifier le parser avec un bookmaker documenté comme susceptible d'être couvert — choix, source officielle et date à écrire **avant** le premier appel |
 | Piste B | couverture `winamax_fr`, indépendante ; le constat du 2026-08-07 reste borné aux deux événements SPL testés |
-| Requêtes maximales | **12** |
-| Crédits maximaux | **16** — borne tarifaire relue, pas une garantie de facture |
-| Autorisations humaines | **12**, une par appel |
+| Invocations CLI maximales | **12** |
+| Requêtes HTTP maximales | **16**, dont **8** payantes — `discover` fait deux requêtes par invocation |
+| Crédits contractuels maximaux | **16** — borne tarifaire relue, pas une garantie de facture |
+| Autorisations humaines | **12**, une par invocation |
 | Arrêt immédiat | `COVERAGE_MISSING`, `COST_MISMATCH`, mapping rejeté |
 | Substitution automatique | **aucune**, ni de bookmaker ni d'événement |
 
-Aucune de ces commandes n'a été exécutée par la tranche 03C-1 : elle n'écrit que le
-protocole, l'évaluateur et leurs tests.
+Aucune de ces commandes n'a été exécutée par les tranches 03C-1 ni 03C-1 ter :
+elles n'écrivent que le protocole, l'évaluateur et leurs tests.

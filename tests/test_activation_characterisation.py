@@ -183,10 +183,29 @@ class TestD062FiveProofDimensionsReadByStatus:
         assert unverifiable == 1
 
 
-class TestD063ReceiptsAreV3AndV2StaysReadable:
-    def test_the_current_version_is_three_and_two_is_still_supported(self) -> None:
-        assert act.RECEIPT_SCHEMA_VERSION == 3
-        assert frozenset({2, 3}) == act.SUPPORTED_SCHEMA_VERSIONS
+class TestD063ReceiptsAreV4AndOlderSchemasStayReadable:
+    """D-063's *policy* is unchanged; D-072 moved the current version to 4.
+
+    Characterisation pinned "the current version is 3". That was correct until the
+    protocol needed a receipt to name the protocol and parser versions it was
+    produced under — fields whose absence is meaningful, so a new version rather
+    than v3 with extras. What this class actually guards is the compatibility rule:
+    older schemas are read, honoured and never rewritten. That rule still holds,
+    and the numbers move with the authorised bump.
+    """
+
+    def test_the_current_version_is_four_and_older_ones_are_still_read(self) -> None:
+        assert act.RECEIPT_SCHEMA_VERSION == 4
+        assert frozenset({2, 3, 4}) == act.SUPPORTED_SCHEMA_VERSIONS
+
+    def test_a_v3_receipt_is_read_without_being_rewritten(self, workspace: Path) -> None:
+        document = _signed(receipt_id="beef0000beef0004", schema_version=3)
+        path = _write(workspace, document)
+        before = path.read_text(encoding="utf-8")
+        receipts, unverifiable = act.audit_receipts()
+        assert unverifiable == 0
+        assert [r["schema_version"] for r in receipts] == [3]
+        assert path.read_text(encoding="utf-8") == before
 
     def test_a_v2_receipt_is_read_without_being_rewritten(self, workspace: Path) -> None:
         document = _signed(receipt_id="beef0000beef0001", schema_version=2)

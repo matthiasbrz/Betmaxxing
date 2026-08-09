@@ -27,16 +27,20 @@ FOOTBALL_2 = "soccer_epl"
 TENNIS = "tennis_atp_paris"
 TENNIS_2 = "tennis_wta_madrid"
 BOOK = "unibet"
-DAY_ONE = datetime(2026, 8, 4, 12, tzinfo=UTC)
-DAY_TWO = datetime(2026, 8, 5, 12, tzinfo=UTC)
-DAY_THREE = datetime(2026, 8, 6, 12, tzinfo=UTC)
+#: After `QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC`: under protocol v2 a receipt
+#: recorded before the protocol took effect is history, never qualification.
+DAY_ONE = datetime(2026, 8, 10, 12, tzinfo=UTC)
+DAY_TWO = datetime(2026, 8, 11, 12, tzinfo=UTC)
+DAY_THREE = datetime(2026, 8, 12, 12, tzinfo=UTC)
 
 
 def signed(**fields: Any) -> dict[str, Any]:
     """A signed synthetic receipt. Defaults describe an admissible core mapping."""
     moment: datetime = fields.pop("moment", DAY_ONE)
     document: dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": 4,
+        "qualification_protocol_version": qual.PROVIDER_VALIDATION_PROTOCOL_VERSION,
+        "provider_adapter_evidence_version": qual.PROVIDER_ADAPTER_EVIDENCE_VERSION,
         "receipt_id": fields.pop("receipt_id", "00" * 8),
         "command": "core",
         "status": str(act.ActivationStatus.CORE_LIVE_VERIFIED),
@@ -283,11 +287,20 @@ class TestFreshness:
         document = qual.evaluate(old, 0)
         assert result_for(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 0
 
-    def test_the_threshold_is_the_products_own_staleness_limit(self) -> None:
-        """Anchored, not invented: the same number the scan calls stale."""
+    def test_the_threshold_is_a_protocol_literal(self) -> None:
+        """Fixed, not anchored.
+
+        This assertion used to compare the protocol threshold with the product's
+        runtime `max_odds_age_seconds`. That identity held whatever the runtime
+        value was — including 123 s from a `.env` — so it pinned the coupling
+        instead of the protocol. Under v2 the threshold is a literal, and the fact
+        that the product's default agrees today is recorded without being relied
+        on.
+        """
         from betmaxxing.config import Settings
 
-        assert Settings().max_odds_age_seconds == qual.MAX_QUALIFYING_AGE_SECONDS
+        assert qual.PROTOCOL_MAX_ODDS_AGE_SECONDS == 900
+        assert Settings.model_fields["max_odds_age_seconds"].default == 900
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +325,7 @@ class TestNoSubstitution:
                 event_tag=tag,
                 status=str(act.ActivationStatus.ADDITIONAL_PARTIAL_COVERAGE),
                 market_states=states,
+                markets_mapped=[m for m in partial if m != missing_one],
                 freshness={m: 300 for m in partial if m != missing_one},
             )
             for index, (key, moment, tag) in enumerate(
@@ -340,15 +354,24 @@ class TestNoSubstitution:
 # 12-15. Schema versions, signatures, expiry
 # ---------------------------------------------------------------------------
 class TestProvenance:
-    def test_v2_contributes_to_what_its_schema_can_establish(self) -> None:
-        """v2's `selections_mapped` means what v3's does, so core mapping counts."""
+    def test_v2_is_readable_history_and_qualifies_nothing(self) -> None:
+        """Reversed on purpose, and the reversal is the correction.
+
+        Protocol v1 let v2 support the core criteria because `selections_mapped`
+        means the same in both schemas. True, and beside the point: a v2 receipt
+        cannot say which protocol judged it or which parser produced it, so it
+        cannot be *current* evidence. It stays readable, honoured for chaining,
+        and counted in the historical block.
+        """
         receipts = [dict(r, schema_version=2) for r in football_core_passing()]
         for receipt in receipts:
             receipt[act.SIGNATURE_FIELD] = act.sign_receipt(
                 {k: v for k, v in receipt.items() if k != act.SIGNATURE_FIELD}
             )
         document = qual.evaluate(receipts, 0)
-        assert result_for(document, "CORE_MAPPING_FOOTBALL")["passed"] is True
+        assert result_for(document, "CORE_MAPPING_FOOTBALL")["passed"] is False
+        assert document["qualification_historical_nonqualifying_receipts"] == 3
+        assert document["qualification_unverifiable_receipts"] == 0
 
     def test_v2_does_not_contribute_to_a_per_market_criterion(self) -> None:
         """v2's market map was partial, so it cannot establish one market's state."""
@@ -362,8 +385,8 @@ class TestProvenance:
             entry = result_for(document, f"ADDITIONAL_MAPPING_FOOTBALL_{market.upper()}")
             assert entry["observed"]["events"] == 0, market
 
-    @pytest.mark.parametrize("version", (1, 4, 99, None, "3"))
-    def test_v1_and_unknown_schemas_never_contribute(self, version: object) -> None:
+    @pytest.mark.parametrize("version", (1, 3, 5, 99, None, "3"))
+    def test_v1_v3_and_unknown_schemas_never_contribute(self, version: object) -> None:
         receipts = [dict(r, schema_version=version) for r in football_core_passing()]
         document = qual.evaluate(receipts, 0)
         assert result_for(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 0
@@ -375,8 +398,8 @@ class TestProvenance:
 
     def test_unverifiable_receipts_are_reported_and_never_used(self) -> None:
         document = qual.evaluate([], 7)
-        assert document["unverifiable_receipts"] == 7
-        assert document["admissible_observations"] == 0
+        assert document["qualification_unverifiable_receipts"] == 7
+        assert document["qualification_admissible_receipts"] == 0
 
     def test_an_expired_receipt_remains_historical_evidence(self) -> None:
         """Expiry refuses a *parent*. It does not un-happen the call that was made."""
@@ -520,10 +543,22 @@ class TestTheStatusCommand:
 
         self._write_all(workspace, everything_passing())
         result = run("status", "--json")
-        for forbidden in (FAKE_KEY, "1.63", "Olympique", "apiKey=", "signature"):
+        for forbidden in (FAKE_KEY, "1.63", "Olympique", "apiKey=", "signature", "://"):
             assert forbidden not in result.stdout, forbidden
-        # Event tags are not printed either: counts are enough for a criterion.
-        assert "e" * 32 not in result.stdout
+        # The local HMAC tags *are* printed, in the coverage block and only there:
+        # that is what bounds an observation to one event without ever naming it
+        # (D-062). The assertion this replaces looked for a sentinel the fixture
+        # never produces — `everything_passing()` uses a, b, c, d, f, 0, 1 and 2 —
+        # so it could not fail, and its comment said the opposite of the truth.
+        payload = jsonlib.loads(result.stdout)
+        injected = {str(receipt["event_tag"]) for receipt in everything_passing()}
+        shown = {
+            observation["event_tag"] for observation in payload["bookmaker_coverage_observations"]
+        }
+        assert injected <= shown, injected - shown
+        elsewhere = jsonlib.dumps([payload["criteria_results"], payload["qualification_reasons"]])
+        for tag in injected:
+            assert tag not in elsewhere, tag
 
     def test_evaluation_opens_no_socket(self, workspace: Path) -> None:
         """`conftest` blocks outbound connections; this asserts we never even try."""
