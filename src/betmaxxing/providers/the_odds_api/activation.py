@@ -202,6 +202,19 @@ def _reported_int(value: object) -> int:
     return value
 
 
+def _counted_credits(value: object) -> int:
+    """A credit count that really is one, else zero — for totalling only.
+
+    Distinct from :func:`_reported_int`, which is about not crashing on a mistyped
+    field. This one is about not *adding* a mistyped field: a boolean, a numeric
+    string and a negative number are all refused rather than coerced, because the
+    sum is a spend figure an operator reads before deciding to spend more.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
 def _schema_version_of(payload: Mapping[str, Any]) -> int | None:
     """The receipt's schema version when it is one we read, else ``None``.
 
@@ -298,19 +311,42 @@ class ExecutionState(StrEnum):
 
 
 class PaidActivationState(StrEnum):
-    """The paid dimension only. Separate from coverage and from mapping."""
+    """The paid dimension only. Separate from coverage and from mapping.
+
+    ``PAID_ATTEMPT_INCONCLUSIVE`` is the state this enum was missing. A paid call
+    that really went out but established neither coverage nor mapping — because its
+    receipt is malformed, contradictory, or an error that never reached a market —
+    is not "executed with no coverage": that phrase claims we looked and the
+    bookmaker was absent. Rounding it down to the nearest existing label is how
+    ``selections_mapped = "3"`` came to read as an observed coverage.
+    """
 
     PREPARED_NOT_EXECUTED = "PREPARED_NOT_EXECUTED"
+    PAID_ATTEMPT_INCONCLUSIVE = "PAID_ATTEMPT_INCONCLUSIVE"
     CORE_EXECUTED_NO_COVERAGE = "CORE_EXECUTED_NO_COVERAGE"
     CORE_EXECUTED_COVERAGE_OBSERVED = "CORE_EXECUTED_COVERAGE_OBSERVED"
     ADDITIONAL_EXECUTED = "ADDITIONAL_EXECUTED"
 
 
 class CostProof(StrEnum):
-    """Whether connectivity and billing have been exercised, and conformingly."""
+    """Whether connectivity and billing have been exercised, and conformingly.
+
+    ``EXERCISED_UNESTABLISHED`` is distinct from both ends on purpose. A paid call
+    whose cost cannot be established is not conforming — the whole point of the
+    ``COST_CONFORMITY`` criterion is that an unestablished cost fails it — and it is
+    not a mismatch either, because nothing was shown to disagree. Before v4 this
+    dimension had nowhere to put it and reported ``EXERCISED_CONFORMING`` while the
+    strict block counted the same call under
+    ``paid_calls_with_unestablished_cost``.
+
+    The precedence, applied over every real paid attempt::
+
+        NONCONFORMING > UNESTABLISHED > CONFORMING > NOT_EXERCISED
+    """
 
     NOT_EXERCISED = "NOT_EXERCISED"
     EXERCISED_CONFORMING = "EXERCISED_CONFORMING"
+    EXERCISED_UNESTABLISHED = "EXERCISED_UNESTABLISHED"
     EXERCISED_NONCONFORMING = "EXERCISED_NONCONFORMING"
 
 
@@ -493,22 +529,72 @@ def verify_receipt(payload: Mapping[str, Any]) -> bool:
     return hmac.compare_digest(given, sign_receipt(payload))
 
 
+def _name_component(value: object, field: str) -> str:
+    """One validated component of a receipt filename.
+
+    A filename is built from three pieces of a document, and a document is data. A
+    ``recorded_at`` of ``"../../2026-08-11T12:00:00+00:00"`` used to survive the
+    string slice below as ``"../../20260811T"`` and put the receipt two directories
+    above the one it belongs in. So each component is checked to be a plain name
+    before it is joined to anything.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{field} doit être une chaîne non vide pour nommer un reçu.",
+        )
+    if value in {".", ".."} or set(value) & {"/", "\\", "\0"}:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{field} contient un séparateur de chemin : un reçu est nommé, pas placé. "
+            "Aucun fichier n'est écrit hors du répertoire de reçus.",
+        )
+    return value
+
+
 def write_receipt(document: dict[str, Any]) -> Path:
     """Sign and persist one receipt locally. Never committed, never uploaded.
 
-    Created **exclusively**, and named with the whole ``receipt_id``. The previous
+    Created **exclusively**, and named with the whole ``receipt_id``. An earlier
     version truncated the identifier to eight characters and used
     ``Path.write_text``, so two receipts sharing a second, a command and an
     eight-character prefix silently overwrote one another — a proof of a paid call
     lost without a word. Re-writing a byte-identical receipt is idempotent; a
     divergent one under the same name is refused rather than allowed to replace it.
+
+    Every name component is validated and the timestamp is *parsed* rather than
+    sliced, then the resolved parent is checked immediately before the exclusive
+    open. A pre-existing symbolic link at the target is refused without reading
+    what it points at, so a link planted in the directory cannot make this function
+    overwrite a file elsewhere.
     """
+    signed = {k: v for k, v in document.items() if not k.startswith("_")}
+    command = _name_component(signed.get("command"), "command")
+    receipt_id = _name_component(signed.get("receipt_id"), "receipt_id")
+    moment = _parse_instant(signed.get("recorded_at"))
+    if moment is None:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            "recorded_at n'est pas un instant ISO 8601 avec fuseau ; un reçu sans instant "
+            "lisible n'est pas nommable.",
+        )
+    stamp = moment.strftime("%Y%m%dT%H%M%S")
+
     directory = receipt_dir()
     directory.mkdir(parents=True, exist_ok=True)
-    signed = {k: v for k, v in document.items() if not k.startswith("_")}
     signed[SIGNATURE_FIELD] = sign_receipt(signed)
-    stamp = str(signed["recorded_at"]).replace(":", "").replace("-", "")[:15]
-    path = directory / f"{stamp}-{signed['command']}-{signed['receipt_id']}.json"
+    path = directory / f"{stamp}-{command}-{receipt_id}.json"
+    if path.is_symlink():
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{path.name} est un lien symbolique. Un reçu n'écrit jamais à travers un "
+            "renvoi : déplacez ce lien avant de rejouer cette étape.",
+        )
+    if path.resolve().parent != directory.resolve():
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{path.name} ne se résout pas dans le répertoire de reçus ; rien n'est écrit.",
+        )
     body = jsonlib.dumps(signed, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
     try:
         handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -1944,13 +2030,34 @@ def audit_receipts() -> tuple[list[dict[str, Any]], int]:
 
     A file that fails signature or schema verification is counted, not read: it
     must neither become evidence nor vanish silently.
+
+    The directory boundary is the same one :func:`load_parent` applies, and it is
+    applied *before* anything is opened. A symbolic link is never followed, inside
+    the directory or out of it; a target resolving elsewhere is never read. Until
+    v4 this function read straight through a link, so a receipt planted anywhere on
+    the filesystem could satisfy a criterion from a directory it was not in — while
+    the authorising path refused the very same link.
+
+    A link, a broken link, a directory named ``*.json`` and anything else that is
+    not a regular file of this directory are counted as unverifiable. Their path and
+    their content never appear in the count or anywhere downstream.
     """
     directory = receipt_dir()
     if not directory.is_dir():
         return [], 0
+    boundary = directory.resolve()
     verified: list[dict[str, Any]] = []
     unverifiable = 0
     for path in sorted(directory.glob("*.json")):
+        try:
+            # `is_symlink` is true for a dangling link too, so a broken one is
+            # counted here rather than raising out of the read below.
+            if path.is_symlink() or not path.is_file() or path.resolve().parent != boundary:
+                unverifiable += 1
+                continue
+        except OSError:
+            unverifiable += 1
+            continue
         try:
             payload = jsonlib.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -1981,10 +2088,33 @@ def build_activation_state(receipts: list[dict[str, Any]], unverifiable: int) ->
     found no coverage on the two events they looked at. Condensing that into a
     single word loses whichever part the reader needed — and
     ``PREPARED_NOT_EXECUTED`` in particular became simply false.
+
+    Separate is not the same as lenient, which is what v4 corrects. Every dimension
+    below now reads its receipts through the same strict lens as the qualification
+    block: ``is True`` for a flag, a real non-negative integer for a count, and
+    :func:`~.qualification.mapping_observation_is_sound` for anything that claims
+    the parser read a live market. None of them can print a positive label about a
+    fact the sixth block rejects.
     """
-    attempted = [r for r in receipts if r.get("network_attempted")]
-    paid = [r for r in attempted if r.get("command") in ("core", "additional")]
-    statuses = {str(r.get("status")) for r in paid}
+    # Imported here rather than at module level because `qualification` imports this
+    # module for its vocabularies.
+    from .qualification import (
+        ReceiptPhase,
+        admissible_phases,
+        cost_category,
+        is_real_paid_attempt,
+        mapping_observation_is_sound,
+        structural_faults,
+    )
+    from .qualification import (
+        contradictions as receipt_contradictions,
+    )
+    from .qualification import (
+        evaluate as evaluate_qualification,
+    )
+
+    attempted = [r for r in receipts if r.get("network_attempted") is not False]
+    paid = [r for r in receipts if is_real_paid_attempt(r)]
 
     execution = ExecutionState.NO_NETWORK_ATTEMPTED
     if any(r.get("command") == "additional" for r in paid):
@@ -1994,33 +2124,66 @@ def build_activation_state(receipts: list[dict[str, Any]], unverifiable: int) ->
     elif attempted:
         execution = ExecutionState.DISCOVERY_ATTEMPTED
 
-    if not attempted:
-        cost_proof = CostProof.NOT_EXERCISED
-    elif statuses & {
-        str(ActivationStatus.COST_MISMATCH),
-        str(ActivationStatus.COST_UNVERIFIED),
-    }:
-        cost_proof = CostProof.EXERCISED_NONCONFORMING
-    else:
-        cost_proof = CostProof.EXERCISED_CONFORMING
+    # One CostProof per real paid attempt, then the declared precedence. The census
+    # it is derived from is published beside it as `paid_call_cost_census`, over the
+    # *same* population — every real paid attempt on disk, historical ones included.
+    # ``COST_CONFORMITY`` counts a narrower population on purpose (current protocol
+    # only, deduplicated), so the two numbers can legitimately differ; naming both
+    # populations is what stops that from reading as a contradiction, and it is why
+    # the label can stay a historical fact while the criterion stays pre-registered.
+    per_call = {
+        "nonconforming_paid_calls": CostProof.EXERCISED_NONCONFORMING,
+        "paid_calls_with_unestablished_cost": CostProof.EXERCISED_UNESTABLISHED,
+        "conforming_paid_calls": CostProof.EXERCISED_CONFORMING,
+        # Proven not to have reached the provider: this call exercised neither
+        # connectivity nor billing, and says so rather than claiming conformity.
+        "paid_calls_that_never_left": CostProof.NOT_EXERCISED,
+    }
+    precedence = [
+        CostProof.EXERCISED_NONCONFORMING,
+        CostProof.EXERCISED_UNESTABLISHED,
+        CostProof.EXERCISED_CONFORMING,
+        CostProof.NOT_EXERCISED,
+    ]
+    census = dict.fromkeys(per_call, 0)
+    for receipt in paid:
+        if category := cost_category(receipt):
+            census[category] += 1
+    established = {per_call[name] for name, count in census.items() if count}
+    cost_proof = next((p for p in precedence if p in established), CostProof.NOT_EXERCISED)
 
-    mapped_live = any(_reported_int(r.get("selections_mapped")) > 0 for r in paid)
-    mapping_proof = MappingProof.OBTAINED_LIVE if mapped_live else MappingProof.NOT_OBTAINED_LIVE
+    sound = [r for r in receipts if mapping_observation_is_sound(r)]
+    mapping_proof = MappingProof.OBTAINED_LIVE if sound else MappingProof.NOT_OBTAINED_LIVE
+
+    # A receipt whose phase actually answered the bookmaker question, well formed
+    # and not self-contradictory. That is what a coverage observation is: an answer.
+    def observed_the_bookmaker(receipt: Mapping[str, Any]) -> bool:
+        if not is_real_paid_attempt(receipt):
+            return False
+        if ReceiptPhase.CLASSIFIED not in admissible_phases(receipt):
+            return False
+        if structural_faults(receipt) or receipt_contradictions(receipt):
+            return False
+        return not isinstance(receipt.get("market_states"), bool) and bool(
+            receipt.get("market_states")
+        )
+
+    answered = [r for r in paid if observed_the_bookmaker(r)]
 
     if not paid:
         paid_state = PaidActivationState.PREPARED_NOT_EXECUTED
     elif any(r.get("command") == "additional" for r in paid):
         paid_state = PaidActivationState.ADDITIONAL_EXECUTED
-    elif mapped_live:
+    elif sound:
         paid_state = PaidActivationState.CORE_EXECUTED_COVERAGE_OBSERVED
-    else:
+    elif answered:
         paid_state = PaidActivationState.CORE_EXECUTED_NO_COVERAGE
+    else:
+        # A paid call really went out and established neither coverage nor mapping.
+        paid_state = PaidActivationState.PAID_ATTEMPT_INCONCLUSIVE
 
     # Sixth block, added by 03C-1: the pre-registered qualification criteria,
-    # evaluated over the same receipts. Imported here rather than at module level
-    # because `qualification` imports this module for its vocabularies.
-    from .qualification import evaluate as evaluate_qualification
-
+    # evaluated over the same receipts.
     qualification = evaluate_qualification(receipts, unverifiable)
 
     return {
@@ -2031,29 +2194,45 @@ def build_activation_state(receipts: list[dict[str, Any]], unverifiable: int) ->
         "execution_state": str(execution),
         # 3. Connectivity, authentication and billing.
         "connectivity_and_cost_proof": str(cost_proof),
-        # 4. Coverage — a list of scoped observations, never a verdict.
+        # The census the label above is derived from, over the population it speaks
+        # about: one entry per real paid attempt found on disk, no deduplication and
+        # no protocol filter. ``COST_CONFORMITY`` below counts the current protocol's
+        # receipts only and deduplicates them, so its numbers are narrower by design.
+        "paid_call_cost_census": dict(census),
+        "paid_call_cost_census_population": (
+            "toute tentative payante réelle vérifiée sur ce disque — commande core ou "
+            "additional dont network_attempted n'est pas exactement False, protocoles "
+            "antérieurs compris, sans déduplication"
+        ),
+        # 4. Coverage — a list of scoped observations, never a verdict. Only
+        # receipts whose phase actually answered the bookmaker question and whose
+        # displayed fields are structurally valid appear here. A malformed receipt
+        # contributed one before v4, which both stated a coverage nobody had
+        # observed and echoed its own bad values into the report.
         "bookmaker_coverage_observations": [
             {
-                # Rendered as text, so read as text: a signed receipt whose types
-                # are not the ones we write must not be able to break a report
-                # that only summarises what is on disk.
                 "sport_key": str(r.get("sport_key", "")),
                 "bookmaker": str(r.get("bookmaker", "")),
                 "event_tag": str(r.get("event_tag") or ""),
                 "recorded_at": str(r.get("recorded_at", "")),
-                "bookmaker_state": str(r.get("bookmaker_state") or "UNKNOWN_SCHEMA_V2"),
+                "bookmaker_state": str(r.get("bookmaker_state")),
                 "market_states": (
                     dict(r["market_states"]) if isinstance(r.get("market_states"), Mapping) else {}
                 ),
                 "status": str(r.get("status")),
                 "schema_version": _reported_int(r.get("schema_version")),
             }
-            for r in paid
+            for r in answered
         ],
         # 5. Whether the parser and freshness path have been exercised for real.
         "mapping_freshness_proof": str(mapping_proof),
         "paid_activation_state": str(paid_state),
-        "accounted_credits_total": sum(_reported_int(r.get("accounted_credits")) for r in receipts),
+        # Real non-negative integers only. `True` is not one credit, `"7"` is not
+        # seven, and a negative count is not a count — each of those would move a
+        # spend total the operator reads to decide whether to keep going.
+        "accounted_credits_total": sum(
+            value for r in receipts if (value := _counted_credits(r.get("accounted_credits")))
+        ),
         "verified_receipts": len(receipts),
         # D-062's own audit counter: files this installation could not verify.
         # Spelled out rather than spread from the block below, because the
@@ -2074,10 +2253,25 @@ def build_activation_state(receipts: list[dict[str, Any]], unverifiable: int) ->
         "eligible_for_human_promotion_review": qualification["eligible_for_human_promotion_review"],
         "evidence_conflicts": qualification["evidence_conflicts"],
         "qualification_admissible_receipts": qualification["qualification_admissible_receipts"],
+        "qualification_usable_receipts": qualification["qualification_usable_receipts"],
+        "qualification_current_malformed_receipts": qualification[
+            "qualification_current_malformed_receipts"
+        ],
+        "qualification_current_contradictory_receipts": qualification[
+            "qualification_current_contradictory_receipts"
+        ],
+        "qualification_unknown_pair_receipts": qualification["qualification_unknown_pair_receipts"],
         "qualification_historical_nonqualifying_receipts": qualification[
             "qualification_historical_nonqualifying_receipts"
         ],
+        "qualification_duplicate_excluded_receipts": qualification[
+            "qualification_duplicate_excluded_receipts"
+        ],
         "qualification_unverifiable_receipts": qualification["qualification_unverifiable_receipts"],
+        "qualification_exact_duplicate_copies": qualification[
+            "qualification_exact_duplicate_copies"
+        ],
+        "qualification_population_equation": qualification["qualification_population_equation"],
         "qualification_reasons": qualification["qualification_reasons"],
         "qualification_note": qualification["qualification_note"],
         "scope_note": (

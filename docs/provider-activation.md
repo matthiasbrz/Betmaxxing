@@ -413,11 +413,11 @@ de candidat en `paper` ou `live_analysis`, démarrage d'un ordonnanceur réel,
 envoi de notification, pari ou automatisme de mise, interface web, et
 versionnement d'un payload fournisseur brut.
 
-## Lire la qualification (D-071, corrigée par D-072 puis D-073)
+## Lire la qualification (D-071, corrigée par D-072, D-073 puis D-074)
 
 `activation status` porte, depuis 03C-1, un sixième bloc : l'évaluation des
 critères **préenregistrés** de `docs/provider-validation-protocol.md`
-(`PROVIDER_VALIDATION_PROTOCOL_VERSION = 3`,
+(`PROVIDER_VALIDATION_PROTOCOL_VERSION = 4`,
 `PROVIDER_ADAPTER_EVIDENCE_VERSION = 1`, schéma de reçu `v4`).
 
 ```bash
@@ -435,19 +435,29 @@ Ce que le bloc dit, et ce qu'il ne dit pas :
 - `limit` dit ce que le critère **n'**établit pas. Un `CORE_MAPPING_FOOTBALL` vert
   ne dit rien d'un bookmaker, d'une compétition non observée ou d'une autre date ;
 - `evidence_conflicts` non vide est un **échec fermé**, pas une preuve à pondérer ;
-- trois compteurs distincts, et leurs noms disent la différence :
-  `qualification_admissible_receipts` (preuve courante : v4, versions `2/1`,
-  postérieure à la date d'effet, non contradictoire),
-  `qualification_historical_nonqualifying_receipts` (valide et lisible, mais pas
-  une preuve courante) et `qualification_unverifiable_receipts` (comptés, jamais
-  lus). `qualification_reasons` agrège **pourquoi**, en comptes seulement ;
+- **sept populations exclusives**, dont les noms disent la différence, et une
+  équation publiée sous `qualification_population_equation` qui les réconcilie avec
+  le nombre de reçus vérifiés : `qualification_usable_receipts`,
+  `qualification_current_malformed_receipts`,
+  `qualification_current_contradictory_receipts`,
+  `qualification_unknown_pair_receipts`,
+  `qualification_historical_nonqualifying_receipts`,
+  `qualification_duplicate_excluded_receipts` et
+  `qualification_unverifiable_receipts` (comptés, jamais lus). Un reçu **courant**
+  malformé ou contradictoire n'est plus rangé sous « historique » : ce classement se
+  lisait comme « produit sous un protocole antérieur ».
+  `qualification_exact_duplicate_copies` est à part — une **dimension croisée**, pas
+  une population : la même observation deux fois reste dans la population de son
+  contenu. `qualification_admissible_receipts` reste publié sous son nom d'origine,
+  égal à `qualification_usable_receipts`, pour que deux rapports restent comparables.
+  `qualification_reasons` agrège **pourquoi**, en comptes seulement ;
 - un reçu v2 ou v3 reste lisible et peut encore autoriser l'étape suivante ; il ne
   qualifie plus aucun critère, `COST_CONFORMITY` inclus. C'est le prix assumé de
   la correction D-072 ;
 - une preuve enregistrée avant `qualification_evidence_not_before`
-  (`2026-08-10T07:19:48+00:00`) est de l'histoire. Aucune preuve réelle n'a encore été
-  collectée sous protocole 3 : l'état courant est `INSUFFICIENT_EVIDENCE` avec zéro
-  reçu admissible ;
+  (`2026-08-10T09:11:48+00:00`) est de l'histoire. Aucune preuve réelle n'a encore été
+  collectée sous protocole 4 : l'état courant est `INSUFFICIENT_EVIDENCE` avec zéro
+  reçu utilisable ;
 - un reçu courant **mal typé** — booléen là où un entier est attendu, chaîne là où un
   booléen est attendu — ne prouve rien et fait passer l'état à `EVIDENCE_CONFLICT`,
   avec la raison `malformed_current_schema` et les **noms** des champs fautifs. Une
@@ -455,9 +465,35 @@ Ce que le bloc dit, et ce qu'il ne dit pas :
 - un critère de mapping exige `bookmaker_state = OBSERVED`. Absent, inconnu ou
   `NOT_RETURNED`, il ne qualifie rien : la portée « bookmaker observé » est désormais
   vérifiée et non seulement affichée ;
-- `COST_CONFORMITY` expose quatre catégories exhaustives et disjointes, et échoue si
-  un seul appel payant a un coût **non établi** — un `PROVIDER_UNAVAILABLE` qui a pu
-  atteindre le fournisseur, par exemple — même après six appels conformes ;
+- `COST_CONFORMITY` expose quatre catégories exhaustives et disjointes sur une
+  population écrite — les **tentatives payantes réelles**, c'est-à-dire les reçus
+  `core`/`additional` dont `network_attempted` n'est pas exactement `false` — et
+  échoue si un seul appel payant a un coût **non établi** — un
+  `PROVIDER_UNAVAILABLE` qui a pu atteindre le fournisseur, par exemple — même après
+  six appels conformes. `paid_calls_that_never_left` exige un `false` booléen
+  **certain** sur les deux drapeaux ; absent ou mal typé va en coût non établi, et
+  bloque ;
+- les cinq dimensions plus anciennes lisent la **même** preuve que le bloc strict.
+  `connectivity_and_cost_proof` suit la précédence
+  `NONCONFORMING > UNESTABLISHED > CONFORMING > NOT_EXERCISED` et dispose désormais
+  d'un état `EXERCISED_UNESTABLISHED` : un coût non établi n'est jamais présenté
+  comme conforme. `mapping_freshness_proof = OBTAINED_LIVE` exige une observation de
+  mapping **saine** — statut positif, bookmaker observé, marché cartographié,
+  fraîcheur valide, contrat satisfait — et non un simple `selections_mapped > 0`.
+  `paid_activation_state` gagne `PAID_ATTEMPT_INCONCLUSIVE` pour un appel payant
+  réellement parti qui n'a établi ni couverture ni mapping ;
+- `paid_call_cost_census` publie le recensement dont `connectivity_and_cost_proof`
+  est dérivé, avec sa population en clair : **toute** tentative payante réelle du
+  disque, protocoles antérieurs compris et sans déduplication. `COST_CONFORMITY`
+  compte une population plus étroite — protocole courant, dédupliquée — donc les deux
+  nombres peuvent légitimement différer ;
+- `bookmaker_coverage_observations` ne contient que des reçus dont la phase a
+  réellement répondu à la question du bookmaker, structurellement valides et non
+  contradictoires. Une observation est une **réponse**, pas la trace d'une tentative,
+  et aucune valeur d'un reçu invalide n'y est recopiée ;
+- un reçu obtenu à travers un lien symbolique, ou dont la cible se résout hors du
+  répertoire de reçus, n'est **pas lu** : il est compté invérifiable, sans que son
+  chemin ni son contenu apparaisse dans une sortie ;
 - le seuil de fraîcheur du protocole est le littéral **900 s**. Le réglage runtime
   `max_odds_age_seconds` du produit vaut aussi 900 par défaut et reste
   configurable pour le scan : les deux sont censés coïncider, mais reconfigurer le

@@ -32,8 +32,12 @@ import pytest
 from betmaxxing.providers.the_odds_api import activation as act
 from betmaxxing.providers.the_odds_api import qualification as qual
 
-#: Pinned literally, exactly as D-073 and the protocol publish it.
-EFFECTIVE_INSTANT = "2026-08-10T07:19:48+00:00"
+#: The instant D-073 published, kept as the historical literal it is. This module
+#: guards the v3 closures, which are unchanged; the *current* effective instant is
+#: pinned exactly once, by ``tests/test_qualification_v4_contract.py``. Pinning it
+#: here as well would make every authorised protocol bump edit two files to say the
+#: same thing, and would say nothing extra about v3.
+D073_EFFECTIVE_INSTANT = "2026-08-10T07:19:48+00:00"
 
 FOOTBALL = "soccer_france_ligue_one"
 FOOTBALL_2 = "soccer_epl"
@@ -167,14 +171,29 @@ def write_all(directory: Path, receipts: list[dict[str, Any]]) -> None:
 # ---------------------------------------------------------------------------
 class TestTheProtocolIsVersionThree:
     def test_the_versioned_constants(self) -> None:
-        assert qual.PROVIDER_VALIDATION_PROTOCOL_VERSION == 3
+        """The v3 closures, not the current version number.
+
+        The number itself is pinned exactly once, by the v4 contract. What this class
+        owes is that the constants v3 introduced kept their meaning: the threshold is
+        still the literal 900, the adapter-evidence version is still 1, and only a v4
+        receipt can qualify.
+        """
+        assert qual.PROTOCOL_MAX_ODDS_AGE_SECONDS == 900
         assert qual.PROVIDER_ADAPTER_EVIDENCE_VERSION == 1
         assert qual.QUALIFYING_SCHEMA_VERSION == 4
         assert act.RECEIPT_SCHEMA_VERSION == 4
-        assert qual.PROTOCOL_MAX_ODDS_AGE_SECONDS == 900
+        assert isinstance(qual.PROVIDER_VALIDATION_PROTOCOL_VERSION, int)
+        assert qual.PROVIDER_VALIDATION_PROTOCOL_VERSION >= 3
 
-    def test_the_effective_instant_is_the_published_literal(self) -> None:
-        assert qual.QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC == EFFECTIVE_INSTANT
+    def test_the_effective_instant_moved_forward_from_d073(self) -> None:
+        """An effective instant only ever moves forward, and never back onto D-073's.
+
+        Pinning the current value here would duplicate the v4 contract. What v3 owes
+        is that its own instant was not quietly reused or rolled back, since evidence
+        admitted under D-073 must not silently become current again.
+        """
+        current = datetime.fromisoformat(qual.QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC)
+        assert current >= datetime.fromisoformat(D073_EFFECTIVE_INSTANT)
 
     def test_protocol_two_evidence_is_now_historical(self) -> None:
         document = qual.evaluate(corpus(qualification_protocol_version=2), 0)
@@ -733,5 +752,9 @@ class TestEveryDocumentedCommandExists:
         )
         assert proc.returncode == 0, proc.stderr[-500:]
         payload = jsonlib.loads(proc.stdout)
-        assert payload["qualification_protocol_version"] == 3
+        # The number the module holds, not a second copy of it: what this test owes
+        # is that the documented command exists and reports the protocol it ran under.
+        assert (
+            payload["qualification_protocol_version"] == qual.PROVIDER_VALIDATION_PROTOCOL_VERSION
+        )
         assert payload["adapter_state"] == "IMPLEMENTED_UNVERIFIED"

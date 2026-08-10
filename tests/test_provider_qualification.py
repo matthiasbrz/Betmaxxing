@@ -50,6 +50,11 @@ def signed(**fields: Any) -> dict[str, Any]:
         "bookmaker": BOOK,
         "network_attempted": True,
         "may_have_reached_provider": True,
+        # Mandatory since protocol v4, and consistent with the network flag by
+        # construction. The harness writes `attempts` on every receipt, so a fixture
+        # that omitted it described a document the producer never emits; derived
+        # rather than hard-coded so a case overriding the flag stays honest.
+        "attempts": 1 if fields.get("network_attempted", True) is True else 0,
         "estimated_credits": 1,
         "observed_credits": 1,
         "accounted_credits": 1,

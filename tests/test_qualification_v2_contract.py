@@ -67,6 +67,11 @@ def signed(**fields: Any) -> dict[str, Any]:
         "bookmaker": BOOK,
         "network_attempted": True,
         "may_have_reached_provider": True,
+        # Mandatory since protocol v4, and consistent with the network flag by
+        # construction. The harness writes `attempts` on every receipt, so a fixture
+        # that omitted it described a document the producer never emits; derived
+        # rather than hard-coded so a case overriding the flag stays honest.
+        "attempts": 1 if fields.get("network_attempted", True) is True else 0,
         "estimated_credits": 1,
         "observed_credits": 1,
         "accounted_credits": 1,
@@ -103,8 +108,18 @@ def additional(**fields: Any) -> dict[str, Any]:
     return signed(**base)
 
 
-def full_corpus(*, moment_shift: timedelta = timedelta(0), **over: Any) -> list[dict[str, Any]]:
-    """The minimal corpus that satisfies all eight criteria under protocol v2."""
+def full_corpus(
+    *, moment_shift: timedelta = timedelta(0), id_offset: int = 0, **over: Any
+) -> list[dict[str, Any]]:
+    """The minimal corpus that satisfies all eight criteria under protocol v2.
+
+    ``id_offset`` exists because two corpora combined in one directory are eight
+    *different* receipts twice over, not eight receipts written twice: the harness
+    draws every ``receipt_id`` from :func:`secrets.token_hex`, so it never reuses
+    one. Without the offset both calls produced identical identifiers carrying
+    different signed bytes, which protocol v4 correctly reports as a conflict and
+    excludes from every threshold.
+    """
     rows = [
         (FOOTBALL, DAY_ONE, "a"),
         (FOOTBALL_2, DAY_TWO, "b"),
@@ -115,7 +130,7 @@ def full_corpus(*, moment_shift: timedelta = timedelta(0), **over: Any) -> list[
     ]
     corpus = [
         signed(
-            receipt_id=f"{i:016x}",
+            receipt_id=f"{i + id_offset:016x}",
             sport_key=key,
             moment=moment + moment_shift,
             event_tag=tag * 32,
@@ -125,14 +140,14 @@ def full_corpus(*, moment_shift: timedelta = timedelta(0), **over: Any) -> list[
     ]
     corpus += [
         additional(
-            receipt_id="aa" * 8,
+            receipt_id=f"{0xAA + id_offset:016x}",
             sport_key=FOOTBALL,
             moment=DAY_ONE + moment_shift,
             event_tag="1" * 32,
             **over,
         ),
         additional(
-            receipt_id="bb" * 8,
+            receipt_id=f"{0xBB + id_offset:016x}",
             sport_key=FOOTBALL_2,
             moment=DAY_TWO + moment_shift,
             event_tag="2" * 32,
@@ -319,7 +334,7 @@ class TestEvidenceIsBoundToProtocolAndImplementation:
         assert cost(qual.evaluate(old, 0))["observed"]["conforming_paid_calls"] == 0
 
     def test_older_schemas_stay_readable_history_and_are_not_unverifiable(self) -> None:
-        mixed = full_corpus(schema_version=2) + full_corpus()
+        mixed = full_corpus(schema_version=2, id_offset=0x2000) + full_corpus()
         document = qual.evaluate(mixed, 0)
         assert document["qualification_unverifiable_receipts"] == 0
         assert document["qualification_historical_nonqualifying_receipts"] == 8
@@ -697,7 +712,7 @@ class TestTheAuditCounterIsNotOverwritten:
     """`**qualification` used to spread a same-named key over the D-062 field."""
 
     def test_the_two_counters_coexist_and_disagree_when_they_should(self) -> None:
-        receipts = full_corpus() + full_corpus(schema_version=3)
+        receipts = full_corpus() + full_corpus(schema_version=3, id_offset=0x1000)
         unknown = signed(receipt_id="ee" * 8, schema_version=99)
         document = act.build_activation_state([*receipts, unknown], unverifiable=4)
         assert document["unverifiable_receipts"] == 4

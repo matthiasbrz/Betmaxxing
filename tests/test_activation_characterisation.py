@@ -29,8 +29,15 @@ pytestmark = pytest.mark.usefixtures("workspace")
 
 def _signed(**fields: Any) -> dict[str, Any]:
     """A receipt with a real signature, built from synthetic fields only."""
+    from betmaxxing.providers.the_odds_api import qualification as qual
+
     document: dict[str, Any] = {
         "schema_version": act.RECEIPT_SCHEMA_VERSION,
+        # A v4 receipt is exactly one that carries these two stamps under its
+        # signature. Declaring the version without them described a document
+        # `build_receipt` never writes.
+        "qualification_protocol_version": qual.PROVIDER_VALIDATION_PROTOCOL_VERSION,
+        "provider_adapter_evidence_version": qual.PROVIDER_ADAPTER_EVIDENCE_VERSION,
         "receipt_id": fields.pop("receipt_id", "aa00bb11cc22dd33"),
         "command": "core",
         "status": str(act.ActivationStatus.CORE_LIVE_VERIFIED),
@@ -39,6 +46,13 @@ def _signed(**fields: Any) -> dict[str, Any]:
         "sport_key": "soccer_france_ligue_one",
         "bookmaker": "unibet",
         "network_attempted": True,
+        # Both mandatory on every receipt the harness writes, and both missing here
+        # until protocol v4 started reading them. Without them this fixture described
+        # a document `build_receipt` never produces, and the dimension it exercises —
+        # a live mapping observation — now legitimately refuses such a receipt.
+        # Derived from the network flag so a case overriding it stays consistent.
+        "may_have_reached_provider": fields.get("network_attempted", True) is True,
+        "attempts": 1 if fields.get("network_attempted", True) is True else 0,
         "estimated_credits": 1,
         "observed_credits": 1,
         "accounted_credits": 1,
