@@ -34,8 +34,10 @@ import pytest
 from betmaxxing.providers.the_odds_api import activation as act
 from betmaxxing.providers.the_odds_api import qualification as qual
 
-#: Pinned literally, exactly as D-074 and the protocol publish it.
-EFFECTIVE_INSTANT = "2026-08-10T09:11:48+00:00"
+#: The instant D-074 published, kept as the historical literal it is. This module
+#: guards the v4 closures, which are unchanged; the *current* effective instant is
+#: pinned exactly once, by ``tests/test_qualification_v5_contract.py``.
+D074_EFFECTIVE_INSTANT = "2026-08-10T09:11:48+00:00"
 
 FOOTBALL = "soccer_france_ligue_one"
 FOOTBALL_2 = "soccer_epl"
@@ -452,13 +454,28 @@ def produced(command: str, status: str, over: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 class TestTheProtocolIsVersionFour:
     def test_the_versioned_constants(self) -> None:
-        assert qual.PROVIDER_VALIDATION_PROTOCOL_VERSION == 4
+        """The v4 closures, not the current version number.
+
+        The number itself is pinned exactly once, by the v5 contract. What this module
+        owes is that v4's own constants kept their meaning: the adapter-evidence version
+        is still 1 and only a v4 *schema* can qualify — the receipt schema did not move
+        when the protocol did.
+        """
         assert qual.PROVIDER_ADAPTER_EVIDENCE_VERSION == 1
         assert qual.QUALIFYING_SCHEMA_VERSION == 4
         assert act.RECEIPT_SCHEMA_VERSION == 4
+        assert isinstance(qual.PROVIDER_VALIDATION_PROTOCOL_VERSION, int)
+        assert qual.PROVIDER_VALIDATION_PROTOCOL_VERSION >= 4
 
-    def test_the_effective_instant_is_the_published_literal(self) -> None:
-        assert qual.QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC == EFFECTIVE_INSTANT
+    def test_the_effective_instant_moved_forward_from_d074(self) -> None:
+        """An effective instant only ever moves forward, and never back onto D-074's.
+
+        Pinning the current value here would duplicate the v5 contract. What v4 owes is
+        that its own instant was not quietly reused or rolled back, since evidence
+        admitted under D-074 must not silently become current again.
+        """
+        current = datetime.fromisoformat(qual.QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC)
+        assert current >= datetime.fromisoformat(D074_EFFECTIVE_INSTANT)
 
     def test_protocol_three_evidence_is_now_historical(self) -> None:
         document = qual.evaluate(corpus(qualification_protocol_version=3), 0)
@@ -720,13 +737,13 @@ class TestTheOlderDimensionsAgreeWithTheStrictBlock:
         census = document["paid_call_cost_census"]
         criterion = cost_of(document)["observed"]
         if document["connectivity_and_cost_proof"] == str(act.CostProof.EXERCISED_CONFORMING):
-            assert census["nonconforming_paid_calls"] == 0, label
-            assert census["paid_calls_with_unestablished_cost"] == 0, label
-            assert census["conforming_paid_calls"] >= 1, label
+            assert census["provider_reached_nonconforming_cost"] == 0, label
+            assert census["provider_reached_unestablished_cost"] == 0, label
+            assert census["provider_reached_conforming_cost"] >= 1, label
             # The criterion's population is a subset, so it cannot show a defect the
             # broader census does not.
-            assert criterion["nonconforming_paid_calls"] == 0, label
-            assert criterion["paid_calls_with_unestablished_cost"] == 0, label
+            assert criterion["provider_reached_nonconforming_cost"] == 0, label
+            assert criterion["provider_reached_unestablished_cost"] == 0, label
 
     @pytest.mark.parametrize("label", DIMENSION_LABELS)
     def test_obtained_live_never_rests_on_rejected_evidence(self, label: str) -> None:
@@ -810,21 +827,32 @@ class TestTheCostCategoriesSayWhatTheyKnow:
     def test_never_left_requires_an_exact_false(self) -> None:
         receipt = core(may_have_reached_provider=False, observed_credits=None, accounted_credits=1)
         observed = cost_of(qual.evaluate([receipt], 0))["observed"]
-        assert observed["paid_calls_that_never_left"] == 1
+        assert observed["confirmed_attempts_not_sent"] == 1
 
     @pytest.mark.parametrize("flag", ["network_attempted", "may_have_reached_provider"])
     @pytest.mark.parametrize("value", ["false", "true", 1, 0, [], {}])
     def test_a_mistyped_flag_is_an_unestablished_cost(self, flag: str, value: Any) -> None:
+        """Blocking, and never filed as a certainty.
+
+        Protocol v5 split "the attempt state cannot be established" from "the request
+        was confirmed not to have been served", so a mistyped flag now names which of
+        the two is unknown. The property this test defends is unchanged: it counts, it
+        blocks, and it is never reported as a call proven not to have left.
+        """
         receipt = core(**{flag: value})
-        observed = cost_of(qual.evaluate([receipt], 0))["observed"]
-        assert observed["paid_calls_that_never_left"] == 0
-        assert observed["paid_calls_with_unestablished_cost"] == 1
+        result = cost_of(qual.evaluate([receipt], 0))
+        observed = result["observed"]
+        assert observed["confirmed_attempts_not_sent"] == 0
+        assert sum(observed[name] for name in qual.BLOCKING_COST_BUCKETS) == 1
+        assert result["passed"] is False
 
     @pytest.mark.parametrize("flag", ["network_attempted", "may_have_reached_provider"])
     def test_an_absent_flag_is_an_unestablished_cost(self, flag: str) -> None:
-        observed = cost_of(qual.evaluate([core(drop=(flag,))], 0))["observed"]
-        assert observed["paid_calls_with_unestablished_cost"] == 1
-        assert observed["paid_calls_that_never_left"] == 0
+        result = cost_of(qual.evaluate([core(drop=(flag,))], 0))
+        observed = result["observed"]
+        assert sum(observed[name] for name in qual.BLOCKING_COST_BUCKETS) == 1
+        assert observed["confirmed_attempts_not_sent"] == 0
+        assert result["passed"] is False
 
     def test_a_step_refused_before_the_network_is_not_a_paid_call(self) -> None:
         refused = produced("core", "PREPARED_NOT_EXECUTED", {"markets_requested": ["h2h"]})
@@ -867,13 +895,14 @@ class TestTheCostCategoriesSayWhatTheyKnow:
                         )
                         observed = cost_of(qual.evaluate([receipt], 0))["observed"]
                         total = sum(observed.values())
-                        # The documented denominator, verbatim: a paid command whose
-                        # `network_attempted` is not an exact False. Only an exact
-                        # False proves no paid call was attempted; an absent or
-                        # mistyped flag proves nothing, so the receipt stays in the
-                        # census and lands in `paid_calls_with_unestablished_cost`.
-                        is_paid_attempt = receipt.get("network_attempted") is not False
-                        assert total == (1 if is_paid_attempt else 0), (over, drop, observed)
+                        # The denominator as protocol v5 documents it: a paid step whose
+                        # attempt state is anything other than "never attempted". v4
+                        # wrote this as `network_attempted is not False`, which put an
+                        # absent flag and a confirmed request in the same population;
+                        # the three-valued reading names them apart while keeping the
+                        # property this test defends — exactly one bucket, or none.
+                        counted = qual.attempt_state(receipt) is not qual.AttemptState.NOT_ATTEMPTED
+                        assert total == (1 if counted else 0), (over, drop, observed)
 
     def test_the_pass_rule(self) -> None:
         assert cost_of(qual.evaluate(six_paid(), 0))["passed"] is True
@@ -1024,7 +1053,15 @@ class TestThePopulationsReconcile:
         assert document["qualification_historical_nonqualifying_receipts"] == 0
 
     def test_a_current_contradictory_receipt_is_not_called_historical(self) -> None:
-        document = qual.evaluate([core(selections_mapped=0)], 0)
+        """A contradiction the structural contract does not already catch.
+
+        The original fixture was ``selections_mapped=0`` on a ``CORE_LIVE_VERIFIED``
+        receipt. Protocol v5 refuses that earlier, as *malformed*: a positive mapping
+        status owes at least one mapped selection. So the example moves to a receipt that
+        is structurally impeccable and still disagrees with itself — accounting for fewer
+        credits than the provider reported — which is what this test is about.
+        """
+        document = qual.evaluate([core(observed_credits=1, accounted_credits=0)], 0)
         assert document["qualification_current_contradictory_receipts"] == 1
         assert document["qualification_historical_nonqualifying_receipts"] == 0
 
@@ -1124,82 +1161,3 @@ class TestAMalformedValueIsNeverReflected:
         document = qual.evaluate([core(selections_mapped="3")], 0)
         assert document["qualification_reasons"]["malformed_current_schema"] == 1
         assert any("selections_mapped" in c for c in document["evidence_conflicts"])
-
-
-# ---------------------------------------------------------------------------
-# §7 — the documents say the current norm once, and keep their history readable
-# ---------------------------------------------------------------------------
-#: The sections of the protocol document that are *history*: they describe what an
-#: earlier version claimed and what it actually did, so an old version number and an
-#: old effective instant belong in them. A global grep would make that history
-#: unwritable, which is the opposite of what annotating a superseded decision is for.
-HISTORICAL_HEADINGS = (
-    "## 0. Ce que la v1",
-    "### 0.1 Puis la v2",
-    "### 0.2 Puis la v3",
-)
-
-SUPERSEDED_INSTANTS = ("2026-08-09T19:38:29+00:00", "2026-08-10T07:19:48+00:00")
-
-
-def current_sections(path: Path) -> str:
-    """The document minus the sections that exist to record its own history."""
-    out: list[str] = []
-    historical = False
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.startswith("#"):
-            historical = line.startswith(HISTORICAL_HEADINGS)
-        if not historical:
-            out.append(line)
-    return "\n".join(out)
-
-
-class TestTheDocumentsPublishOneNorm:
-    def test_the_protocol_document_states_the_current_version_once(self) -> None:
-        text = current_sections(Path("docs/provider-validation-protocol.md"))
-        assert "PROVIDER_VALIDATION_PROTOCOL_VERSION = 4" in text
-        assert "PROVIDER_VALIDATION_PROTOCOL_VERSION = 3" not in text
-        assert EFFECTIVE_INSTANT in text
-        for stale in SUPERSEDED_INSTANTS:
-            assert stale not in text, stale
-
-    def test_the_history_is_still_readable(self) -> None:
-        """Superseded numbers must survive where they are the subject.
-
-        The point of annotating a superseded decision rather than editing it is that
-        the earlier claim stays legible. A test that forbade every old number
-        everywhere would quietly delete that record.
-        """
-        whole = Path("docs/provider-validation-protocol.md").read_text(encoding="utf-8")
-        assert "### 0.2 Puis la v3 a été auditée à son tour" in whole
-        decisions = Path("docs/decisions.md").read_text(encoding="utf-8")
-        for stale in SUPERSEDED_INSTANTS:
-            assert stale in decisions, stale
-        assert "Supersédée pour la qualification par D-074" in decisions
-
-    @pytest.mark.parametrize(
-        "document",
-        [
-            "docs/provider-validation-protocol.md",
-            "docs/provider-activation.md",
-            "docs/data-dictionary.md",
-            "docs/roadmap.md",
-        ],
-    )
-    def test_no_current_section_publishes_a_superseded_instant(self, document: str) -> None:
-        text = current_sections(Path(document))
-        for stale in SUPERSEDED_INSTANTS:
-            assert stale not in text, (document, stale)
-
-    def test_the_new_decision_exists_and_names_its_three_versions(self) -> None:
-        decisions = Path("docs/decisions.md").read_text(encoding="utf-8")
-        assert "### D-074 —" in decisions
-        assert "**Protocole 4, adaptateur 1, schéma 4.**" in decisions
-        assert EFFECTIVE_INSTANT in decisions
-
-    def test_the_machine_ceiling_is_still_published(self) -> None:
-        """No document may promise more than the evaluator can conclude."""
-        for name in ("docs/provider-validation-protocol.md", "docs/decisions.md"):
-            text = Path(name).read_text(encoding="utf-8")
-            assert "CRITERIA_MET_AWAITING_HUMAN_REVIEW" in text, name
-        assert "VERIFIED" not in {str(state) for state in qual.QualificationState}

@@ -13,7 +13,7 @@ is why it can be tested purely.
 from __future__ import annotations
 
 import json as jsonlib
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -27,11 +27,14 @@ FOOTBALL_2 = "soccer_epl"
 TENNIS = "tennis_atp_paris"
 TENNIS_2 = "tennis_wta_madrid"
 BOOK = "unibet"
-#: After `QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC`: under protocol v2 a receipt
-#: recorded before the protocol took effect is history, never qualification.
-DAY_ONE = datetime(2026, 8, 10, 12, tzinfo=UTC)
-DAY_TWO = datetime(2026, 8, 11, 12, tzinfo=UTC)
-DAY_THREE = datetime(2026, 8, 12, 12, tzinfo=UTC)
+#: Positioned relative to the protocol's own effective instant rather than to dates
+#: invented here: a receipt recorded before the protocol took effect is history, never
+#: qualification, so hard-coded days silently turn the whole corpus historical the next
+#: time the instant is moved — which is exactly what an authorised bump does.
+NOT_BEFORE = datetime.fromisoformat(qual.QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC)
+DAY_ONE = NOT_BEFORE + timedelta(days=1)
+DAY_TWO = NOT_BEFORE + timedelta(days=2)
+DAY_THREE = NOT_BEFORE + timedelta(days=3)
 
 
 def signed(**fields: Any) -> dict[str, Any]:

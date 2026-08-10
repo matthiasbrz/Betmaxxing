@@ -195,7 +195,7 @@ appels réels au fournisseur.
 | `event_tag` / `event_tags` | identifiant(s) d'événement en **HMAC local**, jamais en clair. Volontairement visible dans `bookmaker_coverage_observations` et nulle part ailleurs : c'est ce qui borne une observation à un événement sans le nommer (D-062). Ce n'est pas l'identifiant fournisseur et ne doit jamais être présenté comme tel |
 | `window_from`, `window_to` | fenêtre déclarée |
 | `endpoints`, `endpoint`, `attempts` | endpoints **templatés** (jamais d'URL avec query string) et nombre exact de requêtes tentées. `attempts` est **obligatoire** et cohérent avec le drapeau réseau : `network_attempted = false` impose `0`, `true` impose `≥ 1` (D-074) |
-| `network_attempted`, `may_have_reached_provider` | une socket a-t-elle été ouverte ; la requête a-t-elle pu être servie (un timeout de lecture vaut « oui »). Exactement `true` ou `false` : une valeur absente ou mal typée n'établit **rien**, et en particulier ne prouve pas qu'un appel n'est jamais parti (D-074) |
+| `network_attempted`, `may_have_reached_provider` | une socket a-t-elle été ouverte ; la requête a-t-elle pu être servie (un timeout de lecture vaut « oui »). Exactement `true` ou `false` : une valeur absente ou mal typée n'établit **rien**, et en particulier ne prouve pas qu'un appel n'est jamais parti (D-074). Les deux ensemble, avec `attempts`, forment l'**atteinte du fournisseur**, précondition de toute preuve de réponse — mapping, couverture, fraîcheur (D-075) |
 | `estimated_credits` | borne calculée avant l'appel |
 | `observed_credits` | `x-requests-last`, ou **`null`** s'il est absent, illisible ou négatif — jamais remplacé par zéro |
 | `accounted_credits` | ce qui est retenu : l'observation si elle existe, l'estimation sinon |
@@ -215,7 +215,7 @@ Ne s'y trouvent **jamais** : la clé API, le secret de signature, une URL non
 expurgée, un corps de réponse brut, une cote, un nom de participant, un horaire
 individuel, ni l'identifiant d'événement en clair.
 
-## Les cinq dimensions de `activation status` (D-062, resserrées par D-074)
+## Les cinq dimensions de `activation status` (D-062, resserrées par D-074 puis D-075)
 
 Cinq faits distincts qu'un seul libellé ne porte pas, plus le bloc de qualification
 ci-dessous. Distinct ne veut pas dire indulgent : depuis D-074 chacune lit ses reçus
@@ -225,14 +225,16 @@ sur une preuve que celui-ci rejette pour le même fait.
 | Champ | Type | Sens |
 |---|---|---|
 | `adapter_state` | `str` | `IMPLEMENTED_UNVERIFIED`, quelle que soit l'issue de tout le reste |
-| `execution_state` | `str` | jusqu'où la séquence est allée sur cette installation : `NO_NETWORK_ATTEMPTED`, `DISCOVERY_ATTEMPTED`, `CORE_ATTEMPTED`, `ADDITIONAL_ATTEMPTED` |
+| `execution_state` | `str` | jusqu'où la séquence est allée : `NO_NETWORK_ATTEMPTED`, `NETWORK_ATTEMPT_STATE_UNESTABLISHED`, `DISCOVERY_ATTEMPTED`, `CORE_ATTEMPTED`, `ADDITIONAL_ATTEMPTED`. Seule une tentative **confirmée** — `network_attempted is true` et `attempts ≥ 1` — produit un `*_ATTEMPTED` ; un drapeau absent ou mal typé produit l'état non établi, jamais un fait (D-075) |
 | `connectivity_and_cost_proof` | `str` | `NOT_EXERCISED`, `EXERCISED_CONFORMING`, `EXERCISED_UNESTABLISHED` ou `EXERCISED_NONCONFORMING`, par la précédence `NONCONFORMING > UNESTABLISHED > CONFORMING > NOT_EXERCISED`. `EXERCISED_UNESTABLISHED` existe parce qu'un coût non établi n'est ni conforme ni un écart (D-074) |
-| `paid_call_cost_census` | `dict[str, int]` | le recensement dont le champ précédent est dérivé, sur **la même** population : toute tentative payante réelle du disque, protocoles antérieurs compris, sans déduplication. `COST_CONFORMITY` en compte une plus étroite, d'où des nombres qui peuvent légitimement différer |
+| `paid_call_cost_census` | `dict[str, int]` | le recensement dont le champ précédent est dérivé, sur **la même** population : tout pas payant **distinct** du disque, protocoles antérieurs compris. Cinq clés depuis D-075 : `provider_reached_conforming_cost`, `provider_reached_nonconforming_cost`, `provider_reached_unestablished_cost`, `paid_attempt_state_unestablished`, `confirmed_attempts_not_sent`. `COST_CONFORMITY` en compte une plus étroite — protocole courant —, d'où des nombres qui peuvent légitimement différer |
 | `paid_call_cost_census_population` | `str` | cette population, écrite en clair, pour que l'écart avec le critère ne se lise pas comme une contradiction |
-| `mapping_freshness_proof` | `str` | `NOT_OBTAINED_LIVE`, `OFFLINE_CONTRACT_VERIFIED` ou `OBTAINED_LIVE`. `OBTAINED_LIVE` exige une observation de mapping **saine** — statut positif, bookmaker observé, marché cartographié, fraîcheur valide, contrat satisfait, aucune contradiction — jamais un simple `selections_mapped > 0` (D-074) |
-| `paid_activation_state` | `str` | `PREPARED_NOT_EXECUTED`, `PAID_ATTEMPT_INCONCLUSIVE`, `CORE_EXECUTED_NO_COVERAGE`, `CORE_EXECUTED_COVERAGE_OBSERVED` ou `ADDITIONAL_EXECUTED`. `PAID_ATTEMPT_INCONCLUSIVE` nomme un appel payant réellement parti qui n'a établi ni couverture ni mapping ; le confondre avec « exécuté sans couverture » affirmait qu'on avait regardé (D-074) |
+| `mapping_freshness_proof` | `str` | `NOT_OBTAINED_LIVE`, `OFFLINE_CONTRACT_VERIFIED` ou `OBTAINED_LIVE`. `OBTAINED_LIVE` exige une observation de mapping **saine** — atteinte du fournisseur établie, statut positif, bookmaker observé, marché cartographié, fraîcheur valide, contrat satisfait, aucune contradiction — jamais un simple `selections_mapped > 0` (D-074, D-075) |
+| `paid_activation_state` | `str` | `PREPARED_NOT_EXECUTED`, `PAID_ATTEMPT_STATE_UNESTABLISHED`, `PAID_ATTEMPT_INCONCLUSIVE`, `CORE_EXECUTED_NO_COVERAGE`, `CORE_EXECUTED_COVERAGE_OBSERVED` ou `ADDITIONAL_EXECUTED`. Cascade **identique** pour `core` et `additional`, preuves d'abord : `ADDITIONAL_EXECUTED` exige qu'une preuve `additional` classifiée et valide établisse effectivement couverture ou mapping — la seule présence d'un reçu `additional` ne suffit pas (D-075) |
 | `bookmaker_coverage_observations` | `list[dict]` | observations de portée stricte — un fournisseur, un bookmaker, une compétition, un événement tagué, un instant. N'y figurent que des reçus dont la phase a réellement répondu à la question du bookmaker, structurellement valides et non contradictoires : une observation est une **réponse**, pas la trace d'une tentative |
-| `accounted_credits_total` | `int` | somme des `accounted_credits`, en n'additionnant que des entiers réels **non négatifs**. Ni booléen, ni chaîne numérique, ni négatif : c'est un chiffre de dépense lu avant de décider d'en dépenser plus |
+| `accounted_credits_total` | `int` | somme des `accounted_credits` de reçus **distincts** et **structurellement lisibles**, en n'additionnant que des entiers réels non négatifs. Ni booléen, ni chaîne numérique, ni négatif, ni copie de fichier : c'est un chiffre de dépense lu avant de décider d'en dépenser plus (D-075) |
+| `rejected_receipt_credits_not_counted` | `int` | ce que revendiquent les reçus que le contrat structurel rejette. Publié pour être visible, **jamais** sommé dans le champ précédent : le nom dit lequel des deux est une comptabilité (D-075) |
+| `bookmaker_coverage_observation_scope` | `str` | la population des observations, en clair : reçus distincts, de phase classifiée, structurellement valides, non contradictoires, et dont l'atteinte du fournisseur est établie |
 | `verified_receipts` / `unverifiable_receipts` | `int` | population de l'audit local D-062. `unverifiable_receipts` compte aussi les liens symboliques, les cibles hors répertoire et les répertoires nommés `*.json`, jamais ouverts (D-074) |
 | `receipt_directory` | `str` | chemin **local**, gitignoré et sans distant. Le supprimer remet la preuve à zéro, ce qui est voulu |
 
@@ -246,7 +248,7 @@ configuration, aucun reçu modifié. Le protocole complet est dans
 
 | Champ | Type | Sens |
 |---|---|---|
-| `qualification_protocol_version` | `int` | version des seuils et des règles d'admissibilité appliqués — `4` ; deux versions ne se comparent pas |
+| `qualification_protocol_version` | `int` | version des seuils et des règles d'admissibilité appliqués — `5` ; deux versions ne se comparent pas |
 | `qualification_adapter_evidence_version` | `int` | version du parser sous laquelle une preuve compte — `1` |
 | `qualification_evidence_not_before` | `str` | instant UTC littéral avant lequel un reçu est historique et jamais qualifiant |
 | `qualification_state` | `str` | `INSUFFICIENT_EVIDENCE`, `EVIDENCE_CONFLICT` ou `CRITERIA_MET_AWAITING_HUMAN_REVIEW`. Il n'existe pas de `VERIFIED` |

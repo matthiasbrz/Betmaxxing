@@ -331,7 +331,7 @@ class TestEvidenceIsBoundToProtocolAndImplementation:
             )
             for i in (1, 2)
         ]
-        assert cost(qual.evaluate(old, 0))["observed"]["conforming_paid_calls"] == 0
+        assert cost(qual.evaluate(old, 0))["observed"]["provider_reached_conforming_cost"] == 0
 
     def test_older_schemas_stay_readable_history_and_are_not_unverifiable(self) -> None:
         mixed = full_corpus(schema_version=2, id_offset=0x2000) + full_corpus()
@@ -425,25 +425,47 @@ class TestAdmissibilityIsAPositiveTable:
         assert passing(qual.evaluate(extra_like, 0)) == []
 
     def test_partial_coverage_is_admissible_for_the_markets_it_mapped(self) -> None:
+        """And for those only — which is what "partial" has to mean.
+
+        The fixture used to carry ``ADDITIONAL_PARTIAL_COVERAGE`` with *all five*
+        markets mapped, a document ``_additional_status`` never emits: with everything
+        mapped it reports ``ADDITIONAL_LIVE_VERIFIED``. Protocol v5 refuses that shape,
+        so the fixture now describes a real partial coverage — four markets mapped, the
+        fifth not returned — and the assertion gains the half it was missing: the market
+        that was not mapped is not carried by the ones that were.
+        """
+        markets = list(act.ADDITIONAL_MARKETS)
+        mapped, unmapped = markets[:-1], markets[-1]
+        shape: dict[str, Any] = {
+            "status": str(act.ActivationStatus.ADDITIONAL_PARTIAL_COVERAGE),
+            "market_states": {
+                **dict.fromkeys(mapped, str(act.MarketState.OBSERVED_MAPPED)),
+                unmapped: str(act.MarketState.NOT_RETURNED),
+            },
+            "markets_mapped": mapped,
+            "selections_mapped": 9,
+            "freshness": dict.fromkeys(mapped, 300),
+        }
         partial = [
             additional(
                 receipt_id="aa" * 8,
                 sport_key=FOOTBALL,
                 moment=DAY_ONE,
                 event_tag="1" * 32,
-                status=str(act.ActivationStatus.ADDITIONAL_PARTIAL_COVERAGE),
+                **shape,
             ),
             additional(
                 receipt_id="bb" * 8,
                 sport_key=FOOTBALL_2,
                 moment=DAY_TWO,
                 event_tag="2" * 32,
-                status=str(act.ActivationStatus.ADDITIONAL_PARTIAL_COVERAGE),
+                **shape,
             ),
         ]
         satisfied = passing(qual.evaluate(partial, 0))
-        for market in act.ADDITIONAL_MARKETS:
+        for market in mapped:
             assert f"ADDITIONAL_MAPPING_FOOTBALL_{market.upper()}" in satisfied
+        assert f"ADDITIONAL_MAPPING_FOOTBALL_{unmapped.upper()}" not in satisfied
 
 
 class TestCostConformityIsDefinedInItsOwnTerms:
@@ -493,7 +515,7 @@ class TestCostConformityIsDefinedInItsOwnTerms:
     )
     def test_a_cost_that_is_not_established_does_not_count(self, field: str, value: Any) -> None:
         document = qual.evaluate(self._six(**{field: value}), 0)
-        assert cost(document)["observed"]["conforming_paid_calls"] == 0
+        assert cost(document)["observed"]["provider_reached_conforming_cost"] == 0
         assert cost(document)["passed"] is False
 
     @pytest.mark.parametrize(
@@ -506,7 +528,10 @@ class TestCostConformityIsDefinedInItsOwnTerms:
             signed(receipt_id="ff" * 8, status=str(status), event_tag="9" * 32),
         ]
         result = cost(qual.evaluate(receipts, 0))
-        assert result["observed"]["nonconforming_paid_calls"] == 1
+        # Protocol v5 files COST_UNVERIFIED under "cost not established" rather than
+        # "cost nonconforming": a header nobody could read is not a tariff that
+        # disagreed. Both block, and blocking is what this test is about.
+        assert sum(result["observed"][name] for name in qual.BLOCKING_COST_BUCKETS) == 1
         assert result["passed"] is False
 
 

@@ -415,9 +415,9 @@ class TestAPaidCallWithUnestablishedCostBlocksTheCriterion:
     def test_six_conforming_calls_pass_on_their_own(self) -> None:
         result = entry(qual.evaluate(six_paid(), 0), "COST_CONFORMITY")
         assert result["passed"] is True
-        assert result["observed"]["conforming_paid_calls"] == 6
-        assert result["observed"]["nonconforming_paid_calls"] == 0
-        assert result["observed"]["paid_calls_with_unestablished_cost"] == 0
+        assert result["observed"]["provider_reached_conforming_cost"] == 6
+        assert result["observed"]["provider_reached_nonconforming_cost"] == 0
+        assert result["observed"]["provider_reached_unestablished_cost"] == 0
 
     @pytest.mark.parametrize(("label", "over"), UNESTABLISHED, ids=[c[0] for c in UNESTABLISHED])
     def test_a_seventh_paid_call_never_passes_unnoticed(
@@ -426,9 +426,10 @@ class TestAPaidCallWithUnestablishedCostBlocksTheCriterion:
         seventh = core(receipt_id="ff" * 8, event_tag="9" * 32, moment=D2, **over)
         result = entry(qual.evaluate([*six_paid(), seventh], 0), "COST_CONFORMITY")
         observed = result["observed"]
-        counted = (
-            observed["nonconforming_paid_calls"] + observed["paid_calls_with_unestablished_cost"]
-        )
+        # Protocol v5 split "the attempt state cannot be established" out of the
+        # unestablished-cost bucket, so a mistyped network flag now names itself. All
+        # three still block, which is the property this test defends.
+        counted = sum(observed[name] for name in qual.BLOCKING_COST_BUCKETS)
         assert counted >= 1, observed
         assert result["passed"] is False
         assert result["missing"], "the reader must be told why the cost criterion fails"
@@ -450,19 +451,15 @@ class TestAPaidCallWithUnestablishedCostBlocksTheCriterion:
             freshness={},
         )
         observed = entry(qual.evaluate([*six_paid(), never], 0), "COST_CONFORMITY")["observed"]
-        assert observed["paid_calls_that_never_left"] == 1
-        assert observed["paid_calls_with_unestablished_cost"] == 0
+        assert observed["confirmed_attempts_not_sent"] == 1
+        assert observed["provider_reached_unestablished_cost"] == 0
 
     def test_every_paid_receipt_lands_in_exactly_one_category(self) -> None:
         for _, over in UNESTABLISHED:
             seventh = core(receipt_id="ff" * 8, event_tag="9" * 32, moment=D2, **over)
             observed = entry(qual.evaluate([seventh], 0), "COST_CONFORMITY")["observed"]
-            total = (
-                observed["conforming_paid_calls"]
-                + observed["nonconforming_paid_calls"]
-                + observed["paid_calls_with_unestablished_cost"]
-                + observed["paid_calls_that_never_left"]
-            )
+            # Five buckets since protocol v5, still exhaustive and still disjoint.
+            total = sum(observed.values())
             assert total == 1, (over, observed)
 
     def test_the_criterion_says_what_it_does_not_prove(self) -> None:

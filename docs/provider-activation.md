@@ -413,11 +413,11 @@ de candidat en `paper` ou `live_analysis`, démarrage d'un ordonnanceur réel,
 envoi de notification, pari ou automatisme de mise, interface web, et
 versionnement d'un payload fournisseur brut.
 
-## Lire la qualification (D-071, corrigée par D-072, D-073 puis D-074)
+## Lire la qualification (D-071, corrigée par D-072, D-073, D-074 puis D-075)
 
 `activation status` porte, depuis 03C-1, un sixième bloc : l'évaluation des
 critères **préenregistrés** de `docs/provider-validation-protocol.md`
-(`PROVIDER_VALIDATION_PROTOCOL_VERSION = 4`,
+(`PROVIDER_VALIDATION_PROTOCOL_VERSION = 5`,
 `PROVIDER_ADAPTER_EVIDENCE_VERSION = 1`, schéma de reçu `v4`).
 
 ```bash
@@ -455,9 +455,28 @@ Ce que le bloc dit, et ce qu'il ne dit pas :
   qualifie plus aucun critère, `COST_CONFORMITY` inclus. C'est le prix assumé de
   la correction D-072 ;
 - une preuve enregistrée avant `qualification_evidence_not_before`
-  (`2026-08-10T09:11:48+00:00`) est de l'histoire. Aucune preuve réelle n'a encore été
-  collectée sous protocole 4 : l'état courant est `INSUFFICIENT_EVIDENCE` avec zéro
+  (`2026-08-10T14:00:37+00:00`) est de l'histoire. Aucune preuve réelle n'a encore été
+  collectée sous protocole 5 : l'état courant est `INSUFFICIENT_EVIDENCE` avec zéro
   reçu utilisable ;
+- **toute** preuve de réponse — mapping, couverture, fraîcheur — exige que l'atteinte du
+  fournisseur soit établie : `network_attempted is true`, `attempts ≥ 1` **et**
+  `may_have_reached_provider is true`. Un statut impliquant une réponse sur un reçu qui
+  ne l'établit pas est **contradictoire**, pas seulement non qualifiant (D-075) ;
+- l'état de tentative est **à trois valeurs** : pas de tentative, tentative confirmée, ou
+  état non établi. Le troisième est visible sous
+  `NETWORK_ATTEMPT_STATE_UNESTABLISHED` / `PAID_ATTEMPT_STATE_UNESTABLISHED`, il bloque, et
+  il n'est jamais décrit comme tenté, réel ou exécuté ;
+- une **tentative confirmée non envoyée** — les deux drapeaux exacts,
+  `may_have_reached_provider is false` — est recensée sous `confirmed_attempts_not_sent` :
+  elle ne bloque pas et ne qualifie rien, parce qu'une requête certainement non servie n'a
+  mesuré aucun tarif ;
+- une **copie byte-à-byte** ne change aucun nombre sémantique : crédits, recensement,
+  observations, catégories et seuils passent par une collection dédupliquée. Seuls
+  `verified_receipts`, `unverifiable_receipts` et
+  `qualification_exact_duplicate_copies` comptent des fichiers, et aucun n'est une preuve ;
+- `accounted_credits_total` ne somme que des reçus distincts et structurellement lisibles ;
+  ce qu'un reçu rejeté revendique est publié à part sous
+  `rejected_receipt_credits_not_counted` ;
 - un reçu courant **mal typé** — booléen là où un entier est attendu, chaîne là où un
   booléen est attendu — ne prouve rien et fait passer l'état à `EVIDENCE_CONFLICT`,
   avec la raison `malformed_current_schema` et les **noms** des champs fautifs. Une
@@ -465,14 +484,12 @@ Ce que le bloc dit, et ce qu'il ne dit pas :
 - un critère de mapping exige `bookmaker_state = OBSERVED`. Absent, inconnu ou
   `NOT_RETURNED`, il ne qualifie rien : la portée « bookmaker observé » est désormais
   vérifiée et non seulement affichée ;
-- `COST_CONFORMITY` expose quatre catégories exhaustives et disjointes sur une
-  population écrite — les **tentatives payantes réelles**, c'est-à-dire les reçus
-  `core`/`additional` dont `network_attempted` n'est pas exactement `false` — et
-  échoue si un seul appel payant a un coût **non établi** — un
-  `PROVIDER_UNAVAILABLE` qui a pu atteindre le fournisseur, par exemple — même après
-  six appels conformes. `paid_calls_that_never_left` exige un `false` booléen
-  **certain** sur les deux drapeaux ; absent ou mal typé va en coût non établi, et
-  bloque ;
+- `COST_CONFORMITY` expose **cinq** catégories exhaustives et disjointes sur une
+  population écrite — tout pas payant distinct du protocole courant dont l'état de
+  tentative n'est pas « jamais tenté » — et échoue si une seule d'entre elles est non
+  conforme, non établie, ou d'état de tentative non établi, même après six appels
+  conformes. `COST_UNVERIFIED` compte comme coût **non établi**, pas comme non conforme :
+  un en-tête illisible n'est pas un tarif qui a désaccordé (D-075) ;
 - les cinq dimensions plus anciennes lisent la **même** preuve que le bloc strict.
   `connectivity_and_cost_proof` suit la précédence
   `NONCONFORMING > UNESTABLISHED > CONFORMING > NOT_EXERCISED` et dispose désormais
@@ -481,7 +498,10 @@ Ce que le bloc dit, et ce qu'il ne dit pas :
   mapping **saine** — statut positif, bookmaker observé, marché cartographié,
   fraîcheur valide, contrat satisfait — et non un simple `selections_mapped > 0`.
   `paid_activation_state` gagne `PAID_ATTEMPT_INCONCLUSIVE` pour un appel payant
-  réellement parti qui n'a établi ni couverture ni mapping ;
+  réellement parti qui n'a établi ni couverture ni mapping, et applique la **même**
+  cascade à `core` et à `additional` : `ADDITIONAL_EXECUTED` exige qu'une preuve
+  `additional` classifiée et valide établisse effectivement couverture ou mapping, jamais
+  la seule présence d'un reçu `additional` (D-075) ;
 - `paid_call_cost_census` publie le recensement dont `connectivity_and_cost_proof`
   est dérivé, avec sa population en clair : **toute** tentative payante réelle du
   disque, protocoles antérieurs compris et sans déduplication. `COST_CONFORMITY`

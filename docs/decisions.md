@@ -1453,6 +1453,17 @@ protocole 3 — l'état courant est `INSUFFICIENT_EVIDENCE` avec zéro reçu adm
 
 ### D-074 — La rigueur doit accepter ce que le producteur écrit vraiment
 
+> **Supersédée pour la qualification par D-075**, et seulement sur les points que D-075
+> remplace réellement : l'absence de précondition d'atteinte fournisseur sur les preuves de
+> réponse ; la lecture binaire de l'état de tentative ; le court-circuit
+> `command == "additional"` de l'état payant ; la déduplication partielle des lectures
+> sémantiques ; l'admission d'un statut positif à portée de marchés vide ; la création du
+> nom final avant les octets ; le classement de `COST_UNVERIFIED` en « non conforme » ; et
+> le numéro de protocole avec sa date d'effet. Tout le reste de D-074 reste en vigueur tel
+> quel : le contrat conscient de la phase et sa table versionnée, la lecture partagée du
+> mapping, l'équation des populations, la détection des identifiants divergents sur
+> l'ensemble des reçus vérifiés, et l'absence de réflexion des valeurs rejetées.
+
 D-073 avait raison sur ses cinq fermetures et s'est trompée dans l'autre sens sur la
 première : elle a écrit un contrat structurel strict sans demander ce que le harnais
 émet réellement. Un troisième audit indépendant, en lecture seule et avant tout appel,
@@ -1616,3 +1627,139 @@ l'adaptateur reste `IMPLEMENTED_UNVERIFIED`, les modèles `BACKTEST_ONLY`,
 l'incertitude `UNAVAILABLE` hors démo, `Challenge` `PARTIAL` et désactivé. Le plafond
 machine reste `CRITERIA_MET_AWAITING_HUMAN_REVIEW`. Aucune preuve réelle n'existe sous
 protocole 4 : l'état courant est `INSUFFICIENT_EVIDENCE` avec zéro reçu utilisable.
+
+### D-075 — Une preuve de réponse exige une réponse
+
+D-074 avait raison sur la phase et s'est trompée sur ce qu'une phase établit. Un quatrième
+audit indépendant, en lecture seule et avant tout appel, a trouvé **un P1** : la porte
+`CRITERIA_MET_AWAITING_HUMAN_REVIEW` était atteignable alors que **toutes** les
+observations de mapping du corpus portaient `may_have_reached_provider = false` — une
+affirmation signée que la requête n'avait jamais atteint le fournisseur. Le drapeau
+n'était lu que par le recensement du coût ; le mapping, la couverture et la fraîcheur ne
+le regardaient pas. Détail qui dit tout : un drapeau **absent ou mal typé** était
+correctement refusé, et seule la valeur la plus explicite passait. Cinq P2 accompagnaient
+ce P1. Cette décision les ferme. D-074 reste lisible, annotée.
+
+**Protocole 5, adaptateur 1, schéma 4.** Les règles d'admissibilité, la population du coût
+et les états publiés changent, donc `PROVIDER_VALIDATION_PROTOCOL_VERSION = 5`. Ni le
+parseur fournisseur ni le mapping du payload ne changent, donc
+`PROVIDER_ADAPTER_EVIDENCE_VERSION` reste `1` ; aucun champ signé nouveau n'est requis,
+donc `RECEIPT_SCHEMA_VERSION` reste `4`. Nouvelle date d'effet, choisie une seule fois
+après le préflight et avant la première correction :
+`QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC = "2026-08-10T14:00:37+00:00"`, écrite au caractère
+près dans le code, ici, dans le protocole, le runbook et la feuille de route, et jamais
+recalculée au runtime.
+
+**L'atteinte du fournisseur est une précondition, pas une note de bas de page.**
+`provider_was_reached` exige une tentative confirmée **et** `may_have_reached_provider is
+true`, et il garde désormais `admissible_for`, `mapping_observation_is_sound`, les
+observations de couverture et les dimensions historiques de `activation status`. Un statut
+qui **implique** une réponse — `DISCOVERY_VERIFIED`, `CORE_LIVE_VERIFIED`,
+`ADDITIONAL_LIVE_VERIFIED`, `ADDITIONAL_PARTIAL_COVERAGE`, `COVERAGE_MISSING`,
+`SCHEMA_MISMATCH`, `COST_MISMATCH`, `COST_UNVERIFIED`, `AUTH_FAILED` — sur un reçu dont
+l'atteinte n'est pas établie est **contradictoire**, pas seulement non qualifiant : les deux
+champs sont les nôtres et signés, donc l'un est faux et nous ne savons pas lequel.
+`PROVIDER_UNAVAILABLE` n'en fait pas partie, parce qu'un timeout et un 5xx sont deux issues
+différentes et que le harnais ne prétend pas savoir laquelle.
+
+Le corpus qui franchissait la porte — huit preuves de mapping à `reach=false` plus six coûts
+honnêtes — reste désormais sous la porte avec **zéro** mapping admissible.
+
+**L'état de tentative a trois valeurs.** `AttemptState` : `NOT_ATTEMPTED` quand
+`network_attempted is false` **et** `attempts == 0` ; `CONFIRMED_ATTEMPT` quand le drapeau
+est exactement `true` **et** `attempts ≥ 1` ; `ATTEMPT_STATE_UNESTABLISHED` autrement,
+drapeau absent, mal typé, ou incohérent avec le compte. D-074 écrivait cette lecture
+`network_attempted is not False`, si bien qu'un champ **absent** devenait un fait :
+`execution_state` rapportait `CORE_ATTEMPTED` et la population s'appelait « tentatives
+payantes réelles ». Une mesure manquante n'est ni une mesure de zéro ni une mesure de un.
+
+Les deux états qui manquaient sont ajoutés :
+`ExecutionState.NETWORK_ATTEMPT_STATE_UNESTABLISHED` et
+`PaidActivationState.PAID_ATTEMPT_STATE_UNESTABLISHED`. La rétention reste prudente et
+bloquante — le reçu ne disparaît pas des raisons —, mais il n'est jamais décrit comme tenté,
+réel ou exécuté.
+
+**Une tentative confirmée non envoyée ne bloque pas, et ne qualifie rien.** Décision de
+propriétaire, écrite : un pas `core`/`additional` avec `network_attempted is true` et
+`may_have_reached_provider is false` est une **tentative locale confirmée non envoyée**.
+Elle n'a mesuré aucun tarif, donc elle ne contribue pas aux six appels conformes, elle
+n'entre ni dans « non conforme » ni dans « non établi », elle est recensée séparément sous
+`confirmed_attempts_not_sent`, et elle ne bloque pas `COST_CONFORMITY`. La raison : une
+requête certainement non envoyée ne mesure pas le tarif du fournisseur, et elle ne doit pas
+invalider six observations réellement servies et conformes. Cette tolérance ne tient que
+parce que les deux drapeaux sont des booléens exacts et cohérents ; dès que l'un ne l'est
+pas, le reçu retombe dans une catégorie bloquante. Elle ne peut jamais produire mapping,
+couverture, fraîcheur, crédit observé ni statut `*_LIVE_VERIFIED` admissible.
+
+**`COST_UNVERIFIED` signifie coût non établi.** Pas coût non conforme. D-074 le rangeait
+sous « non conforme », si bien que le même reçu changeait de sens selon le bloc consulté.
+`COST_MISMATCH` alimente la catégorie non conforme, `COST_UNVERIFIED` la catégorie non
+établie, les deux bloquent, et aucun bloc, enum, texte ou tableau ne leur donne un sens
+différent.
+
+**La cascade des états payants est symétrique.** D-074 testait
+`any(command == "additional")` avant tout le reste, donc la seule présence d'un reçu
+`additional` rapportait `ADDITIONAL_EXECUTED` pour un `AUTH_FAILED`, un `COST_MISMATCH`, un
+`PROVIDER_UNAVAILABLE` non servi ou une couverture jamais classifiée — alors que les mêmes
+issues en `core` rapportaient correctement `PAID_ATTEMPT_INCONCLUSIVE`. L'ordre est
+désormais les faits d'abord : aucune tentative, état non établi, tentative confirmée sans
+rien d'établi, puis seulement les étiquettes positives. `ADDITIONAL_EXECUTED` a une
+définition — une preuve `additional` classifiée et valide qui établit effectivement
+couverture ou mapping — et cette définition est publiée.
+
+**Un statut positif ne peut pas être satisfait à vide.** `set(states) == set(requested)` est
+vrai quand les deux sont vides, donc un `CORE_LIVE_VERIFIED` sans marché demandé, sans
+carte, sans fraîcheur et à zéro sélection était bien formé, utilisable, et comptait comme
+appel payant conforme — six d'entre eux fournissaient la moitié « coût » du corpus qui
+franchissait la porte. Chaque statut classifié porte désormais ses invariants positifs,
+dérivés du producteur : marchés demandés non vides, bookmaker observé, au moins un marché
+cartographié et une sélection pour les statuts positifs ; toutes les cartes pour
+`ADDITIONAL_LIVE_VERIFIED` ; un marché cartographié **et** un qui ne l'est pas pour
+`ADDITIONAL_PARTIAL_COVERAGE` ; une absence réellement observée pour `COVERAGE_MISSING` ; au
+moins un marché rejeté pour `SCHEMA_MISMATCH`.
+
+**La déduplication sémantique est universelle.** D-074 la décrivait comme une dimension
+croisée, ce qui était vrai des seuils de mapping et des appels conformes et faux partout
+ailleurs : sept copies byte-à-byte d'un `COST_MISMATCH` rapportaient **63 crédits**
+dépensés, sept appels non conformes contre un seuil qui doit valoir zéro, et sept
+observations de couverture d'un seul événement. Après vérification des signatures et
+exclusion des identifiants divergents, toute lecture sémantique passe par une collection
+dédupliquée par identifiant et empreinte scellée. Les comptes de fichiers physiques restent
+disponibles sous trois noms qui disent qu'ils sont physiques, et aucun n'est une preuve
+métier. Les crédits d'un reçu que le contrat rejette sont publiés à part, sous
+`rejected_receipt_credits_not_counted`.
+
+**La publication est atomique.** `O_CREAT | O_EXCL` est atomique sur l'existence et muette
+sur le contenu : le nom final apparaissait vide et était rempli ensuite, donc une
+interruption laissait un fichier de zéro octet — et la republication du **même** reçu était
+refusée définitivement sous « contenu signé différent », ce qui était faux et rendait la
+preuve d'un appel payant réel à jamais inenregistrable. Les octets existent maintenant en
+entier avant le nom : temporaire du même répertoire, `fsync`, puis publication par lien dur
+qui échoue au lieu de remplacer, puis `fsync` du répertoire. Un fichier incomplet est nommé
+comme tel et `quarantine_incomplete_receipt` le met de côté sans perdre un octet, ce qui
+libère le nom et permet la reprise à l'identique.
+
+**La frontière tient au moment de l'ouverture.** Décision de propriétaire : les courses de
+liens sont dans le périmètre d'intégrité, et la documentation ne se contente pas de réduire
+la promesse. Une primitive unique ouvre relativement à un descripteur de répertoire, avec
+`O_NOFOLLOW`, vérifie par `fstat` qu'il s'agit d'un fichier régulier et lit **depuis ce
+descripteur**. Un `resolve()` antérieur ne prouvait rien : un probe déterministe remplaçait
+un reçu régulier par un lien vers l'extérieur dans la fenêtre entre le contrôle et la
+lecture, et le contenu étranger devenait un reçu vérifié, sentinelle comprise. Sur une
+plateforme sans `O_NOFOLLOW`, le répertoire n'est pas lu — échec fermé. `receipt_secret`
+utilise la même primitive, parce que ce fichier *est* le secret et que D-074 le lisait
+encore avec `Path.read_text` après un `O_EXCL` échoué.
+
+**Mapping et coût sont deux axes indépendants, et la porte exige les deux.** Un
+`observed_credits` hors plafond n'annule pas une preuve de mapping saine — ce sont deux
+questions — mais il rend le coût non conforme ou non établi et bloque la porte globale.
+Aucun corpus au coût défaillant n'atteint les huit critères.
+
+**Ce que cette décision ne fait pas.** Aucun appel fournisseur, aucun endpoint, aucune
+tentative, aucun crédit, aucune promotion, aucun changement de statut métier :
+l'adaptateur reste `IMPLEMENTED_UNVERIFIED`, les modèles `BACKTEST_ONLY`, l'incertitude
+`UNAVAILABLE` hors démo, `Challenge` `PARTIAL` et désactivé. Le plafond machine reste
+`CRITERIA_MET_AWAITING_HUMAN_REVIEW`. Aucune preuve réelle n'existe sous protocole 5 :
+l'état courant est `INSUFFICIENT_EVIDENCE` avec zéro reçu utilisable. Les reçus protocole 4
+deviennent historiques non qualifiants, et aucun reçu n'est migré, ouvert, re-signé ni
+supprimé.

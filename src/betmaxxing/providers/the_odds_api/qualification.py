@@ -106,7 +106,7 @@ from .activation import (
 #: instant changes. Results computed under one version are not comparable with
 #: another, which is the whole reason the number exists: a criterion quietly
 #: relaxed after the fact is not a criterion.
-PROVIDER_VALIDATION_PROTOCOL_VERSION = 4
+PROVIDER_VALIDATION_PROTOCOL_VERSION = 5
 
 #: Bump this when the parser, the mapping, the freshness reading or the cost
 #: logic changes in a way that invalidates an earlier proof. A receipt stamped
@@ -122,10 +122,10 @@ PROVIDER_ADAPTER_EVIDENCE_VERSION = 1
 PROTOCOL_MAX_ODDS_AGE_SECONDS = 900
 
 #: The instant this protocol took effect, chosen once and written identically in
-#: D-074 and `docs/provider-validation-protocol.md`. Evidence recorded before it
+#: D-075 and `docs/provider-validation-protocol.md`. Evidence recorded before it
 #: is history, never qualification. Never recomputed at runtime, never read from
 #: the environment: a date that moves is not an effective date.
-QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC = "2026-08-10T09:11:48+00:00"
+QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC = "2026-08-10T14:00:37+00:00"
 
 #: Only v4 receipts carry the two version stamps, so only v4 can qualify. v2 and
 #: v3 stay readable, honoured as authority for chaining, and reported in the
@@ -176,8 +176,31 @@ COST_ESTABLISHING_STATUSES = frozenset(
     }
 )
 
-_NONCONFORMING_COST_STATUSES = frozenset(
-    {str(ActivationStatus.COST_MISMATCH), str(ActivationStatus.COST_UNVERIFIED)}
+#: A cost the provider itself contradicted. ``COST_UNVERIFIED`` is deliberately
+#: **not** here: v4 filed it under "nonconforming", but a cost nobody could read is
+#: not a cost that disagreed — it is a cost that was never established. Both block
+#: ``COST_CONFORMITY``; conflating them made one receipt mean two things depending on
+#: which block you read (D-075).
+_NONCONFORMING_COST_STATUSES = frozenset({str(ActivationStatus.COST_MISMATCH)})
+
+#: A status only reachable *after* the provider answered. Each of them is raised from
+#: a code path that has already read a response — ``_settle_cost`` sets
+#: ``reached_provider`` before it can raise, ``_event_of`` runs on a parsed payload,
+#: and an authentication failure is itself an answer. So a signed receipt carrying one
+#: of these together with ``may_have_reached_provider`` other than ``True`` disagrees
+#: with itself, and v5 says so instead of reading it as evidence.
+RESPONSE_ASSERTING_STATUSES = frozenset(
+    {
+        str(ActivationStatus.DISCOVERY_VERIFIED),
+        str(ActivationStatus.CORE_LIVE_VERIFIED),
+        str(ActivationStatus.ADDITIONAL_LIVE_VERIFIED),
+        str(ActivationStatus.ADDITIONAL_PARTIAL_COVERAGE),
+        str(ActivationStatus.COVERAGE_MISSING),
+        str(ActivationStatus.SCHEMA_MISMATCH),
+        str(ActivationStatus.COST_MISMATCH),
+        str(ActivationStatus.COST_UNVERIFIED),
+        str(ActivationStatus.AUTH_FAILED),
+    }
 )
 
 _LIVE_STATUSES = frozenset(
@@ -190,6 +213,56 @@ _LIVE_STATUSES = frozenset(
 )
 
 PAID_COMMANDS = frozenset({"core", "additional"})
+
+
+class AttemptState(StrEnum):
+    """What a receipt establishes about whether a request was actually issued.
+
+    Three values, because v4's two-valued reading — ``network_attempted is not
+    False`` — turned an *absent* flag into a positive fact. It reported
+    ``CORE_ATTEMPTED`` and counted the receipt in a population it called "real paid
+    attempts", from a field that said nothing at all. A missing measurement is not a
+    measurement of zero, and it is not a measurement of one either.
+    """
+
+    #: The step stopped before any socket existed. Not a paid call, and not a defect.
+    NOT_ATTEMPTED = "NOT_ATTEMPTED"
+    #: A request really was issued: the flag is exactly ``True`` and the count agrees.
+    CONFIRMED_ATTEMPT = "CONFIRMED_ATTEMPT"
+    #: The receipt cannot say. Blocking, visible, and never called attempted.
+    ATTEMPT_STATE_UNESTABLISHED = "ATTEMPT_STATE_UNESTABLISHED"
+
+
+def attempt_state(receipt: Mapping[str, Any]) -> AttemptState:
+    """Read the attempt state of a receipt, strictly and in three values.
+
+    ``attempts`` is part of the reading, not a separate check: a receipt claiming a
+    network attempt with zero requests, or none with two, cannot be believed about
+    either field, so it is unestablished rather than arbitrated.
+    """
+    flag = receipt.get("network_attempted")
+    count = _counted(receipt.get("attempts"))
+    if flag is False and count == 0:
+        return AttemptState.NOT_ATTEMPTED
+    if flag is True and count is not None and count >= 1:
+        return AttemptState.CONFIRMED_ATTEMPT
+    return AttemptState.ATTEMPT_STATE_UNESTABLISHED
+
+
+def provider_was_reached(receipt: Mapping[str, Any]) -> bool:
+    """Whether this receipt establishes that the request reached the provider.
+
+    The precondition v4 was missing on every path except the cost census. A claim
+    about a response — a mapped market, an observed bookmaker, a freshness age — is a
+    claim that a response arrived, and only these two exact booleans establish it.
+    Under v4 an explicit ``may_have_reached_provider = False`` left a
+    ``CORE_LIVE_VERIFIED`` receipt admissible, sound and reported ``OBTAINED_LIVE``,
+    so a corpus asserting that nothing was ever served opened the review gate.
+    """
+    if attempt_state(receipt) is not AttemptState.CONFIRMED_ATTEMPT:
+        return False
+    return receipt.get("may_have_reached_provider") is True
+
 
 #: The two closed vocabularies a current receipt must draw from. A value outside
 #: them is not a nuance to interpret: it is a field we cannot read.
@@ -710,6 +783,80 @@ def _classified_faults(receipt: Mapping[str, Any]) -> list[str]:
     return faults
 
 
+def _classified_status_faults(receipt: Mapping[str, Any]) -> list[str]:
+    """What each classified status must positively contain, per status.
+
+    v4 checked the market block's *shape* and not its content, and
+    ``set(market_states) == set(markets_requested)`` is vacuously true when both are
+    empty. So a ``CORE_LIVE_VERIFIED`` receipt with no requested market, no map, no
+    freshness and zero selections was well formed, usable, and counted as a conforming
+    paid call — a live verification that had classified nothing.
+
+    Derived from the producer: ``_classify_markets`` is total over a non-empty
+    ``requested``, ``_additional_status`` returns ``ADDITIONAL_LIVE_VERIFIED`` only when
+    *every* state is ``OBSERVED_MAPPED`` and ``ADDITIONAL_PARTIAL_COVERAGE`` only when
+    some are and some are not, and both ``COVERAGE_MISSING`` shapes carry no mapped
+    market at all.
+    """
+    faults: list[str] = []
+    status = _text(receipt.get("status")) or ""
+    states = receipt.get("market_states")
+    requested = _market_list(receipt.get("markets_requested"))
+    if not isinstance(states, Mapping) or requested is None:
+        return faults  # the shape contract already named it
+
+    def named(state: MarketState) -> set[str]:
+        return {str(m) for m, s in states.items() if str(s) == str(state)}
+
+    mapped = named(MarketState.OBSERVED_MAPPED)
+    rejected = named(MarketState.OBSERVED_REJECTED)
+    absent = named(MarketState.NOT_RETURNED)
+    not_evaluated = named(MarketState.NOT_EVALUATED_BOOKMAKER_ABSENT)
+    selections = _counted(receipt.get("selections_mapped"))
+    freshness = receipt.get("freshness")
+    ages = freshness if isinstance(freshness, Mapping) else {}
+
+    positive = status in {
+        str(ActivationStatus.CORE_LIVE_VERIFIED),
+        str(ActivationStatus.ADDITIONAL_LIVE_VERIFIED),
+        str(ActivationStatus.ADDITIONAL_PARTIAL_COVERAGE),
+    }
+    if positive:
+        # A classification of nothing is not a classification.
+        if not requested:
+            faults.append("markets_requested")
+        if not mapped:
+            faults.append("market_states")
+        if selections is None or selections < 1:
+            faults.append("selections_mapped")
+        if str(receipt.get("bookmaker_state")) != str(BookmakerState.OBSERVED):
+            faults.append("bookmaker_state")
+        for market in sorted(mapped):
+            if _counted(ages.get(market)) is None:
+                faults.append("freshness")
+                break
+    if status == str(ActivationStatus.ADDITIONAL_LIVE_VERIFIED) and mapped != set(requested):
+        # The producer reports this status only when every requested market mapped.
+        faults.append("market_states")
+    if status == str(ActivationStatus.ADDITIONAL_PARTIAL_COVERAGE) and not (
+        mapped and mapped != set(requested)
+    ):
+        # "Partial" means some mapped and some not. Both ends are a different finding.
+        faults.append("market_states")
+    if status == str(ActivationStatus.COVERAGE_MISSING):
+        if mapped or (selections or 0) > 0:
+            faults.append("market_states")
+        # Either the bookmaker was never quoted, or it was quoted and offered nothing.
+        if not (not_evaluated == set(requested) or absent == set(requested)):
+            faults.append("market_states")
+    if status == str(ActivationStatus.SCHEMA_MISMATCH):
+        if mapped or (selections or 0) > 0:
+            faults.append("market_states")
+        if not rejected:
+            faults.append("market_states")
+    return faults
+
+
 def _phase_faults(receipt: Mapping[str, Any], phase: ReceiptPhase) -> list[str]:
     """The fields this one phase requires, on top of the common contract."""
     faults: list[str] = []
@@ -743,7 +890,7 @@ def _phase_faults(receipt: Mapping[str, Any], phase: ReceiptPhase) -> list[str]:
     require(_text(receipt.get("event_tag")) is not None, "event_tag")
     if phase is ReceiptPhase.ATTEMPTED_UNCLASSIFIED:
         return faults + _no_market_was_classified(receipt)
-    return faults + _classified_faults(receipt)
+    return faults + _classified_faults(receipt) + _classified_status_faults(receipt)
 
 
 def structural_faults(receipt: Mapping[str, Any]) -> list[str]:
@@ -832,6 +979,17 @@ def contradictions(receipt: Mapping[str, Any]) -> list[str]:
         and receipt.get("network_attempted") is not True
     ):
         found.append("statut live sans tentative réseau enregistrée")
+    # The reciprocal invariant v4 lacked, and the one the final re-audit exploited: a
+    # status that can only be reached by reading a response, on a receipt that does not
+    # establish the provider was ever reached. Both fields are ours and signed, so one
+    # of them is wrong and we cannot tell which.
+    if str(receipt.get("status")) in RESPONSE_ASSERTING_STATUSES and not provider_was_reached(
+        receipt
+    ):
+        found.append(
+            "statut impliquant une réponse du fournisseur alors que l'atteinte du "
+            "fournisseur n'est pas établie"
+        )
     observed_credits = _plain_int(receipt.get("observed_credits"))
     accounted = _plain_int(receipt.get("accounted_credits"))
     if observed_credits is not None and accounted is not None and accounted < observed_credits:
@@ -931,7 +1089,7 @@ def mapping_observation_is_sound(receipt: Mapping[str, Any]) -> bool:
         return False
     if structural_faults(receipt) or contradictions(receipt):
         return False
-    if receipt.get("network_attempted") is not True:
+    if not provider_was_reached(receipt):
         return False
     if str(receipt.get("bookmaker_state")) != str(BookmakerState.OBSERVED):
         return False
@@ -971,7 +1129,9 @@ def admissible_for(receipt: Mapping[str, Any], criterion: Criterion) -> bool:
         return False
     if not str(receipt.get("sport_key", "")).startswith(f"{criterion.sport_family}_"):
         return False
-    if receipt.get("network_attempted") is not True:
+    # An established reach, not merely an attempted one: a mapped market is a claim
+    # about a payload, and a payload that never arrived cannot have been parsed.
+    if not provider_was_reached(receipt):
         return False
     # The scope says "observed bookmaker only", so the receipt has to say it too.
     # Under protocol v2 nothing checked this and the scope was a claim about a
@@ -1034,52 +1194,92 @@ def cost_conforming(receipt: Mapping[str, Any]) -> bool:
     return accounted == observed
 
 
-def is_real_paid_attempt(receipt: Mapping[str, Any]) -> bool:
-    """The documented denominator of the four cost categories.
+#: The five cost buckets of protocol v5, and the four that gate the criterion. Named
+#: after what they establish rather than after what the request did, because that is
+#: the question ``COST_CONFORMITY`` asks.
+#: ``provider_reached_unestablished_cost`` covers two readings that establish the same
+#: nothing: the provider answered and its cost is unreadable, **or** the request was
+#: confirmed issued and whether it was served cannot be established. Both block.
+COST_BUCKETS: tuple[str, ...] = (
+    "provider_reached_conforming_cost",
+    "provider_reached_nonconforming_cost",
+    "provider_reached_unestablished_cost",
+    "paid_attempt_state_unestablished",
+    "confirmed_attempts_not_sent",
+)
 
-    A **real paid attempt** is a receipt of a paid command whose
-    ``network_attempted`` is not an exact ``False``. Only an exact ``False`` proves
-    that no paid call was made — that is the shape of a step refused before any
-    socket existed, and such a step is not a paid call however it is labelled. An
-    absent or mistyped flag proves nothing, so the receipt stays in the census and
-    lands in ``paid_calls_with_unestablished_cost`` rather than quietly leaving it.
+#: The buckets that must be empty for the criterion to pass. ``confirmed_attempts_not_
+#: sent`` is deliberately absent: a request confirmed never to have been issued did
+#: not measure the provider's tariff, so it must neither help the threshold nor
+#: invalidate six calls that really were served and really were conforming (D-075).
+BLOCKING_COST_BUCKETS: tuple[str, ...] = (
+    "provider_reached_nonconforming_cost",
+    "provider_reached_unestablished_cost",
+    "paid_attempt_state_unestablished",
+)
 
-    Not extended to pre-network refusals, deliberately: counting them would inflate
-    the denominator of a criterion about billing with calls that were never billed.
-    """
-    if str(receipt.get("command")) not in PAID_COMMANDS:
-        return False
-    return receipt.get("network_attempted") is not False
+
+def is_paid_command(receipt: Mapping[str, Any]) -> bool:
+    """Whether this receipt belongs to a step that can be billed at all."""
+    return str(receipt.get("command")) in PAID_COMMANDS
 
 
 def cost_category(receipt: Mapping[str, Any]) -> str:
-    """Which single cost bucket a **current** real paid attempt belongs to.
+    """Which single cost bucket a **current** paid step belongs to, or ``""``.
 
-    Exactly one, deterministically, and never none: protocol v2 let a paid call
-    that was neither conforming nor explicitly a mismatch fall out of the census
-    entirely, so the report read "0 nonconforming" about a call whose cost nobody
-    could establish.
-
-    The first rule is v4's correction. ``paid_calls_that_never_left`` is a claim
-    that the request demonstrably did not reach the provider, and only two exact
-    booleans can support it. Under v3 an absent or mistyped
-    ``may_have_reached_provider`` was filed there — 250 of the 875 flag/status/cost
-    combinations asserted a certainty nothing established.
+    Exhaustive and disjoint over paid steps, and derived from the three-valued
+    :func:`attempt_state` rather than from ``is not False``. A step that was never
+    attempted is outside the census — not a defect, just not a paid call. A step whose
+    attempt state cannot be established stays *in* the census and blocks, because a
+    receipt that cannot say whether it spent a credit is not evidence that it did not.
     """
-    if not is_real_paid_attempt(receipt):
+    if str(receipt.get("command")) not in PAID_COMMANDS:
         return ""
-    if not all(
-        receipt.get(flag) is True or receipt.get(flag) is False
-        for flag in ("network_attempted", "may_have_reached_provider")
-    ):
-        return "paid_calls_with_unestablished_cost"
-    if str(receipt.get("status")) in _NONCONFORMING_COST_STATUSES:
-        return "nonconforming_paid_calls"
+    state = attempt_state(receipt)
+    if state is AttemptState.NOT_ATTEMPTED:
+        return ""
+    if state is AttemptState.ATTEMPT_STATE_UNESTABLISHED:
+        return "paid_attempt_state_unestablished"
     if receipt.get("may_have_reached_provider") is False:
-        return "paid_calls_that_never_left"
+        # Confirmed issued and confirmed *not* served. It observed no tariff, so it
+        # neither helps the threshold nor invalidates six calls that were served —
+        # which is only defensible because both flags are exact booleans (D-075).
+        return "confirmed_attempts_not_sent"
+    if receipt.get("may_have_reached_provider") is not True:
+        # Issued, and unable to say whether it was served. Nothing is established about
+        # the tariff, so this blocks like any other unestablished cost. Filing it under
+        # "not sent" would claim a certainty the flag does not carry.
+        return "provider_reached_unestablished_cost"
+    if str(receipt.get("status")) in _NONCONFORMING_COST_STATUSES:
+        return "provider_reached_nonconforming_cost"
     if cost_conforming(receipt):
-        return "conforming_paid_calls"
-    return "paid_calls_with_unestablished_cost"
+        return "provider_reached_conforming_cost"
+    return "provider_reached_unestablished_cost"
+
+
+def canonical(receipts: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """One entry per distinct signed receipt, in first-seen order.
+
+    Every semantic reading runs over this collection. A receipt copied byte for byte
+    into seven files is one observation, one paid call, one credit and one coverage
+    answer — v4 deduplicated it for the mapping thresholds and for
+    ``conforming_paid_calls`` only, so seven copies of a single ``COST_MISMATCH``
+    reported sixty-three credits spent and seven nonconforming calls, and seven copies
+    of one event produced seven coverage observations.
+
+    Physical file counts remain available, under names that say they are physical.
+    """
+    from .activation import SIGNATURE_FIELD
+
+    seen: set[tuple[str, str]] = set()
+    out: list[Mapping[str, Any]] = []
+    for receipt in receipts:
+        identity = (str(receipt.get("receipt_id") or ""), str(receipt.get(SIGNATURE_FIELD)))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        out.append(receipt)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1140,57 +1340,51 @@ def _missing(observed: Mapping[str, int], required: Mapping[str, int]) -> list[s
 
 
 def _cost_result(receipts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Four buckets, one per paid receipt, and three of them must be empty.
+    """Five buckets, one per paid step, and three of them must be empty.
 
-    The census runs over every **current** paid receipt — v4, this protocol, this
-    adapter, postdated — whether or not it is well formed. That is deliberate: a
-    malformed paid call is exactly one whose cost cannot be established, and the
-    v2 version of this function let it disappear instead.
+    The census runs over the **canonical** current paid receipts — v4 schema, this
+    protocol, this adapter, postdated, one entry per distinct signed receipt — whether
+    or not they are well formed. Malformed included, deliberately: a malformed paid call
+    is exactly one whose cost cannot be established, and letting it disappear is how v2
+    reported "0 nonconforming" about a call nobody could account for.
+
+    Deduplicated for **every** bucket, not just the conforming one. Under v4 the other
+    three counted files, so seven copies of one receipt reported seven nonconforming
+    calls against a threshold that must be zero.
     """
-    buckets = {
-        "conforming_paid_calls": 0,
-        "nonconforming_paid_calls": 0,
-        "paid_calls_with_unestablished_cost": 0,
-        "paid_calls_that_never_left": 0,
-    }
-    conforming: list[Mapping[str, Any]] = []
-    for receipt in receipts:
-        category = cost_category(receipt)
-        if not category:
-            continue
-        if category == "conforming_paid_calls":
-            conforming.append(receipt)
-            continue
-        buckets[category] += 1
-    buckets["conforming_paid_calls"] = len(_dedupe(conforming, "*"))
+    buckets = dict.fromkeys(COST_BUCKETS, 0)
+    for receipt in canonical(receipts):
+        if category := cost_category(receipt):
+            buckets[category] += 1
 
     required = {
-        "conforming_paid_calls": COST_CONFORMITY.min_events,
-        "nonconforming_paid_calls": 0,
-        "paid_calls_with_unestablished_cost": 0,
+        "provider_reached_conforming_cost": COST_CONFORMITY.min_events,
+        **dict.fromkeys(BLOCKING_COST_BUCKETS, 0),
+    }
+    labels = {
+        "provider_reached_nonconforming_cost": "appels servis au coût non conforme",
+        "provider_reached_unestablished_cost": "appels servis au coût non établi",
+        "paid_attempt_state_unestablished": "pas payants à l'état de tentative non établi",
     }
     missing: list[str] = []
-    if buckets["conforming_paid_calls"] < required["conforming_paid_calls"]:
+    if buckets["provider_reached_conforming_cost"] < COST_CONFORMITY.min_events:
         missing.append(
-            "appels payants au coût établi : "
-            f"{buckets['conforming_paid_calls']}/{required['conforming_paid_calls']}"
+            "appels servis au coût établi et conforme : "
+            f"{buckets['provider_reached_conforming_cost']}/{COST_CONFORMITY.min_events}"
         )
-    if buckets["nonconforming_paid_calls"]:
-        missing.append(
-            f"appels au coût non conforme : {buckets['nonconforming_paid_calls']} (maximum 0)"
-        )
-    if buckets["paid_calls_with_unestablished_cost"]:
-        missing.append(
-            "appels payants au coût non établi : "
-            f"{buckets['paid_calls_with_unestablished_cost']} (maximum 0)"
-        )
+    for name in BLOCKING_COST_BUCKETS:
+        if buckets[name]:
+            missing.append(f"{labels[name]} : {buckets[name]} (maximum 0)")
     return {
         "criterion_id": COST_CONFORMITY.criterion_id,
         "passed": not missing,
         "observed": buckets,
         "required": required,
         "missing": missing,
-        "scope": "tous sports · appels payants · coût observé et comptabilisé",
+        "scope": (
+            "tous sports · pas payants du protocole courant, dédupliqués · coût observé "
+            "et comptabilisé chez un fournisseur réellement atteint"
+        ),
         "limit": COST_CONFORMITY.limit,
     }
 
@@ -1215,30 +1409,6 @@ def _divergent_identifiers(receipts: Sequence[Mapping[str, Any]]) -> set[str]:
         identifier = str(receipt.get("receipt_id") or "")
         seen.setdefault(identifier, set()).add(str(receipt.get(SIGNATURE_FIELD)))
     return {identifier for identifier, signatures in seen.items() if len(signatures) > 1}
-
-
-def _exact_duplicate_copies(receipts: Sequence[Mapping[str, Any]]) -> int:
-    """How many receipts are a byte-identical repeat of one already seen.
-
-    A **crossed dimension**, not one of the exclusive populations below: an exact
-    copy is the same observation twice, so both files stay in whichever population
-    their content belongs to, and only the diversity counters deduplicate them.
-    Mixing the two models is how a reconciliation equation stops adding up.
-    """
-    from .activation import SIGNATURE_FIELD
-
-    seen: set[tuple[str, str]] = set()
-    duplicates = 0
-    for receipt in receipts:
-        identity = (
-            str(receipt.get("receipt_id") or ""),
-            str(receipt.get(SIGNATURE_FIELD)),
-        )
-        if identity in seen:
-            duplicates += 1
-            continue
-        seen.add(identity)
-    return duplicates
 
 
 def evaluate(receipts: Sequence[Mapping[str, Any]], unverifiable: int) -> dict[str, Any]:
@@ -1272,7 +1442,13 @@ def evaluate(receipts: Sequence[Mapping[str, Any]], unverifiable: int) -> dict[s
     #: collision between two *different* sub-populations is still a collision.
     divergent = _divergent_identifiers(receipts)
 
-    for receipt in receipts:
+    #: Every semantic reading below — populations, criteria, cost census, reasons —
+    #: runs over this collection, so a receipt copied into seven files is one
+    #: observation everywhere rather than in some places only.
+    distinct = canonical(receipts)
+    physical_copies = len(receipts) - len(distinct)
+
+    for receipt in distinct:
         if str(receipt.get("receipt_id") or "") in divergent:
             # Exclusive, and first: an identifier naming two different receipts
             # makes both unusable whatever else they are. Counting them under
@@ -1372,11 +1548,11 @@ def evaluate(receipts: Sequence[Mapping[str, Any]], unverifiable: int) -> dict[s
         # A crossed dimension, not a population: an exact copy stays in whichever
         # population its content belongs to. Stated so the equation above cannot be
         # read as if duplicates had been removed from it.
-        "qualification_exact_duplicate_copies": _exact_duplicate_copies(receipts),
+        "qualification_exact_duplicate_copies": physical_copies,
         "qualification_population_equation": (
             "reçus vérifiés + fichiers invérifiables = utilisables + courants malformés + "
             "courants contradictoires + couples inconnus + historiques non qualifiants + "
-            "exclus pour identifiant divergent + invérifiables"
+            "exclus pour identifiant divergent + invérifiables + copies exactes"
         ),
         "qualification_reasons": reasons,
         "qualification_note": (

@@ -1,4 +1,4 @@
-# Protocole de qualification du fournisseur — `PROVIDER_VALIDATION_PROTOCOL_VERSION = 4`
+# Protocole de qualification du fournisseur — `PROVIDER_VALIDATION_PROTOCOL_VERSION = 5`
 
 Ce document dit, **avant** les appels, combien de preuve live justifierait de
 *demander* à un humain de promouvoir l'adaptateur The Odds API. Il ne promeut rien
@@ -64,6 +64,28 @@ exacts (§3.1), aucune valeur d'un reçu structurellement invalide n'est reflét
 une sortie, et un `receipt_id` divergent est détecté sur **l'ensemble** des reçus
 vérifiés — pas seulement sur ceux déjà utilisables.
 
+### 0.3 Puis la v4 a été auditée à son tour
+
+Quatrième réaudit indépendant en lecture seule. Il a trouvé **un P1** et cinq P2, et le
+P1 est le plus grave de la série : la porte de revue humaine était atteignable alors que
+**toutes** les observations de mapping du corpus portaient
+`may_have_reached_provider = false`. La v5 les ferme.
+
+| Revendication v4 | Ce que le code faisait | Ce que fait la v5 |
+| --- | --- | --- |
+| « toute preuve positive est fermée » | `may_have_reached_provider` n'était lu **que** par le recensement du coût. Un reçu `CORE_LIVE_VERIFIED` affirmant que la requête n'avait jamais atteint le fournisseur restait bien formé, admissible, « sain », et produisait `OBTAINED_LIVE` — la valeur la plus explicite était la seule à passer, un drapeau absent ou mal typé étant, lui, correctement refusé. Huit preuves de ce type plus six coûts honnêtes franchissaient la porte | **l'atteinte du fournisseur est une précondition** : `provider_was_reached` exige les deux booléens exacts, et il garde `admissible_for`, `mapping_observation_is_sound`, les observations de couverture et les dimensions historiques. Un statut impliquant une réponse avec une atteinte non établie est **contradictoire** (§2.2) |
+| « les cinq dimensions lisent la même preuve » | la seule présence d'un reçu `additional` forçait `ADDITIONAL_EXECUTED`, y compris pour `AUTH_FAILED`, `COST_MISMATCH` ou une couverture jamais classifiée — alors que les mêmes issues en `core` rapportaient correctement `PAID_ATTEMPT_INCONCLUSIVE` | cascade **symétrique**, preuves d'abord et nom de commande en dernier (§2.3). `ADDITIONAL_EXECUTED` exige qu'une preuve `additional` classifiée et valide établisse effectivement couverture ou mapping |
+| « une copie exacte est une dimension croisée » | vrai pour les seuils de mapping et les appels conformes, faux partout ailleurs : sept copies d'un `COST_MISMATCH` rapportaient **63 crédits** dépensés, sept appels non conformes contre un seuil qui doit valoir zéro, et sept observations de couverture d'un seul événement | **canon sémantique** : toute lecture sémantique passe par une collection dédupliquée par identifiant et empreinte scellée. Les comptes de fichiers restent disponibles sous des noms qui disent qu'ils sont physiques (§3.1) |
+| « un statut positif incomplet reste refusé » | `set(market_states) == set(markets_requested)` est vrai à vide, donc un `CORE_LIVE_VERIFIED` sans marché demandé, sans carte, sans fraîcheur et à zéro sélection était bien formé, utilisable, et comptait comme appel payant conforme | **invariants positifs par statut** (§2.0), dérivés du producteur : une classification de rien n'est pas une classification |
+| « réel », « tenté », « exécuté » | `network_attempted is not False` traitait un drapeau **absent** comme une tentative : `execution_state` rapportait `CORE_ATTEMPTED` et le recensement s'appelait « tentatives payantes réelles » | lecture **à trois états** (§2.4) : pas de tentative, tentative confirmée, état de tentative non établi. Le troisième est visible, bloquant, et jamais appelé tenté ni exécuté |
+| écriture exclusive et idempotence | `O_CREAT | O_EXCL` crée le nom final **avant** d'écrire les octets : une interruption laissait un fichier vide, et le même reçu était ensuite refusé pour toujours sous le message « contenu signé différent », qui était faux | **publication atomique** (§9) : octets complets dans un temporaire, `fsync`, puis publication sous le nom final sans écrasement. Un fichier incomplet est nommé comme tel et récupérable |
+
+Deux P3 de frontière sont fermés avec : l'ouverture porte désormais `O_NOFOLLOW`
+relativement à un descripteur de répertoire, et les octets sont lus depuis le
+descripteur ouvert — un `resolve()` antérieur ne prouvait rien contre un remplacement, et
+un probe déterministe lisait une cible extérieure dans cette fenêtre. `receipt_secret`
+utilise la même primitive. Trois P3 documentaires sont corrigés dans le corps de PR.
+
 **Règles de version.** Toute modification d'un seuil, d'une portée, d'une règle
 d'admissibilité ou de la date d'effet incrémente
 `PROVIDER_VALIDATION_PROTOCOL_VERSION`. Toute modification du parser, du mapping,
@@ -93,7 +115,7 @@ commande absente.
 | 1 | l'adaptateur est **implémenté** | la revue de code et la suite hors ligne |
 | 2 | **connectivité et authentification** | un appel réel qui revient sans `AUTH_FAILED` |
 | 3 | **conformité du coût** | un coût **établi** au sens du §2.1 : `observed_credits` lisible, dans la borne, et égal à `accounted_credits`. Une comptabilisation prudente après un timeout n'établit rien et **fait échouer** le critère |
-| 4 | **présence ponctuelle d'un bookmaker** | `bookmaker_state = OBSERVED` sur *cet* événement |
+| 4 | **présence ponctuelle d'un bookmaker** | `bookmaker_state = OBSERVED` sur *cet* événement, sur un reçu dont l'atteinte du fournisseur est établie |
 | 5 | **mapping d'un marché** | `market_states[marché] = OBSERVED_MAPPED` |
 | 6 | **fraîcheur et horodatage** | un âge exploitable pour ce marché |
 | 7 | **diversité de l'échantillon** | événements, compétitions et jours UTC distincts |
@@ -111,9 +133,10 @@ Deux conséquences qu'on confond vite :
 
 Portée commune à tous : provider `the_odds_api`, un seul bookmaker par
 observation **et `bookmaker_state = OBSERVED`**, âge du marché ≤ **900 s**, reçu
-**v4** portant `qualification_protocol_version = 4` et
+**v4** portant `qualification_protocol_version = 5` et
 `provider_adapter_evidence_version = 1`, `recorded_at`
-**≥ `2026-08-10T09:11:48+00:00`**, et **contrat structurel du §2.0 satisfait**.
+**≥ `2026-08-10T14:00:37+00:00`**, **atteinte du fournisseur établie** au sens du §2.4,
+et **contrat structurel du §2.0 satisfait**.
 
 Le 900 est un littéral du protocole. Le produit a par ailleurs un réglage runtime
 `max_odds_age_seconds` qui vaut aussi 900 par défaut — au-delà, le scan appelle
@@ -124,14 +147,14 @@ aucun reçu ne devient plus admissible qu'avant.
 
 | `criterion_id` | Portée | Preuve admissible | Événements | Compétitions | Jours UTC | Schéma |
 | --- | --- | --- | --- | --- | --- | --- |
-| `CORE_MAPPING_FOOTBALL` | `soccer_*`, `core`, `h2h`, `GROUPED_ODDS` | statut `CORE_LIVE_VERIFIED`, `selections_mapped > 0`, aucun rejet de mapping | **3** | **2** | **2** | **v4/4/1 seul** |
-| `CORE_MAPPING_TENNIS` | `tennis_*`, `core`, `h2h`, `GROUPED_ODDS` | idem | **3** | **2** | **2** | **v4/4/1 seul** |
-| `ADDITIONAL_MAPPING_FOOTBALL_DRAW_NO_BET` | `soccer_*`, `additional`, `draw_no_bet` | statut `ADDITIONAL_LIVE_VERIFIED` ou `ADDITIONAL_PARTIAL_COVERAGE`, `market_states[marché] = OBSERVED_MAPPED` | **2** | **2** | **1** | **v4/4/1 seul** |
-| `ADDITIONAL_MAPPING_FOOTBALL_DOUBLE_CHANCE` | idem, `double_chance` | idem | **2** | **2** | **1** | **v4/4/1 seul** |
-| `ADDITIONAL_MAPPING_FOOTBALL_H2H_3_WAY_H1` | idem, `h2h_3_way_h1` | idem | **2** | **2** | **1** | **v4/4/1 seul** |
-| `ADDITIONAL_MAPPING_FOOTBALL_TOTALS_H1` | idem, `totals_h1` | idem | **2** | **2** | **1** | **v4/4/1 seul** |
-| `ADDITIONAL_MAPPING_FOOTBALL_DOUBLE_CHANCE_H1` | idem, `double_chance_h1` | idem | **2** | **2** | **1** | **v4/4/1 seul** |
-| `COST_CONFORMITY` | tous sports, appels payants | coût **établi** au sens du §2.1, 0 appel non conforme | **6** appels au coût établi | — | — | **v4/4/1 seul** |
+| `CORE_MAPPING_FOOTBALL` | `soccer_*`, `core`, `h2h`, `GROUPED_ODDS` | statut `CORE_LIVE_VERIFIED`, `selections_mapped > 0`, aucun rejet de mapping | **3** | **2** | **2** | **v4/5/1 seul** |
+| `CORE_MAPPING_TENNIS` | `tennis_*`, `core`, `h2h`, `GROUPED_ODDS` | idem | **3** | **2** | **2** | **v4/5/1 seul** |
+| `ADDITIONAL_MAPPING_FOOTBALL_DRAW_NO_BET` | `soccer_*`, `additional`, `draw_no_bet` | statut `ADDITIONAL_LIVE_VERIFIED` ou `ADDITIONAL_PARTIAL_COVERAGE`, `market_states[marché] = OBSERVED_MAPPED` | **2** | **2** | **1** | **v4/5/1 seul** |
+| `ADDITIONAL_MAPPING_FOOTBALL_DOUBLE_CHANCE` | idem, `double_chance` | idem | **2** | **2** | **1** | **v4/5/1 seul** |
+| `ADDITIONAL_MAPPING_FOOTBALL_H2H_3_WAY_H1` | idem, `h2h_3_way_h1` | idem | **2** | **2** | **1** | **v4/5/1 seul** |
+| `ADDITIONAL_MAPPING_FOOTBALL_TOTALS_H1` | idem, `totals_h1` | idem | **2** | **2** | **1** | **v4/5/1 seul** |
+| `ADDITIONAL_MAPPING_FOOTBALL_DOUBLE_CHANCE_H1` | idem, `double_chance_h1` | idem | **2** | **2** | **1** | **v4/5/1 seul** |
+| `COST_CONFORMITY` | tous sports, appels payants | coût **établi** au sens du §2.1, 0 appel non conforme | **6** appels au coût établi | — | — | **v4/5/1 seul** |
 
 ### 2.0 Contrat structurel : une signature prouve des octets, pas des types
 
@@ -177,6 +200,20 @@ depuis `_event_of` — avant l'observation du bookmaker — et depuis la fin de
 `run_core` / `run_additional`, après que chaque marché a un état. Les deux formes
 sont honnêtes ; seule la forme classifiée peut porter une observation.
 
+**Invariants positifs par statut.** La forme de la phase ne suffit pas : `set(states) ==
+set(requested)` est vrai à vide, si bien qu'un `CORE_LIVE_VERIFIED` sans marché demandé,
+sans carte, sans fraîcheur et à zéro sélection était bien formé, utilisable, et comptait
+comme appel payant conforme. Une classification de rien n'est pas une classification.
+Dérivés du producteur :
+
+| Statut classifié | Ce qu'il doit positivement porter |
+| --- | --- |
+| `CORE_LIVE_VERIFIED` | marchés demandés **non vides**, `bookmaker_state = OBSERVED`, au moins un `OBSERVED_MAPPED`, au moins une sélection, un âge de fraîcheur pour chaque marché cartographié |
+| `ADDITIONAL_LIVE_VERIFIED` | idem, et **tous** les marchés demandés `OBSERVED_MAPPED` — c'est la condition exacte à laquelle `_additional_status` retourne ce statut |
+| `ADDITIONAL_PARTIAL_COVERAGE` | idem, et au moins un marché cartographié **et** au moins un qui ne l'est pas. « Partiel » a deux bords ; les deux extrémités sont un autre constat |
+| `COVERAGE_MISSING` classifié | aucun marché cartographié, zéro sélection, et une forme compatible avec une absence **observée** : soit tous les marchés `NOT_EVALUATED_BOOKMAKER_ABSENT` (bookmaker jamais coté), soit tous `NOT_RETURNED` (bookmaker coté, n'offrant rien) |
+| `SCHEMA_MISMATCH` classifié | aucun marché cartographié, zéro sélection, et au moins un `OBSERVED_REJECTED` — une réponse rejetée, qui ne se fait pas passer pour un mapping |
+
 Un couple commande/statut **absent** de la table n'est pas jugé contre une forme que
 personne n'a choisie : il est nommé `unknown_command_status_pair`. Inventer un
 contrat pour un statut que nous n'avons jamais produit est la façon dont un statut
@@ -190,6 +227,48 @@ tranquille. Aucune valeur d'un tel reçu n'est reflétée dans le JSON complet d
 `status`, dans la sortie humaine, dans les observations de couverture, dans les
 raisons ou dans les conflits : une sortie peut nommer un champ, jamais recopier ce
 qu'il contenait.
+
+### 2.4 État de tentative et atteinte du fournisseur
+
+Deux lectures distinctes, et aucune des deux n'est un booléen simple.
+
+**L'état de tentative** est **à trois valeurs**, dérivé de `network_attempted` *et* de
+`attempts` ensemble :
+
+| État | Conditions | Sens |
+| --- | --- | --- |
+| `NOT_ATTEMPTED` | `network_attempted is false` **et** `attempts == 0` | l'étape s'est arrêtée avant toute socket. Ce n'est pas un défaut, et ce n'est pas un appel payant |
+| `CONFIRMED_ATTEMPT` | `network_attempted is true` **et** `attempts ≥ 1` | une requête a réellement été émise |
+| `ATTEMPT_STATE_UNESTABLISHED` | drapeau absent, mal typé, ou incohérent avec `attempts` | le reçu ne peut pas le dire. **Visible et bloquant**, jamais appelé tenté ni exécuté |
+
+La v4 écrivait cette lecture comme `network_attempted is not False`, si bien qu'un drapeau
+**absent** devenait une tentative : `execution_state` rapportait `CORE_ATTEMPTED` et la
+population s'appelait « tentatives payantes réelles ». Une mesure manquante n'est ni une
+mesure de zéro ni une mesure de un. Aucun état non établi ne produit désormais
+`CORE_ATTEMPTED`, `ADDITIONAL_ATTEMPTED`, `*_EXECUTED` ni une phrase contenant
+« tentative réelle » — il a ses propres valeurs,
+`ExecutionState.NETWORK_ATTEMPT_STATE_UNESTABLISHED` et
+`PaidActivationState.PAID_ATTEMPT_STATE_UNESTABLISHED`.
+
+**L'atteinte du fournisseur** est établie quand, cumulativement, l'état de tentative est
+`CONFIRMED_ATTEMPT` **et** `may_have_reached_provider is true`.
+
+C'est une **précondition de toute preuve de réponse** : mapping, couverture, fraîcheur,
+sélection cartographiée. Un payload qui n'est jamais arrivé n'a pas pu être analysé. La
+v4 ne lisait ce drapeau que pour le recensement du coût, si bien qu'un reçu
+`CORE_LIVE_VERIFIED` portant `may_have_reached_provider = false` restait admissible et
+produisait `OBTAINED_LIVE` — et huit preuves de ce type, accompagnées de six coûts
+honnêtes, franchissaient la porte de revue humaine.
+
+Les statuts qui **impliquent** une réponse du fournisseur sont
+`DISCOVERY_VERIFIED`, `CORE_LIVE_VERIFIED`, `ADDITIONAL_LIVE_VERIFIED`,
+`ADDITIONAL_PARTIAL_COVERAGE`, `COVERAGE_MISSING`, `SCHEMA_MISMATCH`, `COST_MISMATCH`,
+`COST_UNVERIFIED` et `AUTH_FAILED` : chacun est levé depuis un chemin qui a déjà lu une
+réponse. L'un d'eux avec une atteinte non établie est **contradictoire** (§2.2), pas
+seulement non qualifiant.
+
+`PROVIDER_UNAVAILABLE` n'en fait pas partie : un timeout de lecture et un 5xx sont deux
+issues différentes, et le harnais ne prétend pas savoir laquelle.
 
 ### 2.1 Ce qu'est un coût conforme
 
@@ -208,36 +287,45 @@ jamais pour un critère de mapping. Un coût seulement **supposé** après un ti
 où `accounted_credits` retombe sur l'estimation, n'est pas une preuve de coût : c'est
 une écriture de prudence.
 
-**Le dénominateur : une tentative payante réelle.** Les quatre catégories sont
-exhaustives et disjointes sur une population **explicitement définie** — un reçu de
-commande payante (`core` ou `additional`) dont `network_attempted` n'est pas
-exactement `false`.
+**Le dénominateur : un pas payant distinct.** Les catégories sont exhaustives et
+disjointes sur une population **explicitement définie** — tout reçu de commande payante
+(`core` ou `additional`) du protocole courant, **dédupliqué** par identifiant et empreinte
+scellée, dont l'état de tentative n'est pas `NOT_ATTEMPTED`.
 
-Seul un `false` exact prouve qu'aucun appel payant n'a eu lieu : c'est la forme d'une
-étape refusée avant toute socket, et une telle étape n'est pas un appel payant, quel
-que soit son libellé. Un drapeau **absent ou mal typé** ne prouve rien, donc le reçu
-reste dans le recensement et tombe dans `paid_calls_with_unestablished_cost` au lieu
-d'en sortir discrètement. Le dénominateur n'est **pas** étendu aux étapes payantes
-refusées avant réseau : les compter gonflerait le dénominateur d'un critère sur la
-facturation avec des appels jamais facturés.
+Un pas jamais tenté est hors recensement : ce n'est pas un défaut, simplement pas un appel
+payant. Un pas dont l'état de tentative n'est pas établi y **reste** et bloque, parce qu'un
+reçu incapable de dire s'il a dépensé un crédit n'est pas une preuve qu'il n'en a pas
+dépensé.
 
-**Quatre catégories, exhaustives et disjointes**, dans cet ordre :
+**Cinq catégories, exhaustives et disjointes**, plus l'exclusion :
 
-| Catégorie | Ce qu'elle contient |
-| --- | --- |
-| — (hors recensement) | `network_attempted = false` exactement : aucun appel payant n'a été tenté |
-| `paid_calls_with_unestablished_cost` | l'un des deux drapeaux est absent ou mal typé ; **ou** l'appel a pu atteindre le fournisseur mais son coût n'est pas établi : statut inconnu, observation absente ou hors borne, comptabilisation divergente, reçu malformé ou contradictoire |
-| `nonconforming_paid_calls` | `COST_MISMATCH` ou `COST_UNVERIFIED` |
-| `paid_calls_that_never_left` | les deux drapeaux sont des booléens **et** `may_have_reached_provider = false` : rien n'a pu être facturé, donc rien n'est prouvé ni reproché. Une certitude, jamais une valeur par défaut |
-| `conforming_paid_calls` | le coût est établi au sens ci-dessus |
+| Catégorie | Conditions | Effet sur `COST_CONFORMITY` |
+| --- | --- | --- |
+| — (hors recensement) | `network_attempted is false` **et** `attempts == 0` | exclu, non bloquant |
+| `paid_attempt_state_unestablished` | drapeau réseau absent, mal typé ou incohérent avec `attempts` | **bloque**, ne qualifie pas |
+| `confirmed_attempts_not_sent` | tentative confirmée **et** `may_have_reached_provider is false` — les deux drapeaux exacts | **exclu du dénominateur fournisseur, non bloquant**, et ne qualifie rien |
+| `provider_reached_conforming_cost` | atteinte établie et coût établi conforme au sens ci-dessus | contribue au seuil de **6** |
+| `provider_reached_nonconforming_cost` | `COST_MISMATCH` | **bloque** |
+| `provider_reached_unestablished_cost` | `COST_UNVERIFIED`, coût illisible, hors borne ou incohérent — **ou** atteinte non établie alors que la tentative l'est | **bloque** |
 
 Le critère passe **si et seulement si** :
 
 ```text
-conforming_paid_calls >= 6
-nonconforming_paid_calls == 0
-paid_calls_with_unestablished_cost == 0
+provider_reached_conforming_cost >= 6
+provider_reached_nonconforming_cost == 0
+provider_reached_unestablished_cost == 0
+paid_attempt_state_unestablished == 0
 ```
+
+**Pourquoi `confirmed_attempts_not_sent` ne bloque pas.** Une requête dont il est certain
+qu'elle n'a pas été servie n'a mesuré aucun tarif. Elle ne doit donc ni aider le seuil, ni
+invalider six observations réellement servies et réellement conformes. C'est une décision
+de propriétaire, et elle ne tient que parce que les deux drapeaux sont des booléens exacts
+et cohérents : dès que l'un ne l'est pas, le reçu retombe dans une catégorie bloquante.
+
+**`COST_UNVERIFIED` signifie coût non établi**, pas coût non conforme. La v4 le rangeait
+sous « non conforme », si bien que le même reçu changeait de sens selon le bloc consulté.
+Les deux bloquent ; ils ne disent pas la même chose.
 
 Un `PROVIDER_UNAVAILABLE` qui a pu atteindre le fournisseur fait donc échouer le
 critère, même après six appels conformes. La v2 l'ignorait en silence.
@@ -298,6 +386,41 @@ de protocole ne défait pas.
 | `paid_activation_state` | `CORE_EXECUTED_COVERAGE_OBSERVED` exige une observation saine ; `CORE_EXECUTED_NO_COVERAGE` exige un reçu dont la phase a réellement répondu à la question du bookmaker ; sinon `PAID_ATTEMPT_INCONCLUSIVE` — un appel payant réellement parti qui n'a établi ni couverture ni mapping |
 | `bookmaker_coverage_observations` | n'y figurent que des reçus de phase `CLASSIFIED`, structurellement valides et non contradictoires. Une observation est une **réponse**, pas la trace d'une tentative |
 | `accounted_credits_total` | somme d'entiers réels **non négatifs** seulement. Ni booléen, ni chaîne numérique, ni nombre négatif : c'est un chiffre de dépense qu'un opérateur lit avant de décider d'en dépenser plus |
+
+**La cascade des états payants, preuves d'abord.** La v4 testait
+`any(command == "additional")` avant tout le reste, si bien que la seule présence d'un
+reçu `additional` rapportait `ADDITIONAL_EXECUTED` pour un `AUTH_FAILED`. L'ordre est
+désormais :
+
+1. aucune tentative confirmée et aucun état non établi → `PREPARED_NOT_EXECUTED` ;
+2. aucune tentative confirmée mais un état non établi → `PAID_ATTEMPT_STATE_UNESTABLISHED` ;
+3. tentative confirmée sans couverture ni mapping établis → `PAID_ATTEMPT_INCONCLUSIVE` ;
+4. une preuve `additional` classifiée, valide et établissant couverture ou mapping →
+   `ADDITIONAL_EXECUTED` ;
+5. une observation de mapping saine en `core` → `CORE_EXECUTED_COVERAGE_OBSERVED` ;
+6. une réponse `core` sur la question du bookmaker, sans mapping →
+   `CORE_EXECUTED_NO_COVERAGE`.
+
+`core` et `additional` appliquent la **même** règle d'inconclusivité ; seule l'étiquette
+finale diffère, et elle diffère sur une preuve, jamais sur un nom de commande.
+
+**Canon sémantique.** Après vérification des signatures et exclusion des identifiants
+divergents, toute lecture sémantique passe par une collection **dédupliquée** par
+identifiant et empreinte scellée : les huit critères, les cinq catégories de coût, les
+crédits comptabilisés, le recensement, les deux libellés de coût et de progression, les
+observations de couverture, les populations, les raisons et l'état global. La v4 ne
+dédupliquait que les seuils de mapping et les appels conformes, si bien que sept copies
+d'un seul `COST_MISMATCH` rapportaient soixante-trois crédits et sept appels non conformes
+contre un seuil qui doit valoir zéro.
+
+Les nombres de **fichiers** restent disponibles, et uniquement sous des noms qui disent
+qu'ils sont physiques : `verified_receipts`, `unverifiable_receipts` et
+`qualification_exact_duplicate_copies`. Aucun d'eux n'est une preuve métier.
+
+**Crédits.** `accounted_credits_total` additionne des entiers réels non négatifs, de reçus
+**distincts** et **structurellement lisibles**. Ce qu'un reçu rejeté par le contrat
+revendique est publié à part, sous `rejected_receipt_credits_not_counted` : visible, jamais
+sommé dans le premier.
 
 **Deux populations, nommées.** `paid_call_cost_census` recense **toute tentative
 payante réelle vérifiée sur ce disque**, protocoles antérieurs compris et sans
@@ -362,10 +485,13 @@ que la campagne produit déjà ; en exiger moins laisserait un ou deux appels bi
 Une observation compte si, et seulement si, elle est :
 
 1. portée par un reçu **v4** dont la **signature se vérifie localement**, portant
-   `qualification_protocol_version = 4` et `provider_adapter_evidence_version = 1` ;
-2. **postérieure ou égale** à `2026-08-10T09:11:48+00:00`, `recorded_at` étant un
+   `qualification_protocol_version = 5` et `provider_adapter_evidence_version = 1` ;
+2. **postérieure ou égale** à `2026-08-10T14:00:37+00:00`, `recorded_at` étant un
    ISO 8601 avec timezone, normalisé en UTC pour la comparaison ;
-3. rattachée à une **tentative réseau réellement envoyée** (`network_attempted`) ;
+3. rattachée à une **tentative confirmée dont le fournisseur a réellement été
+   atteint** : `network_attempted is true`, `attempts ≥ 1` **et**
+   `may_have_reached_provider is true` (§2.4). Une preuve de réponse exige une
+   réponse ;
 4. d'un statut **explicitement listé** pour cette commande — `core →
    CORE_LIVE_VERIFIED`, `additional → ADDITIONAL_LIVE_VERIFIED |
    ADDITIONAL_PARTIAL_COVERAGE`. Une liste positive, fermée par défaut : un statut
@@ -603,7 +729,38 @@ qu'un reçu placé n'importe où sur le disque pouvait satisfaire un critère �
 
 Aucun de ces cas ne fait apparaître un chemin ni un contenu étranger dans une sortie.
 
-`write_receipt()` — écriture exclusive, nom construit depuis des composants
+**L'ouverture porte la garantie, pas un contrôle préalable.** Un `is_symlink()` suivi
+d'un `read_text()` séparé vérifie un objet et lit ce qui occupe le nom un instant plus
+tard. Toute lecture servant à une décision passe donc par une primitive unique : ouverture
+relative à un **descripteur de répertoire**, `O_NOFOLLOW`, `fstat` pour exiger un fichier
+régulier, et lecture **depuis ce descripteur**. Un `resolve()` antérieur ne prouve rien : un
+probe déterministe remplaçait un reçu régulier par un lien vers l'extérieur dans cette
+fenêtre, et son contenu devenait un reçu vérifié. Sur une plateforme sans `O_NOFOLLOW`, le
+répertoire n'est **pas lu** — échec fermé, jamais un retour au contrôle vulnérable.
+`receipt_secret` utilise la même primitive : ce fichier *est* le secret.
+
+**Publication atomique.** `O_CREAT | O_EXCL` est atomique sur l'*existence* et ne dit rien
+du contenu : le nom final apparaissait vide puis était rempli, donc une interruption entre
+les deux publiait un reçu qui n'en était pas un — et le même reçu était ensuite refusé pour
+toujours sous « contenu signé différent », ce qui était faux. La séquence est désormais :
+
+1. sérialiser et signer entièrement en mémoire ;
+2. créer un temporaire neuf du même répertoire, sans suivre de lien, en `0600`, sous un nom
+   qui n'est pas `*.json` — l'audit ne le voit donc jamais ;
+3. écrire tous les octets, puis `fsync` du fichier ;
+4. publier sous le nom final avec un lien dur, qui **échoue** au lieu de remplacer si le nom
+   est pris — `rename` aurait écrasé silencieusement une cible concurrente ;
+5. `fsync` du répertoire ;
+6. supprimer le temporaire, y compris après échec ;
+7. une interruption avant publication ne laisse **aucun** `*.json` final partiel.
+
+Sur cible finale existante : un fichier régulier identique est idempotent ; un **reçu signé
+valide** divergent est une collision explicite et reste intact ; un fichier vide, tronqué ou
+qui n'est pas du JSON signé n'est **jamais** appelé « contenu signé différent » — il est
+nommé incomplet, et `quarantine_incomplete_receipt` le met de côté sous un nom hors de
+l'audit, sans perdre un octet, ce qui libère le nom et permet la reprise à l'identique.
+
+`write_receipt()` — nom construit depuis des composants
 **validés**. `command` et `receipt_id` doivent être des chaînes non vides sans
 séparateur de chemin ; `recorded_at` est **parsé** puis reformaté, au lieu d'être
 découpé dans le texte. Cette dernière règle est ce qui manquait : un `recorded_at` de
