@@ -187,6 +187,35 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset({2, 3, RECEIPT_SCHEMA_VERSION})
 
 SIGNATURE_FIELD = "signature"
 
+
+def _reported_int(value: object) -> int:
+    """A signed receipt's field read as an integer for **reporting**, or zero.
+
+    The audit block summarises whatever is on disk, including a receipt whose
+    signature is ours but whose types are not what we write. `int()` on such a
+    field raised out of `status`; a report that cannot be produced is worse than a
+    report that says zero, and the qualification block — which decides things —
+    reads the same fields strictly and refuses them.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return value
+
+
+def _schema_version_of(payload: Mapping[str, Any]) -> int | None:
+    """The receipt's schema version when it is one we read, else ``None``.
+
+    A JSON file can carry anything under ``schema_version`` — a mapping, a list, a
+    boolean, a float, a string. Testing such a value for membership in a frozenset
+    hashes it, and an unhashable one raised ``TypeError`` out of the audit and out
+    of `status`. A version is a real integer or it is not a version.
+    """
+    version = payload.get("schema_version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        return None
+    return version if version in SUPPORTED_SCHEMA_VERSIONS else None
+
+
 #: How long a receipt may authorise the next step. Short on purpose: yesterday's
 #: discovery says nothing about today's fixtures, and a proof that never expires
 #: is a proof that eventually gets reused for the wrong thing.
@@ -465,17 +494,36 @@ def verify_receipt(payload: Mapping[str, Any]) -> bool:
 
 
 def write_receipt(document: dict[str, Any]) -> Path:
-    """Sign and persist one receipt locally. Never committed, never uploaded."""
+    """Sign and persist one receipt locally. Never committed, never uploaded.
+
+    Created **exclusively**, and named with the whole ``receipt_id``. The previous
+    version truncated the identifier to eight characters and used
+    ``Path.write_text``, so two receipts sharing a second, a command and an
+    eight-character prefix silently overwrote one another — a proof of a paid call
+    lost without a word. Re-writing a byte-identical receipt is idempotent; a
+    divergent one under the same name is refused rather than allowed to replace it.
+    """
     directory = receipt_dir()
     directory.mkdir(parents=True, exist_ok=True)
     signed = {k: v for k, v in document.items() if not k.startswith("_")}
     signed[SIGNATURE_FIELD] = sign_receipt(signed)
     stamp = str(signed["recorded_at"]).replace(":", "").replace("-", "")[:15]
-    path = directory / f"{stamp}-{signed['command']}-{str(signed['receipt_id'])[:8]}.json"
-    path.write_text(
-        jsonlib.dumps(signed, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    path = directory / f"{stamp}-{signed['command']}-{signed['receipt_id']}.json"
+    body = jsonlib.dumps(signed, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    try:
+        handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        existing = path.read_text(encoding="utf-8")
+        if existing != body:
+            raise Refused(
+                ActivationStatus.PREPARED_NOT_EXECUTED,
+                f"{path.name} existe déjà avec un contenu signé différent. Un reçu n'est "
+                "jamais remplacé : renommez ou archivez l'ancien avant de rejouer cette "
+                "étape, et conservez les deux pour l'audit.",
+            ) from None
+    else:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(body)
     document[SIGNATURE_FIELD] = signed[SIGNATURE_FIELD]
     document["_path"] = str(path)
     return path
@@ -523,7 +571,7 @@ def load_parent(
         raise Refused(ActivationStatus.PREPARED_NOT_EXECUTED, f"{raw_path} n'est pas un reçu.")
 
     version = payload.get("schema_version")
-    if version not in SUPPORTED_SCHEMA_VERSIONS:
+    if not _schema_version_of(payload):
         raise Refused(
             ActivationStatus.PREPARED_NOT_EXECUTED,
             f"{raw_path} porte le schéma {version!r} ; seuls "
@@ -1911,7 +1959,10 @@ def audit_receipts() -> tuple[list[dict[str, Any]], int]:
         if not isinstance(payload, dict):
             unverifiable += 1
             continue
-        if payload.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
+        # `in` on a frozenset hashes its left operand, so a mapping or a list here
+        # raised TypeError and took `status` down with it. A version that is not a
+        # real integer is simply not a version we read.
+        if not _schema_version_of(payload):
             unverifiable += 1
             continue
         if not verify_receipt(payload):
@@ -1953,7 +2004,7 @@ def build_activation_state(receipts: list[dict[str, Any]], unverifiable: int) ->
     else:
         cost_proof = CostProof.EXERCISED_CONFORMING
 
-    mapped_live = any(int(r.get("selections_mapped") or 0) > 0 for r in paid)
+    mapped_live = any(_reported_int(r.get("selections_mapped")) > 0 for r in paid)
     mapping_proof = MappingProof.OBTAINED_LIVE if mapped_live else MappingProof.NOT_OBTAINED_LIVE
 
     if not paid:
@@ -1983,21 +2034,26 @@ def build_activation_state(receipts: list[dict[str, Any]], unverifiable: int) ->
         # 4. Coverage — a list of scoped observations, never a verdict.
         "bookmaker_coverage_observations": [
             {
-                "sport_key": r.get("sport_key", ""),
-                "bookmaker": r.get("bookmaker", ""),
-                "event_tag": r.get("event_tag") or "",
-                "recorded_at": r.get("recorded_at", ""),
-                "bookmaker_state": r.get("bookmaker_state") or "UNKNOWN_SCHEMA_V2",
-                "market_states": r.get("market_states") or {},
+                # Rendered as text, so read as text: a signed receipt whose types
+                # are not the ones we write must not be able to break a report
+                # that only summarises what is on disk.
+                "sport_key": str(r.get("sport_key", "")),
+                "bookmaker": str(r.get("bookmaker", "")),
+                "event_tag": str(r.get("event_tag") or ""),
+                "recorded_at": str(r.get("recorded_at", "")),
+                "bookmaker_state": str(r.get("bookmaker_state") or "UNKNOWN_SCHEMA_V2"),
+                "market_states": (
+                    dict(r["market_states"]) if isinstance(r.get("market_states"), Mapping) else {}
+                ),
                 "status": str(r.get("status")),
-                "schema_version": r.get("schema_version"),
+                "schema_version": _reported_int(r.get("schema_version")),
             }
             for r in paid
         ],
         # 5. Whether the parser and freshness path have been exercised for real.
         "mapping_freshness_proof": str(mapping_proof),
         "paid_activation_state": str(paid_state),
-        "accounted_credits_total": sum(int(r.get("accounted_credits") or 0) for r in receipts),
+        "accounted_credits_total": sum(_reported_int(r.get("accounted_credits")) for r in receipts),
         "verified_receipts": len(receipts),
         # D-062's own audit counter: files this installation could not verify.
         # Spelled out rather than spread from the block below, because the

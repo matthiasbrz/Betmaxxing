@@ -170,8 +170,15 @@ class TestTheProtocolThresholdIsALiteral:
     """
 
     def test_the_versioned_constants_are_literals(self) -> None:
+        """The threshold is fixed; the protocol number is pinned by the v3 contract.
+
+        This class guards the v2 closures, which are unchanged. When the authorised
+        v3 bump moved the protocol number, pinning it here as well would have said
+        nothing extra — `tests/test_qualification_v3_contract.py` pins it exactly.
+        """
         assert qual.PROTOCOL_MAX_ODDS_AGE_SECONDS == 900
-        assert qual.PROVIDER_VALIDATION_PROTOCOL_VERSION == 2
+        assert isinstance(qual.PROVIDER_VALIDATION_PROTOCOL_VERSION, int)
+        assert qual.PROVIDER_VALIDATION_PROTOCOL_VERSION >= 2
         assert qual.PROVIDER_ADAPTER_EVIDENCE_VERSION == 1
         assert qual.QUALIFYING_SCHEMA_VERSION == 4
 
@@ -201,7 +208,12 @@ class TestTheProtocolThresholdIsALiteral:
             },
         )
         assert proc.returncode == 0, proc.stderr[-400:]
-        assert proc.stdout.split() == ["900", "2"]
+        # Neither value moved: the threshold stays 900 and the protocol number is
+        # the module's own, not the environment's.
+        assert proc.stdout.split() == [
+            "900",
+            str(qual.PROVIDER_VALIDATION_PROTOCOL_VERSION),
+        ]
 
     def test_every_criterion_scope_states_the_protocol_threshold(self) -> None:
         for criterion in qual.CRITERIA:

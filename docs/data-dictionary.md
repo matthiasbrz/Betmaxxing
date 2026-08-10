@@ -187,8 +187,8 @@ appels réels au fournisseur.
 | Champ | Sens |
 |---|---|
 | `schema_version` | 4 pour tout reçu écrit désormais. Les v2 et v3 restent **lus** et honorés comme autorité de chaînage, jamais réécrits ni re-signés, et ne qualifient plus rien (D-072) ; v1 et inconnues sont refusées |
-| `qualification_protocol_version` / `provider_adapter_evidence_version` | v4 seulement : sous quel protocole ce reçu serait jugé, et quel parser l'a produit. **Couverts par la signature** — altérer l'un invalide le reçu |
-| `receipt_id` | identifiant local du reçu |
+| `qualification_protocol_version` / `provider_adapter_evidence_version` | v4 seulement : sous quel protocole ce reçu serait jugé, et quel parser l'a produit. **Couverts par la signature** — altérer l'un invalide le reçu. Des entiers **réels** : un booléen ou une chaîne numérique rend le reçu malformé, jamais admissible (D-073) |
+| `receipt_id` | identifiant local du reçu, **complet dans le nom de fichier** et créé de façon exclusive : un reçu n'est jamais remplacé silencieusement. Deux reçus courants de même identifiant et de contenus signés différents sont un conflit de preuve (D-073) |
 | `parent_receipt_id` / `parent_schema_version` | le reçu qui a autorisé cette étape, et sous quel schéma il a été accepté |
 | `command`, `status`, `recorded_at`, `expires_at` | étape, issue terminale, instant, péremption (6 h) |
 | `sport_key`, `bookmaker` | portée demandée |
@@ -215,7 +215,7 @@ Ne s'y trouvent **jamais** : la clé API, le secret de signature, une URL non
 expurgée, un corps de réponse brut, une cote, un nom de participant, un horaire
 individuel, ni l'identifiant d'événement en clair.
 
-## Bloc de qualification fournisseur (D-071, corrigé par D-072)
+## Bloc de qualification fournisseur (D-071, corrigé par D-072 puis D-073)
 
 Produit par `qualification.evaluate()` et recopié champ par champ dans la sortie
 de `activation status` — jamais étalé, pour qu'une clé du protocole ne puisse pas
@@ -225,14 +225,14 @@ configuration, aucun reçu modifié. Le protocole complet est dans
 
 | Champ | Type | Sens |
 |---|---|---|
-| `qualification_protocol_version` | `int` | version des seuils appliqués — `2` ; deux versions ne se comparent pas |
+| `qualification_protocol_version` | `int` | version des seuils et des règles d'admissibilité appliqués — `3` ; deux versions ne se comparent pas |
 | `qualification_adapter_evidence_version` | `int` | version du parser sous laquelle une preuve compte — `1` |
 | `qualification_evidence_not_before` | `str` | instant UTC littéral avant lequel un reçu est historique et jamais qualifiant |
 | `qualification_state` | `str` | `INSUFFICIENT_EVIDENCE`, `EVIDENCE_CONFLICT` ou `CRITERIA_MET_AWAITING_HUMAN_REVIEW`. Il n'existe pas de `VERIFIED` |
 | `criteria_results` | `list` | un élément par critère, ordre stable |
 | `criteria_results[].criterion_id` | `str` | identifiant stable, ex. `CORE_MAPPING_FOOTBALL` |
 | `criteria_results[].passed` | `bool` | seuils atteints pour ce critère seul |
-| `criteria_results[].observed` | `dict` | compteurs après déduplication : `events`, `competitions`, `utc_days` |
+| `criteria_results[].observed` | `dict` | compteurs après déduplication : `events`, `competitions`, `utc_days`. Pour `COST_CONFORMITY` : les quatre catégories de coût `conforming_paid_calls`, `nonconforming_paid_calls`, `paid_calls_with_unestablished_cost`, `paid_calls_that_never_left` — exhaustives et disjointes, les trois premières devant valoir `≥ 6`, `0` et `0` |
 | `criteria_results[].required` | `dict` | seuils préenregistrés, mêmes clés |
 | `criteria_results[].missing` | `list[str]` | ce qui manque, en clair, ou vide |
 | `criteria_results[].scope` | `str` | sport, commande, marché, âge maximal |
@@ -242,7 +242,7 @@ configuration, aucun reçu modifié. Le protocole complet est dans
 | `qualification_admissible_receipts` | `int` | reçus qui sont une preuve **courante** : v4, versions `2/1`, postérieurs à la date d'effet, non contradictoires |
 | `qualification_historical_nonqualifying_receipts` | `int` | reçus valides et lisibles qui ne qualifient rien : v2/v3, autre version, antérieurs, contradictoires |
 | `qualification_unverifiable_receipts` | `int` | fichiers comptés et **jamais lus** : signature invalide, schéma inconnu, v1. Distinct du champ D-062 `unverifiable_receipts`, qui compte la même idée sur la population de l'audit local |
-| `qualification_reasons` | `dict[str, int]` | taxonomie agrégée : `stale_schema`, `other_protocol_version`, `other_adapter_evidence_version`, `before_effective_instant`, `unusable_recorded_at`, `self_contradictory`, `unverified_or_unknown_schema`. **Des comptes seulement** — aucun chemin, reçu, tag ni identifiant |
+| `qualification_reasons` | `dict[str, int]` | taxonomie agrégée : `stale_schema`, `malformed_current_schema`, `duplicate_receipt_identifier`, `other_protocol_version`, `other_adapter_evidence_version`, `before_effective_instant`, `unusable_recorded_at`, `self_contradictory`, `unverified_or_unknown_schema`. **Des comptes seulement** — aucun chemin, reçu, tag ni identifiant |
 
 Aucun de ces champs ne porte de cote, de nom d'équipe, d'identifiant d'événement en
 clair, de clé ni de payload. `adapter_state` reste `IMPLEMENTED_UNVERIFIED` quelle

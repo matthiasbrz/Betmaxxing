@@ -413,16 +413,16 @@ de candidat en `paper` ou `live_analysis`, démarrage d'un ordonnanceur réel,
 envoi de notification, pari ou automatisme de mise, interface web, et
 versionnement d'un payload fournisseur brut.
 
-## Lire la qualification (D-071, corrigée par D-072)
+## Lire la qualification (D-071, corrigée par D-072 puis D-073)
 
 `activation status` porte, depuis 03C-1, un sixième bloc : l'évaluation des
 critères **préenregistrés** de `docs/provider-validation-protocol.md`
-(`PROVIDER_VALIDATION_PROTOCOL_VERSION = 2`,
-`PROVIDER_ADAPTER_EVIDENCE_VERSION = 1`).
+(`PROVIDER_VALIDATION_PROTOCOL_VERSION = 3`,
+`PROVIDER_ADAPTER_EVIDENCE_VERSION = 1`, schéma de reçu `v4`).
 
 ```bash
-betmaxxing-the-odds-api activation status          # lecture humaine
-betmaxxing-the-odds-api activation status --json    # même contenu, parseable
+python -m betmaxxing.providers.the_odds_api.activation status         # lecture humaine
+python -m betmaxxing.providers.the_odds_api.activation status --json  # même contenu, parseable
 ```
 
 Ce que le bloc dit, et ce qu'il ne dit pas :
@@ -444,10 +444,20 @@ Ce que le bloc dit, et ce qu'il ne dit pas :
 - un reçu v2 ou v3 reste lisible et peut encore autoriser l'étape suivante ; il ne
   qualifie plus aucun critère, `COST_CONFORMITY` inclus. C'est le prix assumé de
   la correction D-072 ;
-- une preuve enregistrée avant `qualification_evidence_not_before` est de
-  l'histoire. Aucune preuve réelle n'a encore été collectée sous protocole v2 et
-  schéma v4 : l'état courant est `INSUFFICIENT_EVIDENCE` avec zéro reçu
-  admissible ;
+- une preuve enregistrée avant `qualification_evidence_not_before`
+  (`2026-08-10T07:19:48+00:00`) est de l'histoire. Aucune preuve réelle n'a encore été
+  collectée sous protocole 3 : l'état courant est `INSUFFICIENT_EVIDENCE` avec zéro
+  reçu admissible ;
+- un reçu courant **mal typé** — booléen là où un entier est attendu, chaîne là où un
+  booléen est attendu — ne prouve rien et fait passer l'état à `EVIDENCE_CONFLICT`,
+  avec la raison `malformed_current_schema` et les **noms** des champs fautifs. Une
+  signature valide atteste des octets, pas des types ;
+- un critère de mapping exige `bookmaker_state = OBSERVED`. Absent, inconnu ou
+  `NOT_RETURNED`, il ne qualifie rien : la portée « bookmaker observé » est désormais
+  vérifiée et non seulement affichée ;
+- `COST_CONFORMITY` expose quatre catégories exhaustives et disjointes, et échoue si
+  un seul appel payant a un coût **non établi** — un `PROVIDER_UNAVAILABLE` qui a pu
+  atteindre le fournisseur, par exemple — même après six appels conformes ;
 - le seuil de fraîcheur du protocole est le littéral **900 s**. Le réglage runtime
   `max_odds_age_seconds` du produit vaut aussi 900 par défaut et reste
   configurable pour le scan : les deux sont censés coïncider, mais reconfigurer le

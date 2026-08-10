@@ -1,4 +1,4 @@
-# Protocole de qualification du fournisseur — `PROVIDER_VALIDATION_PROTOCOL_VERSION = 2`
+# Protocole de qualification du fournisseur — `PROVIDER_VALIDATION_PROTOCOL_VERSION = 3`
 
 Ce document dit, **avant** les appels, combien de preuve live justifierait de
 *demander* à un humain de promouvoir l'adaptateur The Odds API. Il ne promeut rien
@@ -10,7 +10,7 @@ n'ont trouvé aucune couverture Winamax, et ont été résumés comme une activa
 comme encourageant. Des seuils argumentés après coup ne sont pas des critères : ce
 sont des descriptions de ce qui est arrivé.
 
-## 0. Ce que la v1 revendiquait sans le tenir
+## 0. Ce que la v1, puis la v2, revendiquaient sans le tenir
 
 La v1 de ce protocole a été auditée en lecture seule avant tout appel. L'audit a
 reproduit cinq défauts qui rendaient trois de ses revendications fausses **au
@@ -27,6 +27,23 @@ runtime**, et la v2 les ferme. C'est écrit ici plutôt que réécrit en silence
 Deux erreurs de documentation sont corrigées avec : le budget confondait
 invocations CLI et requêtes HTTP (§8), et une assertion anti-fuite portait sur une
 sentinelle absente de sa propre fixture (§9).
+
+### 0.1 Puis la v2 a été auditée à son tour
+
+Le même exercice, en lecture seule et avant tout appel, a trouvé cinq surfaces que
+la v2 ne couvrait pas. La v3 les ferme :
+
+| Revendication v2 | Ce que le code faisait | Ce que fait la v3 |
+| --- | --- | --- |
+| « échec fermé » sur une preuve signée | une **signature valide n'atteste que les octets** : `selections_mapped = "3"` valait trois sélections, `network_attempted = "false"` valait une tentative réseau, et un corpus mal typé atteignait la porte de revue | **contrat structurel positif** (§2.0) : types stricts, aucune vérité Python, aucune coercition ; un reçu courant malformé ne prouve rien **et** bloque l'éligibilité |
+| « zéro appel non conforme » | un appel payant au coût **non établi** — `PROVIDER_UNAVAILABLE` après un timeout, par exemple — n'entrait dans aucune catégorie et disparaissait du dénominateur | **quatre catégories** exhaustives et disjointes (§2.1) ; un coût non établi est compté **et** bloquant |
+| portée « bookmaker observé uniquement » | rien ne lisait `bookmaker_state` : absent ou inconnu, la preuve passait quand même | `bookmaker_state == OBSERVED` **exigé** pour tout critère de mapping |
+| audit local robuste | un fichier JSON dont `schema_version` était un mapping ou une liste levait `TypeError` et faisait sortir `status` en erreur | une version est un entier réel ou n'est pas une version ; ces fichiers sont **comptés** invérifiables |
+| commande opérateur documentée | `betmaxxing-the-odds-api activation status` n'existait pas — ni dans `[project.scripts]`, ni dans le wheel | forme canonique `python -m …`, et un test structurel interdit d'en documenter une autre |
+
+Deux constats d'intégrité sont fermés avec : un reçu ne peut plus être écrasé
+silencieusement (§10), et deux reçus portant le même identifiant avec des contenus
+signés différents sont un **conflit de preuve**, pas un événement de plus.
 
 **Règles de version.** Toute modification d'un seuil, d'une portée, d'une règle
 d'admissibilité ou de la date d'effet incrémente
@@ -45,7 +62,10 @@ nous livrons. Ce qu'elle ne protège pas : la validité du payload du fournisseu
 Aucun numéro de version ne valide un payload.
 
 L'évaluateur vit dans `src/betmaxxing/providers/the_odds_api/qualification.py` et se
-lit par `betmaxxing-the-odds-api activation status [--json]`.
+lit par `python -m betmaxxing.providers.the_odds_api.activation status [--json]`.
+C'est la **seule** forme installée : `[project.scripts]` ne déclare que
+`betmaxxing`, et un test structurel vérifie qu'aucun runbook n'invite à taper une
+commande absente.
 
 ## 1. Neuf faits, jamais condensés
 
@@ -71,9 +91,10 @@ Deux conséquences qu'on confond vite :
 ## 2. Matrice des critères
 
 Portée commune à tous : provider `the_odds_api`, un seul bookmaker par
-observation, âge du marché ≤ **900 s**, reçu **v4** portant
-`qualification_protocol_version = 2` et `provider_adapter_evidence_version = 1`,
-`recorded_at` **≥ `2026-08-09T19:38:29+00:00`**.
+observation **et `bookmaker_state = OBSERVED`**, âge du marché ≤ **900 s**, reçu
+**v4** portant `qualification_protocol_version = 3` et
+`provider_adapter_evidence_version = 1`, `recorded_at`
+**≥ `2026-08-10T07:19:48+00:00`**, et **contrat structurel du §2.0 satisfait**.
 
 Le 900 est un littéral du protocole. Le produit a par ailleurs un réglage runtime
 `max_odds_age_seconds` qui vaut aussi 900 par défaut — au-delà, le scan appelle
@@ -84,14 +105,45 @@ aucun reçu ne devient plus admissible qu'avant.
 
 | `criterion_id` | Portée | Preuve admissible | Événements | Compétitions | Jours UTC | Schéma |
 | --- | --- | --- | --- | --- | --- | --- |
-| `CORE_MAPPING_FOOTBALL` | `soccer_*`, `core`, `h2h`, `GROUPED_ODDS` | statut `CORE_LIVE_VERIFIED`, `selections_mapped > 0`, aucun rejet de mapping | **3** | **2** | **2** | **v4/2/1 seul** |
-| `CORE_MAPPING_TENNIS` | `tennis_*`, `core`, `h2h`, `GROUPED_ODDS` | idem | **3** | **2** | **2** | **v4/2/1 seul** |
-| `ADDITIONAL_MAPPING_FOOTBALL_DRAW_NO_BET` | `soccer_*`, `additional`, `draw_no_bet` | statut `ADDITIONAL_LIVE_VERIFIED` ou `ADDITIONAL_PARTIAL_COVERAGE`, `market_states[marché] = OBSERVED_MAPPED` | **2** | **2** | **1** | **v4/2/1 seul** |
-| `ADDITIONAL_MAPPING_FOOTBALL_DOUBLE_CHANCE` | idem, `double_chance` | idem | **2** | **2** | **1** | **v4/2/1 seul** |
-| `ADDITIONAL_MAPPING_FOOTBALL_H2H_3_WAY_H1` | idem, `h2h_3_way_h1` | idem | **2** | **2** | **1** | **v4/2/1 seul** |
-| `ADDITIONAL_MAPPING_FOOTBALL_TOTALS_H1` | idem, `totals_h1` | idem | **2** | **2** | **1** | **v4/2/1 seul** |
-| `ADDITIONAL_MAPPING_FOOTBALL_DOUBLE_CHANCE_H1` | idem, `double_chance_h1` | idem | **2** | **2** | **1** | **v4/2/1 seul** |
-| `COST_CONFORMITY` | tous sports, appels payants | coût **établi** au sens du §2.1, 0 appel non conforme | **6** appels au coût établi | — | — | **v4/2/1 seul** |
+| `CORE_MAPPING_FOOTBALL` | `soccer_*`, `core`, `h2h`, `GROUPED_ODDS` | statut `CORE_LIVE_VERIFIED`, `selections_mapped > 0`, aucun rejet de mapping | **3** | **2** | **2** | **v4/3/1 seul** |
+| `CORE_MAPPING_TENNIS` | `tennis_*`, `core`, `h2h`, `GROUPED_ODDS` | idem | **3** | **2** | **2** | **v4/3/1 seul** |
+| `ADDITIONAL_MAPPING_FOOTBALL_DRAW_NO_BET` | `soccer_*`, `additional`, `draw_no_bet` | statut `ADDITIONAL_LIVE_VERIFIED` ou `ADDITIONAL_PARTIAL_COVERAGE`, `market_states[marché] = OBSERVED_MAPPED` | **2** | **2** | **1** | **v4/3/1 seul** |
+| `ADDITIONAL_MAPPING_FOOTBALL_DOUBLE_CHANCE` | idem, `double_chance` | idem | **2** | **2** | **1** | **v4/3/1 seul** |
+| `ADDITIONAL_MAPPING_FOOTBALL_H2H_3_WAY_H1` | idem, `h2h_3_way_h1` | idem | **2** | **2** | **1** | **v4/3/1 seul** |
+| `ADDITIONAL_MAPPING_FOOTBALL_TOTALS_H1` | idem, `totals_h1` | idem | **2** | **2** | **1** | **v4/3/1 seul** |
+| `ADDITIONAL_MAPPING_FOOTBALL_DOUBLE_CHANCE_H1` | idem, `double_chance_h1` | idem | **2** | **2** | **1** | **v4/3/1 seul** |
+| `COST_CONFORMITY` | tous sports, appels payants | coût **établi** au sens du §2.1, 0 appel non conforme | **6** appels au coût établi | — | — | **v4/3/1 seul** |
+
+### 2.0 Contrat structurel : une signature prouve des octets, pas des types
+
+Une signature valide établit que ces octets sont les nôtres et n'ont pas été
+altérés. Elle ne dit **rien** sur le fait que `network_attempted` soit un booléen
+plutôt que la chaîne `"false"`. Avant qu'un champ soit lu comme preuve, le reçu
+doit donc satisfaire un contrat positif :
+
+- `schema_version`, les deux versions, `attempts`, `selections_mapped`,
+  `estimated_credits` et `accounted_credits` sont des entiers **réels** et positifs ;
+  un booléen n'est jamais un entier admissible ;
+- `observed_credits` et `quota_remaining` sont un entier réel **ou** `null` — et
+  `null` rend le coût *non établi*, jamais conforme ;
+- `network_attempted` et `may_have_reached_provider` valent exactement `true` ou
+  `false` : ni chaîne, ni entier, ni conteneur ;
+- `market_states` est un mapping `marché → état connu`, **total** sur
+  `markets_requested` ;
+- `markets_requested` et chaque projection présente sont des listes de chaînes non
+  vides, sans doublon, et chaque projection est l'image **exacte** de la carte ;
+- `freshness` est un mapping `marché → entier ≥ 0`, sans booléen, et ses clés sont
+  incluses dans `markets_requested` ;
+- `recorded_at` est un ISO 8601 textuel avec fuseau ;
+- `receipt_id`, `sport_key`, `bookmaker` et `event_tag` sont des chaînes non vides
+  — pour `discover`, `event_tags` remplace `event_tag` et aucune observation de
+  bookmaker n'est exigée, parce que `/events` n'en renvoie aucune.
+
+Un reçu courant qui manque à ce contrat est signalé par la raison
+`malformed_current_schema`, avec **les noms des champs fautifs et jamais leurs
+valeurs**. Il ne prouve rien, il ne disparaît pas du corpus, et il fait passer
+l'état global à `EVIDENCE_CONFLICT` : une preuve illisible n'est pas une archive
+tranquille.
 
 ### 2.1 Ce qu'est un coût conforme
 
@@ -109,6 +161,33 @@ compte pour le coût — il a été facturé et son en-tête était lisible — 
 jamais pour un critère de mapping. Un coût seulement **supposé** après un timeout,
 où `accounted_credits` retombe sur l'estimation, n'est pas une preuve de coût : c'est
 une écriture de prudence.
+
+**Quatre catégories, exhaustives et disjointes.** Tout reçu payant courant tombe
+dans exactement une :
+
+| Catégorie | Ce qu'elle contient |
+| --- | --- |
+| `conforming_paid_calls` | le coût est établi au sens ci-dessus |
+| `nonconforming_paid_calls` | `COST_MISMATCH` ou `COST_UNVERIFIED` |
+| `paid_calls_with_unestablished_cost` | l'appel a pu atteindre le fournisseur, mais son coût n'est pas établi : statut inconnu, observation absente ou hors borne, comptabilisation divergente, reçu malformé |
+| `paid_calls_that_never_left` | `may_have_reached_provider = false` : rien n'a pu être facturé, donc rien n'est prouvé ni reproché |
+
+Le critère passe **si et seulement si** :
+
+```text
+conforming_paid_calls >= 6
+nonconforming_paid_calls == 0
+paid_calls_with_unestablished_cost == 0
+```
+
+Un `PROVIDER_UNAVAILABLE` qui a pu atteindre le fournisseur fait donc échouer le
+critère, même après six appels conformes. La v2 l'ignorait en silence.
+
+**Ce que ce critère ne prouve pas.** Il établit deux choses : aucun appel n'a
+dépassé la borne annoncée, et ce que nous comptabilisons égale ce que le
+fournisseur a annoncé. Il n'établit **pas** que le tarif contractuel a été appliqué
+exactement — un appel annoncé à 0 crédit reste conforme, ce qui prouve l'absence de
+dépassement et non le tarif.
 
 ### 2.2 Contradictions qui font échouer fermé
 

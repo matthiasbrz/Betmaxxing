@@ -71,7 +71,7 @@ from .activation import (
 #: instant changes. Results computed under one version are not comparable with
 #: another, which is the whole reason the number exists: a criterion quietly
 #: relaxed after the fact is not a criterion.
-PROVIDER_VALIDATION_PROTOCOL_VERSION = 2
+PROVIDER_VALIDATION_PROTOCOL_VERSION = 3
 
 #: Bump this when the parser, the mapping, the freshness reading or the cost
 #: logic changes in a way that invalidates an earlier proof. A receipt stamped
@@ -87,10 +87,10 @@ PROVIDER_ADAPTER_EVIDENCE_VERSION = 1
 PROTOCOL_MAX_ODDS_AGE_SECONDS = 900
 
 #: The instant this protocol took effect, chosen once and written identically in
-#: D-072 and `docs/provider-validation-protocol.md`. Evidence recorded before it
+#: D-073 and `docs/provider-validation-protocol.md`. Evidence recorded before it
 #: is history, never qualification. Never recomputed at runtime, never read from
 #: the environment: a date that moves is not an effective date.
-QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC = "2026-08-09T19:38:29+00:00"
+QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC = "2026-08-10T07:19:48+00:00"
 
 #: Only v4 receipts carry the two version stamps, so only v4 can qualify. v2 and
 #: v3 stay readable, honoured as authority for chaining, and reported in the
@@ -156,6 +156,22 @@ _LIVE_STATUSES = frozenset(
 
 PAID_COMMANDS = frozenset({"core", "additional"})
 
+#: The two closed vocabularies a current receipt must draw from. A value outside
+#: them is not a nuance to interpret: it is a field we cannot read.
+KNOWN_MARKET_STATES = frozenset(str(state) for state in MarketState)
+KNOWN_BOOKMAKER_STATES = frozenset(str(state) for state in BookmakerState)
+
+#: Each projection and the market states it must be the exact image of. v4 keeps
+#: the total map authoritative; a projection that disagrees with it is a receipt
+#: disagreeing with itself.
+PROJECTIONS: dict[str, tuple[str, ...]] = {
+    "markets_mapped": (str(MarketState.OBSERVED_MAPPED),),
+    "markets_rejected": (str(MarketState.OBSERVED_REJECTED),),
+    "markets_absent": (str(MarketState.NOT_RETURNED),),
+    "markets_not_evaluated": (str(MarketState.NOT_EVALUATED_BOOKMAKER_ABSENT),),
+    "markets_observed": (str(MarketState.OBSERVED_MAPPED), str(MarketState.OBSERVED_REJECTED)),
+}
+
 #: The prepared campaign, declared here so the budget in the documentation is
 #: derived from the harness's own bounds instead of retyped. Protocol v1's prose
 #: said "12 requêtes" for a campaign that issues sixteen: `discover` makes two
@@ -167,6 +183,8 @@ CAMPAIGN_INVOCATIONS: dict[str, int] = {"discover": 4, "core": 6, "additional": 
 #: no path, no receipt, no tag, no identifier ever appears in a reason.
 QUALIFICATION_REASONS: tuple[str, ...] = (
     "stale_schema",
+    "malformed_current_schema",
+    "duplicate_receipt_identifier",
     "other_protocol_version",
     "other_adapter_evidence_version",
     "before_effective_instant",
@@ -345,9 +363,13 @@ COST_CONFORMITY = Criterion(
         "critère."
     ),
     limit=(
-        "Établit que le coût observé a été conforme sur les appels faits. N'établit "
-        "aucune garantie de facturation future. Un coût seulement supposé — en-tête "
-        "illisible, requête peut-être jamais servie — ne compte pas."
+        "Établit deux choses seulement : aucun appel n'a dépassé la borne annoncée, et "
+        "ce que nous comptabilisons égale ce que le fournisseur a annoncé. **Pas** que "
+        "le tarif contractuel a été appliqué exactement : un appel annoncé à 0 crédit "
+        "reste conforme, ce qui prouve l'absence de dépassement et non le tarif. "
+        "N'établit aucune garantie de facturation future. Un coût seulement supposé — "
+        "en-tête illisible, requête peut-être jamais servie — ne compte pas, et un "
+        "appel payant dont le coût n'est pas établi fait échouer le critère."
     ),
 )
 
@@ -364,24 +386,16 @@ CRITERIA: tuple[Criterion, ...] = (
 
 
 # ---------------------------------------------------------------------------
-# Reading receipt fields without ever raising on odd input
+# Reading receipt fields strictly. A signature proves bytes, not types.
 # ---------------------------------------------------------------------------
-def _int(value: object) -> int:
-    """A receipt field read as an integer, or zero. Never raises on odd input."""
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        try:
-            return int(value)
-        except ValueError:
-            return 0
-    return 0
-
-
 def _plain_int(value: object) -> int | None:
-    """An integer that really is one. ``True`` is not a credit count."""
+    """An integer that really is one. ``True`` is not a credit count.
+
+    Protocol v2 had a companion that coerced booleans and numeric strings, and a
+    re-audit showed why that cannot exist on an evidence path: a signed receipt
+    carrying ``selections_mapped = "3"`` proved three mapped selections. There is
+    now one reader, and it is strict.
+    """
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
@@ -413,6 +427,121 @@ def utc_day(raw: object) -> str:
     return moment.astimezone(UTC).date().isoformat()
 
 
+def _text(value: object) -> str | None:
+    """A non-empty string, or ``None``. An identity field cannot be blank."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value
+
+
+def _market_list(value: object) -> list[str] | None:
+    """A duplicate-free list of non-empty strings, or ``None``.
+
+    Not a string — iterating one yields characters, which is how a mistyped
+    ``markets_mapped`` used to sneak past a set comparison.
+    """
+    if not isinstance(value, list):
+        return None
+    out: list[str] = []
+    for item in value:
+        name = _text(item)
+        if name is None or name in out:
+            return None
+        out.append(name)
+    return out
+
+
+def _counted(value: object, *, minimum: int = 0) -> int | None:
+    number = _plain_int(value)
+    if number is None or number < minimum:
+        return None
+    return number
+
+
+# ---------------------------------------------------------------------------
+# The structural contract every current receipt must satisfy
+# ---------------------------------------------------------------------------
+def structural_faults(receipt: Mapping[str, Any]) -> list[str]:
+    """The **names** of the fields a current receipt gets wrong. Never their values.
+
+    A valid signature establishes that these bytes are ours and unaltered. It says
+    nothing about whether ``network_attempted`` is a boolean or the string
+    ``"false"``. So before any field is read as evidence, the receipt must satisfy
+    a positive contract; a field outside it is named, and the receipt qualifies
+    nothing and blocks the gate.
+
+    Command-aware on purpose: ``discover`` carries ``event_tags`` and no bookmaker
+    observation — demanding one would flag a perfectly good discovery receipt.
+    """
+    faults: list[str] = []
+
+    def require(condition: object, field: str) -> None:
+        if not condition:
+            faults.append(field)
+
+    for field in (
+        "schema_version",
+        "qualification_protocol_version",
+        "provider_adapter_evidence_version",
+    ):
+        require(_counted(receipt.get(field)) is not None, field)
+    for field in ("estimated_credits", "accounted_credits"):
+        require(_counted(receipt.get(field)) is not None, field)
+    for field in ("observed_credits", "quota_remaining"):
+        value = receipt.get(field)
+        require(value is None or _counted(value) is not None, field)
+    if "attempts" in receipt:
+        require(_counted(receipt.get("attempts")) is not None, "attempts")
+    for field in ("network_attempted", "may_have_reached_provider"):
+        require(receipt.get(field) is True or receipt.get(field) is False, field)
+    for field in ("receipt_id", "sport_key", "command", "status"):
+        require(_text(receipt.get(field)) is not None, field)
+    require(_instant(receipt.get("recorded_at")) is not None, "recorded_at")
+
+    command = str(receipt.get("command") or "")
+    if command == "discover":
+        require(_market_list(receipt.get("event_tags")) is not None, "event_tags")
+        for field in ("events_returned", "events_in_window", "events_admissible"):
+            if field in receipt:
+                require(_counted(receipt.get(field)) is not None, field)
+        return faults
+
+    require(_text(receipt.get("bookmaker")) is not None, "bookmaker")
+    require(_text(receipt.get("event_tag")) is not None, "event_tag")
+    require(str(receipt.get("bookmaker_state")) in KNOWN_BOOKMAKER_STATES, "bookmaker_state")
+    require(_counted(receipt.get("selections_mapped")) is not None, "selections_mapped")
+    require(isinstance(receipt.get("mapping_rejections"), list), "mapping_rejections")
+
+    requested = _market_list(receipt.get("markets_requested"))
+    require(requested is not None, "markets_requested")
+    states = receipt.get("market_states")
+    if not isinstance(states, Mapping) or any(
+        _text(market) is None or str(state) not in KNOWN_MARKET_STATES
+        for market, state in states.items()
+    ):
+        faults.append("market_states")
+        states = None
+    if requested is not None and states is not None:
+        # v4's map is *total* over the markets the call requested. A key on either
+        # side alone means the receipt cannot say what became of a market.
+        require(set(states) == set(requested), "market_states")
+    if states is not None:
+        for field, wanted in PROJECTIONS.items():
+            if field not in receipt:
+                continue
+            projection = _market_list(receipt.get(field))
+            expected = {market for market, state in states.items() if str(state) in wanted}
+            require(projection is not None and set(projection) == expected, field)
+    freshness = receipt.get("freshness")
+    if not isinstance(freshness, Mapping) or any(
+        _text(market) is None or _counted(age) is None for market, age in freshness.items()
+    ):
+        faults.append("freshness")
+    elif requested is not None:
+        require(set(freshness) <= set(requested), "freshness")
+    return sorted(set(faults))
+
+
 # ---------------------------------------------------------------------------
 # Contradictions — closed in both directions
 # ---------------------------------------------------------------------------
@@ -422,9 +551,12 @@ def contradictions(receipt: Mapping[str, Any]) -> list[str]:
     A receipt that disagrees with itself is not weak evidence to be discounted —
     it means one of its fields is wrong and we cannot tell which. The protocol
     fails closed on it and names it, without naming any event.
+
+    Assumes the structural contract already holds: these rules read the fields,
+    they do not re-check their types.
     """
     found: list[str] = []
-    mapped = _int(receipt.get("selections_mapped"))
+    mapped = _plain_int(receipt.get("selections_mapped")) or 0
     states = receipt.get("market_states")
     version = receipt.get("schema_version")
     total_map = version in {3, QUALIFYING_SCHEMA_VERSION} and isinstance(states, Mapping)
@@ -453,8 +585,7 @@ def contradictions(receipt: Mapping[str, Any]) -> list[str]:
         freshness = receipt.get("freshness")
         ages = freshness if isinstance(freshness, Mapping) else {}
         for market in sorted(observed):
-            age = _plain_int(ages.get(market))
-            if age is None or age < 0:
+            if _counted(ages.get(market)) is None:
                 found.append("un marché OBSERVED_MAPPED n'a pas d'âge de fraîcheur entier positif")
                 break
     elif mapped > 0 and isinstance(states, Mapping) and not states:
@@ -462,12 +593,14 @@ def contradictions(receipt: Mapping[str, Any]) -> list[str]:
 
     if absent and listed:
         found.append("bookmaker_state = NOT_RETURNED alors que markets_mapped n'est pas vide")
-    if str(receipt.get("status")) in _LIVE_STATUSES and not receipt.get("network_attempted"):
-        found.append("statut live sans tentative réseau enregistrée")
-    observed_credits = receipt.get("observed_credits")
-    if observed_credits is not None and _int(receipt.get("accounted_credits")) < _int(
-        observed_credits
+    if (
+        str(receipt.get("status")) in _LIVE_STATUSES
+        and receipt.get("network_attempted") is not True
     ):
+        found.append("statut live sans tentative réseau enregistrée")
+    observed_credits = _plain_int(receipt.get("observed_credits"))
+    accounted = _plain_int(receipt.get("accounted_credits"))
+    if observed_credits is not None and accounted is not None and accounted < observed_credits:
         found.append("accounted_credits inférieur à observed_credits")
     return found
 
@@ -479,31 +612,53 @@ def _verifiable(receipt: Mapping[str, Any]) -> bool:
     """Signed with our secret, and of a schema whose fields we can read."""
     from .activation import SUPPORTED_SCHEMA_VERSIONS
 
-    if receipt.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
+    version = _plain_int(receipt.get("schema_version"))
+    if version is None or version not in SUPPORTED_SCHEMA_VERSIONS:
         return False
     return verify_receipt(receipt)
 
 
-def classify(receipt: Mapping[str, Any]) -> str:
-    """``""`` when the receipt is current evidence, otherwise the reason it is not.
+def currency_reason(receipt: Mapping[str, Any]) -> str:
+    """Why this receipt is not evidence *of this protocol*, or ``""``.
 
-    One receipt, one reason, in a fixed order of severity: unreadable before
-    outdated, outdated before premature. The reason is a taxonomy key, never a
-    description of the receipt.
+    Only the version-and-date gate. Structural validity is a separate question,
+    and keeping them separate is what stops a malformed paid call from vanishing
+    out of the cost census — the mistake protocol v2 made.
     """
     if not _verifiable(receipt):
         return "unverified_or_unknown_schema"
-    if receipt.get("schema_version") != QUALIFYING_SCHEMA_VERSION:
+    if _plain_int(receipt.get("schema_version")) != QUALIFYING_SCHEMA_VERSION:
         return "stale_schema"
-    if receipt.get("qualification_protocol_version") != PROVIDER_VALIDATION_PROTOCOL_VERSION:
+    if (
+        _plain_int(receipt.get("qualification_protocol_version"))
+        != PROVIDER_VALIDATION_PROTOCOL_VERSION
+    ):
         return "other_protocol_version"
-    if receipt.get("provider_adapter_evidence_version") != PROVIDER_ADAPTER_EVIDENCE_VERSION:
+    if (
+        _plain_int(receipt.get("provider_adapter_evidence_version"))
+        != PROVIDER_ADAPTER_EVIDENCE_VERSION
+    ):
         return "other_adapter_evidence_version"
     moment = _instant(receipt.get("recorded_at"))
     if moment is None:
         return "unusable_recorded_at"
     if moment.astimezone(UTC) < datetime.fromisoformat(QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC):
         return "before_effective_instant"
+    return ""
+
+
+def classify(receipt: Mapping[str, Any]) -> str:
+    """``""`` when the receipt is usable evidence, otherwise the reason it is not.
+
+    One receipt, one reason, in a fixed order of severity: unreadable, then out of
+    version, then premature, then malformed, then self-contradictory. The reason is
+    a taxonomy key, never a description of the receipt.
+    """
+    reason = currency_reason(receipt)
+    if reason:
+        return reason
+    if structural_faults(receipt):
+        return "malformed_current_schema"
     if contradictions(receipt):
         return "self_contradictory"
     return ""
@@ -523,26 +678,36 @@ def admissible_for(receipt: Mapping[str, Any], criterion: Criterion) -> bool:
         return False
     if not str(receipt.get("sport_key", "")).startswith(f"{criterion.sport_family}_"):
         return False
-    if not receipt.get("network_attempted"):
+    if receipt.get("network_attempted") is not True:
         return False
-    if criterion.requires_total_market_map:
-        states = receipt.get("market_states")
-        if not isinstance(states, Mapping):
-            return False
-        if str(states.get(criterion.market)) != str(MarketState.OBSERVED_MAPPED):
-            return False
-    else:
-        if _int(receipt.get("selections_mapped")) <= 0:
+    # The scope says "observed bookmaker only", so the receipt has to say it too.
+    # Under protocol v2 nothing checked this and the scope was a claim about a
+    # field nobody read.
+    if str(receipt.get("bookmaker_state")) != str(BookmakerState.OBSERVED):
+        return False
+    requested = _market_list(receipt.get("markets_requested")) or []
+    if criterion.market not in requested:
+        return False
+    states = receipt.get("market_states")
+    if not isinstance(states, Mapping):
+        return False
+    if str(states.get(criterion.market)) != str(MarketState.OBSERVED_MAPPED):
+        return False
+    if not criterion.requires_total_market_map:
+        # A `core` call requests one market, so mapped selections *are* that
+        # market's mapping — read strictly, never coerced.
+        selections = _counted(receipt.get("selections_mapped"), minimum=1)
+        if selections is None:
             return False
         if receipt.get("mapping_rejections"):
             return False
     freshness = receipt.get("freshness")
     if not isinstance(freshness, Mapping):
         return False
-    age = _plain_int(freshness.get(criterion.market))
+    age = _counted(freshness.get(criterion.market))
     if age is None:
         return False
-    return 0 <= age <= PROTOCOL_MAX_ODDS_AGE_SECONDS
+    return age <= PROTOCOL_MAX_ODDS_AGE_SECONDS
 
 
 def cost_conforming(receipt: Mapping[str, Any]) -> bool:
@@ -557,19 +722,42 @@ def cost_conforming(receipt: Mapping[str, Any]) -> bool:
     command = str(receipt.get("command"))
     if command not in PAID_COMMANDS:
         return False
+    if structural_faults(receipt):
+        return False
     if str(receipt.get("status")) not in COST_ESTABLISHING_STATUSES:
         return False
-    if not receipt.get("network_attempted") or not receipt.get("may_have_reached_provider"):
+    if receipt.get("network_attempted") is not True:
+        return False
+    if receipt.get("may_have_reached_provider") is not True:
         return False
     ceiling = STEP_CEILINGS[command]
-    estimated = _plain_int(receipt.get("estimated_credits"))
-    observed = _plain_int(receipt.get("observed_credits"))
-    accounted = _plain_int(receipt.get("accounted_credits"))
+    estimated = _counted(receipt.get("estimated_credits"))
+    observed = _counted(receipt.get("observed_credits"))
+    accounted = _counted(receipt.get("accounted_credits"))
     if estimated is None or observed is None or accounted is None:
         return False
-    if not 0 <= estimated <= ceiling or not 0 <= observed <= ceiling:
+    if estimated > ceiling or observed > ceiling:
         return False
     return accounted == observed
+
+
+def cost_category(receipt: Mapping[str, Any]) -> str:
+    """Which single cost bucket a **current** paid receipt belongs to.
+
+    Exactly one, deterministically, and never none: protocol v2 let a paid call
+    that was neither conforming nor explicitly a mismatch fall out of the census
+    entirely, so the report read "0 nonconforming" about a call whose cost nobody
+    could establish.
+    """
+    if str(receipt.get("command")) not in PAID_COMMANDS:
+        return ""
+    if str(receipt.get("status")) in _NONCONFORMING_COST_STATUSES:
+        return "nonconforming_paid_calls"
+    if receipt.get("may_have_reached_provider") is not True:
+        return "paid_calls_that_never_left"
+    if cost_conforming(receipt):
+        return "conforming_paid_calls"
+    return "paid_calls_with_unestablished_cost"
 
 
 # ---------------------------------------------------------------------------
@@ -630,40 +818,75 @@ def _missing(observed: Mapping[str, int], required: Mapping[str, int]) -> list[s
 
 
 def _cost_result(receipts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    conforming = [r for r in receipts if cost_conforming(r)]
-    nonconforming = [
-        r
-        for r in receipts
-        if str(r.get("command")) in PAID_COMMANDS
-        and str(r.get("status")) in _NONCONFORMING_COST_STATUSES
-    ]
-    observed = {
-        "conforming_paid_calls": len(_dedupe(conforming, "*")),
-        "nonconforming_paid_calls": len(nonconforming),
+    """Four buckets, one per paid receipt, and three of them must be empty.
+
+    The census runs over every **current** paid receipt — v4, this protocol, this
+    adapter, postdated — whether or not it is well formed. That is deliberate: a
+    malformed paid call is exactly one whose cost cannot be established, and the
+    v2 version of this function let it disappear instead.
+    """
+    buckets = {
+        "conforming_paid_calls": 0,
+        "nonconforming_paid_calls": 0,
+        "paid_calls_with_unestablished_cost": 0,
+        "paid_calls_that_never_left": 0,
     }
+    conforming: list[Mapping[str, Any]] = []
+    for receipt in receipts:
+        category = cost_category(receipt)
+        if not category:
+            continue
+        if category == "conforming_paid_calls":
+            conforming.append(receipt)
+            continue
+        buckets[category] += 1
+    buckets["conforming_paid_calls"] = len(_dedupe(conforming, "*"))
+
     required = {
         "conforming_paid_calls": COST_CONFORMITY.min_events,
         "nonconforming_paid_calls": 0,
+        "paid_calls_with_unestablished_cost": 0,
     }
     missing: list[str] = []
-    if observed["conforming_paid_calls"] < required["conforming_paid_calls"]:
+    if buckets["conforming_paid_calls"] < required["conforming_paid_calls"]:
         missing.append(
             "appels payants au coût établi : "
-            f"{observed['conforming_paid_calls']}/{required['conforming_paid_calls']}"
+            f"{buckets['conforming_paid_calls']}/{required['conforming_paid_calls']}"
         )
-    if observed["nonconforming_paid_calls"]:
+    if buckets["nonconforming_paid_calls"]:
         missing.append(
-            f"appels au coût non conforme : {observed['nonconforming_paid_calls']} (maximum 0)"
+            f"appels au coût non conforme : {buckets['nonconforming_paid_calls']} (maximum 0)"
+        )
+    if buckets["paid_calls_with_unestablished_cost"]:
+        missing.append(
+            "appels payants au coût non établi : "
+            f"{buckets['paid_calls_with_unestablished_cost']} (maximum 0)"
         )
     return {
         "criterion_id": COST_CONFORMITY.criterion_id,
         "passed": not missing,
-        "observed": observed,
+        "observed": buckets,
         "required": required,
         "missing": missing,
         "scope": "tous sports · appels payants · coût observé et comptabilisé",
         "limit": COST_CONFORMITY.limit,
     }
+
+
+def _divergent_identifiers(receipts: Sequence[Mapping[str, Any]]) -> set[str]:
+    """Identifiers carried by two current receipts whose signed bytes differ.
+
+    A receipt id is meant to name one receipt. Two byte-identical copies are one
+    observation and deduplicate cleanly; two *different* receipts under one id mean
+    the corpus is inconsistent, and neither can be trusted to speak for it.
+    """
+    from .activation import SIGNATURE_FIELD
+
+    seen: dict[str, set[str]] = {}
+    for receipt in receipts:
+        identifier = str(receipt.get("receipt_id") or "")
+        seen.setdefault(identifier, set()).add(str(receipt.get(SIGNATURE_FIELD)))
+    return {identifier for identifier, signatures in seen.items() if len(signatures) > 1}
 
 
 def evaluate(receipts: Sequence[Mapping[str, Any]], unverifiable: int) -> dict[str, Any]:
@@ -677,14 +900,20 @@ def evaluate(receipts: Sequence[Mapping[str, Any]], unverifiable: int) -> dict[s
     """
     reasons = dict.fromkeys(QUALIFICATION_REASONS, 0)
     current: list[Mapping[str, Any]] = []
+    usable: list[Mapping[str, Any]] = []
     historical = 0
     refused = 0
     conflicts: list[str] = []
+    malformed_fields: set[str] = set()
 
     for receipt in receipts:
+        if currency_reason(receipt) == "":
+            # Current for this protocol. Whether it is well formed is the next
+            # question, and the cost census needs it either way.
+            current.append(receipt)
         reason = classify(receipt)
         if not reason:
-            current.append(receipt)
+            usable.append(receipt)
             continue
         reasons[reason] += 1
         if reason == "unverified_or_unknown_schema":
@@ -693,13 +922,32 @@ def evaluate(receipts: Sequence[Mapping[str, Any]], unverifiable: int) -> dict[s
         historical += 1
         if reason == "self_contradictory":
             conflicts.extend(contradictions(receipt))
+        elif reason == "malformed_current_schema":
+            malformed_fields.update(structural_faults(receipt))
+
+    if malformed_fields:
+        conflicts.append(
+            "reçu courant structurellement invalide — champ(s) hors contrat : "
+            + ", ".join(sorted(malformed_fields))
+        )
+
+    divergent = _divergent_identifiers(usable)
+    if divergent:
+        excluded = [r for r in usable if str(r.get("receipt_id") or "") in divergent]
+        reasons["duplicate_receipt_identifier"] += len(excluded)
+        usable = [r for r in usable if str(r.get("receipt_id") or "") not in divergent]
+        current = [r for r in current if str(r.get("receipt_id") or "") not in divergent]
+        conflicts.append(
+            f"{len(divergent)} identifiant(s) de reçu portent des contenus signés différents ; "
+            "tous les reçus concernés sont écartés des critères"
+        )
 
     results: list[dict[str, Any]] = []
     for criterion in CRITERIA:
         if criterion is COST_CONFORMITY:
             results.append(_cost_result(current))
             continue
-        evidence = _dedupe((r for r in current if admissible_for(r, criterion)), criterion.market)
+        evidence = _dedupe((r for r in usable if admissible_for(r, criterion)), criterion.market)
         observed = _observed_diversity(evidence)
         missing = _missing(observed, criterion.required)
         results.append(
@@ -732,7 +980,7 @@ def evaluate(receipts: Sequence[Mapping[str, Any]], unverifiable: int) -> dict[s
             state is QualificationState.CRITERIA_MET_AWAITING_HUMAN_REVIEW
         ),
         "evidence_conflicts": conflicts,
-        "qualification_admissible_receipts": len(current),
+        "qualification_admissible_receipts": len(usable),
         "qualification_historical_nonqualifying_receipts": historical,
         "qualification_unverifiable_receipts": unverifiable + refused,
         "qualification_reasons": reasons,

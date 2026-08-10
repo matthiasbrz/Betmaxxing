@@ -1214,6 +1214,19 @@ test rouge et une décision séparée.
 
 ### D-072 — Une preuve de qualification est fermée, datée et versionnée
 
+> **Supersédée pour la qualification par D-073.** Tout ce qui suit reste vrai et
+> reste en vigueur ; un second audit indépendant en lecture seule, mené avant tout
+> appel, a montré que « fermée » était encore une revendication trop large. Une
+> signature valide n'atteste que des **octets** : un reçu correctement signé mais
+> mal typé — `selections_mapped = "3"`, `network_attempted = "false"` — produisait
+> encore une preuve positive et ouvrait la porte de revue. Quatre autres surfaces
+> manquaient : un appel payant au coût non établi sortait du dénominateur, la portée
+> « bookmaker observé » n'était vérifiée par personne, un `schema_version` non
+> hachable faisait planter `status`, et une commande opérateur documentée n'existait
+> pas. Le numéro de protocole passe donc à **3** ; le schéma de reçu reste **v4** et
+> la version de preuve d'adaptateur reste **1**, parce que ni le parser ni le mapping
+> du payload ne changent.
+
 D-071 avait raison sur l'intention et faux sur l'exécution. Un audit indépendant en
 lecture seule, mené **avant** tout nouvel appel, a reproduit cinq défauts qui
 rendaient trois de ses revendications fausses au runtime. Cette décision les ferme
@@ -1312,3 +1325,119 @@ promotion, aucun changement de statut métier : l'adaptateur reste
 encore été collectée sous protocole v2 et schéma v4 — l'état courant est
 `INSUFFICIENT_EVIDENCE` avec zéro reçu admissible, ce qui est exactement ce qu'un
 protocole préenregistré doit afficher avant sa première campagne.
+
+### D-073 — Une signature prouve des octets ; le contrat prouve les types
+
+D-072 avait raison sur ses cinq fermetures et trop large sur une revendication : elle
+disait l'évaluateur « fermé ». Un second audit indépendant, en lecture seule et avant
+tout appel, a montré qu'un reçu **correctement signé** pouvait encore fabriquer une
+preuve positive en étant simplement mal typé, et a trouvé quatre autres surfaces
+ouvertes. Cette décision les ferme. D-072 reste lisible, annotée, avec ce qu'elle
+promettait de trop.
+
+**Protocole 3, adaptateur 1, schéma 4.** Les règles d'admissibilité changent, donc
+`PROVIDER_VALIDATION_PROTOCOL_VERSION = 3`. Ni le parser fournisseur ni le mapping du
+payload ne changent, donc `PROVIDER_ADAPTER_EVIDENCE_VERSION` reste `1` et le schéma de
+reçu reste `4` : aucun champ nouveau n'est nécessaire pour porter cette correction.
+Nouvelle date d'effet, choisie avant toute correction et avant toute campagne :
+`QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC = "2026-08-10T07:19:48+00:00"`, écrite au
+caractère près dans le code, ici, dans le protocole et dans la feuille de route.
+
+**Contrat structurel positif.** Une signature valide établit que ces octets sont les
+nôtres et qu'ils n'ont pas été altérés. Elle ne dit rien de leur type. Sous protocole 3,
+un reçu qui prétend qualifier doit satisfaire un contrat explicite avant que le moindre
+champ soit lu comme preuve : entiers **réels** et positifs pour les versions, les
+tentatives, les sélections et les crédits — un booléen n'est jamais un entier ;
+`observed_credits` et `quota_remaining` entiers réels ou `null`, `null` rendant le coût
+non établi ; `network_attempted` et `may_have_reached_provider` exactement `true` ou
+`false`, aucune chaîne ni conteneur ; `market_states` mapping d'états connus **total**
+sur `markets_requested` ; `markets_requested` et chaque projection présente listes de
+chaînes non vides sans doublon, chaque projection image **exacte** de la carte ;
+`freshness` mapping `marché → entier ≥ 0` dont les clés sont incluses dans les marchés
+demandés ; `recorded_at` ISO 8601 textuel avec fuseau ; `receipt_id`, `sport_key`,
+`bookmaker` et `event_tag` chaînes non vides. Le contrat est **conscient de la
+commande** : `discover` porte `event_tags` et aucune observation de bookmaker, parce que
+`/events` n'en renvoie aucune — exiger l'inverse aurait invalidé un reçu de découverte
+parfaitement bon.
+
+Un reçu courant qui manque à ce contrat reçoit la raison `malformed_current_schema`,
+avec **les noms des champs fautifs et jamais leurs valeurs**. Il ne prouve rien, il ne
+disparaît pas du corpus, et il fait passer l'état global à `EVIDENCE_CONFLICT` : une
+preuve illisible n'est pas une archive tranquille. Le lecteur tolérant `_int`, qui
+acceptait booléens et chaînes numériques, est supprimé de tout chemin de décision ; un
+lecteur distinct et explicitement nommé `_reported_int` reste dans le bloc d'audit
+D-062, parce qu'un rapport qui décrit ce qui est sur le disque vaut mieux qu'un rapport
+qui refuse de s'imprimer — et il ne décide de rien.
+
+**Bookmaker observé, obligatoire.** Un critère de mapping n'est satisfait que si
+`bookmaker_state == OBSERVED`. La portée « bookmaker observé uniquement » était affichée
+par la v2 sans que rien ne la vérifie : absent ou inconnu, la preuve passait. Elle n'est
+donc pas retirée, elle est devenue vraie.
+
+**Coût non établi : visible et bloquant.** Quatre catégories exhaustives et disjointes
+pour tout reçu payant courant : `conforming_paid_calls`, `nonconforming_paid_calls`,
+`paid_calls_with_unestablished_cost` et `paid_calls_that_never_left`. Le critère passe
+si et seulement si les conformes atteignent six, les non conformes valent zéro **et** les
+coûts non établis valent zéro. Un `PROVIDER_UNAVAILABLE` qui a pu atteindre le
+fournisseur fait donc échouer le critère, même après six appels conformes ; la v2
+l'ignorait en silence et affichait « 0 non conforme ». Le recensement porte sur tous les
+reçus payants **courants**, malformés compris : un reçu payant malformé est précisément
+un reçu dont le coût ne peut pas être établi.
+
+**Ce que `COST_CONFORMITY` ne prouve pas.** Décision conservée et désormais écrite dans
+le `limit` du critère : il établit l'absence de dépassement de la borne annoncée et
+l'égalité entre observation et comptabilisation. Il n'établit **pas** l'exactitude d'un
+tarif fixe. Un appel annoncé à 0 crédit reste conforme — ce qui prouve qu'aucune borne
+n'a été franchie, pas que le tarif contractuel vaut zéro.
+
+**Aucun JSON ne fait planter l'audit.** Un fichier dont `schema_version` était un
+mapping ou une liste levait `TypeError` — `in` sur un `frozenset` hache son opérande — et
+faisait sortir `status` en erreur. Une version est désormais un entier réel ou n'est pas
+une version : ces fichiers sont comptés invérifiables, sans exposer leur contenu, dans
+`audit_receipts` comme dans `load_parent`. Le code fautif était **antérieur** à cette
+série de tranches ; il est vivant sur cette tête et sur le chemin de la preuve, donc il
+est corrigé ici.
+
+**Écriture exclusive des reçus.** Le nom de fichier porte le `receipt_id` **complet** et
+la création est exclusive, à `0600`. L'ancien nom tronquait l'identifiant à huit
+caractères et utilisait `write_text` : deux reçus partageant la même seconde, la même
+commande **et** le même préfixe de huit caractères s'écrasaient sans un mot. Les trois
+conditions étaient nécessaires — un rapport précédent disait « deux reçus au même instant
+s'écrasent », ce qui était trop large et est corrigé ici. Réécrire un reçu byte pour byte
+identique est idempotent ; un contenu divergent sous le même nom est **refusé**. Compromis
+assumé : un refus d'écriture pourrait faire perdre la trace d'un appel réel, mais avec un
+identifiant complet de seize caractères hexadécimaux tiré de `secrets.token_hex(8)`, ce
+cas est hors d'atteinte pratique, alors que l'écrasement, lui, était atteignable dès
+qu'un schéma d'identifiants non aléatoire serait choisi.
+
+**Un identifiant, un reçu.** Deux copies byte pour byte du même reçu comptent une fois.
+Deux reçus valides portant le même `receipt_id` avec des contenus signés **différents**
+constituent un conflit de preuve : tous les reçus de cet identifiant sont écartés des
+critères, l'état devient `EVIDENCE_CONFLICT`, et le message ne divulgue ni contenu, ni
+chemin, ni tag. La v2 les comptait comme deux événements distincts.
+
+**Marché demandé, carte totale, projections.** Un critère ne peut porter que sur un
+marché appartenant à `markets_requested` ; les clés de `market_states` correspondent
+exactement aux marchés demandés ; chaque projection présente est l'image exacte de la
+carte ; une fraîcheur ne peut pas prouver un marché jamais demandé. La décision sur
+`expires_at` est inchangée : la TTL concerne l'autorité de chaînage, pas la persistance
+de l'attestation historique.
+
+**Commande canonique.** Le runbook dit désormais
+`python -m betmaxxing.providers.the_odds_api.activation status [--json]`.
+`betmaxxing-the-odds-api` n'existait ni dans `[project.scripts]` ni dans le wheel
+construit : une commande documentée qu'un opérateur ne peut pas taper est un défaut, pas
+une coquille. Aucun point d'entrée n'est ajouté dans cette tranche, et un test structurel
+analyse les blocs de commandes des runbooks : leur premier mot doit être `python`, un
+outil courant, ou un script réellement déclaré.
+
+**Compatibilité.** Schémas v2 et v3 : toujours lus, vérifiés, honorés comme autorité de
+chaînage, jamais réécrits ni re-signés, et ne qualifiant rien. v4 portant le protocole 2 :
+devient **historique** pour la qualification — c'est le prix assumé d'un changement
+d'admissibilité, et aucun reçu réel v4 n'existait. Aucun reçu n'est migré, ouvert,
+re-signé ni supprimé.
+
+**Ce que cette décision ne fait pas.** Aucun appel fournisseur, aucun crédit, aucune
+promotion, aucun changement de statut métier : l'adaptateur reste
+`IMPLEMENTED_UNVERIFIED`, les modèles `BACKTEST_ONLY`. Aucune preuve réelle n'existe sous
+protocole 3 — l'état courant est `INSUFFICIENT_EVIDENCE` avec zéro reçu admissible.
