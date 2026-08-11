@@ -1630,6 +1630,18 @@ protocole 4 : l'état courant est `INSUFFICIENT_EVIDENCE` avec zéro reçu utili
 
 ### D-075 — Une preuve de réponse exige une réponse
 
+> **Supersédée pour la frontière de confiance par D-076**, et seulement sur les points
+> que D-076 remplace : la validation et le cycle de vie du secret, la pureté effective
+> de l'évaluateur, la frontière du *répertoire* (et non du seul nom final), le
+> traitement des erreurs de persistance, la lecture de `command`, le découpage du seau
+> de coût « non établi », l'exclusion des reçus rejetés de tout compteur sémantique, la
+> vérification bidirectionnelle du catalogue et les bornes de la quarantaine. Ce que
+> D-075 établit et que D-076 ne remplace pas : l'atteinte du fournisseur comme
+> précondition de toute preuve de réponse, l'état de tentative à trois valeurs, la
+> cascade symétrique `core`/`additional`, le canon sémantique dédupliqué, les
+> invariants positifs par statut, et le caractère non bloquant de
+> `confirmed_attempts_not_sent`.
+
 D-074 avait raison sur la phase et s'est trompée sur ce qu'une phase établit. Un quatrième
 audit indépendant, en lecture seule et avant tout appel, a trouvé **un P1** : la porte
 `CRITERIA_MET_AWAITING_HUMAN_REVIEW` était atteignable alors que **toutes** les
@@ -1763,3 +1775,86 @@ l'adaptateur reste `IMPLEMENTED_UNVERIFIED`, les modèles `BACKTEST_ONLY`, l'inc
 l'état courant est `INSUFFICIENT_EVIDENCE` avec zéro reçu utilisable. Les reçus protocole 4
 deviennent historiques non qualifiants, et aucun reçu n'est migré, ouvert, re-signé ni
 supprimé.
+
+### D-076 — La frontière de confiance est un descripteur, un format et un type
+
+**Contexte.** Cinq réaudits indépendants en lecture seule ont chacun trouvé des défauts
+réels après une CI verte. Le cinquième, sur `e43851e`, a reproduit **un P1, cinq P2 et
+douze P3**, et tous portaient sur le même endroit : la frontière entre ce qui est sur le
+disque et ce que le programme accepte de croire.
+
+Le P1 est le plus net. Rien ne validait le secret de signature. Un fichier vide, un
+retour à la ligne, un caractère, le mot `secret`, soixante-quatre caractères non
+hexadécimaux, cent mille caractères : tous acceptés, tous utilisés pour signer, tous
+vérifiés. Un corpus synthétique signé avec une telle clé atteignait
+`CRITERIA_MET_AWAITING_HUMAN_REVIEW`. Et une route ne demandait aucun adversaire : une
+première exécution interrompue entre la création exclusive et l'écriture laissait un
+fichier de zéro octet que chaque exécution suivante lisait comme une clé vide, pour
+toujours.
+
+**Décision.** Protocole **6**, preuve adaptateur **1**, schéma de reçu **4**, instant
+d'effet unique et littéral `2026-08-11T04:50:40+00:00`. Les preuves de protocole 5
+deviennent historiques non qualifiantes. `TheOddsApiProvider` reste
+`IMPLEMENTED_UNVERIFIED` ; le plafond machine reste
+`CRITERIA_MET_AWAITING_HUMAN_REVIEW` ; aucun statut global de vérification n'est créé.
+
+Neuf changements, chacun accompagné d'un test qui échoue sur `e43851e` :
+
+1. **Le secret est un format.** Exactement 64 caractères hexadécimaux minuscules, dans
+   le fichier comme dans la variable d'environnement. Pas de `strip()` — c'est lui qui
+   transformait `"\n"` en clé — pas de tolérance de casse, pas de longueur voisine. Un
+   secret existant invalide fait échouer l'opération **fermée** et n'est jamais réécrit :
+   le réécrire invaliderait silencieusement tous les reçus déjà signés, ce qui
+   transformerait la preuve d'un opérateur en bruit. Deux verbes séparés :
+   `load_receipt_secret` lit sans créer, `ensure_receipt_secret` crée — et seuls les
+   chemins qui vont signer l'appellent. La création est atomique : octets complets dans
+   un temporaire, `fchmod(0600)`, `fsync`, publication sans écrasement, `fsync` du
+   répertoire. Deux créateurs concurrents obtiennent la même clé complète.
+2. **Le répertoire est un descripteur.** Ouvert une fois, composant par composant, avec
+   `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` relativement au parent déjà sûr, validé par
+   `fstat`, conservé pour tout le cycle. Listing, lecture, publication, `link`,
+   `unlink`, quarantine et `fsync` passent par lui. Sans ces garanties du noyau, le
+   répertoire n'est pas lu.
+3. **La provenance est un type.** `audit_receipts` est le seul endroit où une signature
+   est vérifiée et le seul qui frappe un `VerifiedReceipt`. `qualification.evaluate` est
+   effectivement pur — aucun environnement, aucune horloge, aucun fichier, aucun HMAC —
+   et refuse une liste de mappings brute au lieu de la vérifier lui-même, ce qui est
+   exactement ce qui traînait le secret dans un module documenté comme pur.
+4. **Un intent avant le réseau.** Écrit et `fsync`-é avant chaque requête, résolu
+   seulement après la publication durable du reçu, bloquant tant qu'il subsiste,
+   idempotent au rapprochement, et dépourvu de clé, d'URL, d'événement en clair et de
+   payload. C'est la réponse au trou que la v5 laissait : cinq crédits engagés, la
+   publication en échec, et aucune trace qu'une requête avait été tentée.
+5. **Une erreur de persistance est un résultat métier.** Les cinq sites de publication
+   passent par un point unique qui rapporte, en JSON comme en texte, avec un code de
+   sortie non nul, l'identifiant de tentative, la commande, l'état d'atteinte, les
+   crédits comptabilisés et la nature de l'échec — assainis. Aucun `OSError` nu
+   n'atteint l'opérateur. La durabilité n'est plus supprimée, et l'ordre documenté est
+   l'ordre exécuté.
+6. **La commande est un domaine fermé.** `CommandState` à cinq valeurs. Seul `discover`
+   exact rapporte `DISCOVERY_ATTEMPTED` ; seuls `core` et `additional` entrent dans le
+   dénominateur payant ; `Core`, `" core "`, `sync`, `7` et un champ absent sont une
+   faute structurelle.
+7. **Six populations de coût.** Le seau « non établi » de la v5 affirmait dans son nom
+   une atteinte que deux de ses trois alimentations démentaient. Il est scindé, et les
+   deux moitiés bloquent.
+8. **Un reçu rejeté n'alimente aucun compteur sémantique.** Il alimente les raisons, les
+   populations, `rejected_receipt_credits_not_counted`, `rejected_paid_receipts` et un
+   recensement médico-légal distinct. La conséquence est énoncée : deux des six
+   populations de coût ne peuvent naître que d'un reçu hors contrat, donc elles restent à
+   zéro dans le recensement sémantique — le contrat structurel n'est pas affaibli pour
+   rendre un seau atteignable.
+9. **Le catalogue est vérifié dans les deux sens.** Contre les vrais chemins de commande,
+   pilotés par un transport factice. La v5 déclarait `discover/SCHEMA_MISMATCH` sans
+   producteur et ignorait `discover/COST_UNVERIFIED` et `discover/COST_MISMATCH`, que
+   `run_discovery` écrit par `_settle_cost` — un reçu honnête classé « couple inconnu »
+   faisait basculer un corpus entier en `EVIDENCE_CONFLICT`. La table contient
+   désormais **26 couples** et **30 formes**, dont **21** persistés et **5** non
+   persistés, et la quarantaine est exposée par
+   `receipts quarantine --name`.
+
+**Ce que cette décision n'établit pas.** Aucune preuve réelle n'existe sous protocole 6 :
+zéro appel fournisseur, zéro endpoint, zéro tentative, zéro crédit, zéro reçu utilisable.
+Un secret valide et une frontière tenue ne disent rien de la couverture d'un bookmaker ;
+ils disent seulement que ce que le programme affirme sur ses propres preuves peut être
+cru.

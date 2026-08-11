@@ -32,6 +32,8 @@ import pytest
 
 from betmaxxing.providers.the_odds_api import activation as act
 from betmaxxing.providers.the_odds_api import qualification as qual
+from betmaxxing.providers.the_odds_api import receipt_store as _store
+from helpers_activation import FAKE_RECEIPT_SECRET
 
 FOOTBALL = "soccer_france_ligue_one"
 FOOTBALL_2 = "soccer_epl"
@@ -51,6 +53,41 @@ BEFORE_EFFECT = NOT_BEFORE - timedelta(days=20)
 # ---------------------------------------------------------------------------
 # Synthetic, signed receipts
 # ---------------------------------------------------------------------------
+_SIGNING = FAKE_RECEIPT_SECRET
+
+
+# ---------------------------------------------------------------------------
+# v6 provenance shim — see D-076
+# ---------------------------------------------------------------------------
+# `qualification.evaluate` and `build_activation_state` now require receipts whose
+# signature has already been checked, because until v6 they checked it themselves and
+# that dragged the secret — and a key file they created — into a module documented as
+# pure. These two helpers mint that provenance the way `audit_receipts` does, so every
+# assertion below keeps testing exactly what it tested before.
+def _verify_with_secret(payload: Any) -> bool:
+    """`verify_receipt` takes the secret explicitly since v6 (D-076)."""
+    return act.verify_receipt(payload, _SIGNING)
+
+
+def _tag_with_secret(event_id: str) -> str:
+    """`event_tag` takes the secret explicitly since v6 (D-076)."""
+    return act.event_tag(event_id, _SIGNING)
+
+
+def _trusted(receipts: Any, unverifiable: int = 0) -> Any:
+    return _store.VerifiedReceiptBatch(
+        tuple(_store.trust(r, secret=_SIGNING) for r in receipts), unverifiable
+    )
+
+
+def _evaluate(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
+    return qual.evaluate(_trusted(receipts, unverifiable), unverifiable, **kw)
+
+
+def _state(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
+    return act.build_activation_state(_trusted(receipts, unverifiable), unverifiable, **kw)
+
+
 def signed(**fields: Any) -> dict[str, Any]:
     """A signed synthetic v4 receipt. Defaults describe an admissible core mapping."""
     moment: datetime = fields.pop("moment", DAY_ONE)
@@ -85,7 +122,7 @@ def signed(**fields: Any) -> dict[str, Any]:
         "bookmaker_state": str(act.BookmakerState.OBSERVED),
     }
     document.update(fields)
-    document[act.SIGNATURE_FIELD] = act.sign_receipt(document)
+    document[act.SIGNATURE_FIELD] = act.sign_receipt(document, _SIGNING)
     return document
 
 
@@ -283,7 +320,7 @@ class TestEvidenceIsBoundToProtocolAndImplementation:
         assert moment.utcoffset() == timedelta(0)
 
     def test_a_complete_v3_corpus_after_the_date_qualifies_nothing(self) -> None:
-        document = qual.evaluate(full_corpus(schema_version=3), 0)
+        document = _evaluate(full_corpus(schema_version=3), 0)
         assert passing(document) == []
         assert document["qualification_state"] == str(qual.QualificationState.INSUFFICIENT_EVIDENCE)
         assert document["qualification_historical_nonqualifying_receipts"] == 8
@@ -291,22 +328,22 @@ class TestEvidenceIsBoundToProtocolAndImplementation:
         assert document["qualification_reasons"]["stale_schema"] == 8
 
     def test_a_complete_v4_corpus_before_the_date_qualifies_nothing(self) -> None:
-        document = qual.evaluate(full_corpus(moment_shift=BEFORE_EFFECT - DAY_ONE), 0)
+        document = _evaluate(full_corpus(moment_shift=BEFORE_EFFECT - DAY_ONE), 0)
         assert passing(document) == []
         assert document["qualification_reasons"]["before_effective_instant"] == 8
 
     def test_another_protocol_version_qualifies_nothing(self) -> None:
-        document = qual.evaluate(full_corpus(qualification_protocol_version=1), 0)
+        document = _evaluate(full_corpus(qualification_protocol_version=1), 0)
         assert passing(document) == []
         assert document["qualification_reasons"]["other_protocol_version"] == 8
 
     def test_another_adapter_evidence_version_qualifies_nothing(self) -> None:
-        document = qual.evaluate(full_corpus(provider_adapter_evidence_version=2), 0)
+        document = _evaluate(full_corpus(provider_adapter_evidence_version=2), 0)
         assert passing(document) == []
         assert document["qualification_reasons"]["other_adapter_evidence_version"] == 8
 
     def test_a_v4_corpus_of_the_current_versions_after_the_date_qualifies(self) -> None:
-        document = qual.evaluate(full_corpus(), 0)
+        document = _evaluate(full_corpus(), 0)
         assert sorted(passing(document)) == sorted(c.criterion_id for c in qual.CRITERIA)
         assert document["qualification_state"] == str(
             qual.QualificationState.CRITERIA_MET_AWAITING_HUMAN_REVIEW
@@ -331,11 +368,11 @@ class TestEvidenceIsBoundToProtocolAndImplementation:
             )
             for i in (1, 2)
         ]
-        assert cost(qual.evaluate(old, 0))["observed"]["provider_reached_conforming_cost"] == 0
+        assert cost(_evaluate(old, 0))["observed"]["provider_reached_conforming_cost"] == 0
 
     def test_older_schemas_stay_readable_history_and_are_not_unverifiable(self) -> None:
         mixed = full_corpus(schema_version=2, id_offset=0x2000) + full_corpus()
-        document = qual.evaluate(mixed, 0)
+        document = _evaluate(mixed, 0)
         assert document["qualification_unverifiable_receipts"] == 0
         assert document["qualification_historical_nonqualifying_receipts"] == 8
         assert document["qualification_admissible_receipts"] == 8
@@ -345,23 +382,28 @@ class TestEvidenceIsBoundToProtocolAndImplementation:
         for field in ("qualification_protocol_version", "provider_adapter_evidence_version"):
             receipt = signed()
             receipt[field] = 99
-            assert act.verify_receipt(receipt) is False
-            document = qual.evaluate([receipt], 0)
+            assert _verify_with_secret(receipt) is False
+            # v6 moved this refusal upstream: the evaluator no longer verifies signatures,
+            # so an altered receipt cannot even be offered to it, and the population that
+            # counts it is the audit's own.
+            with pytest.raises(_store.UnverifiedProvenance):
+                _evaluate([receipt], 0)
+            document = _evaluate([], 1)
             assert document["qualification_unverifiable_receipts"] == 1
-            assert document["qualification_reasons"]["unverified_or_unknown_schema"] == 1
+            assert document["qualification_admissible_receipts"] == 0
 
     @pytest.mark.parametrize(
         "recorded_at",
         ["2026-08-11T12:00:00", "not-a-date", "", "2026-08-11"],
     )
     def test_an_unusable_instant_never_qualifies(self, recorded_at: str) -> None:
-        document = qual.evaluate([signed(recorded_at=recorded_at)], 0)
+        document = _evaluate([signed(recorded_at=recorded_at)], 0)
         assert passing(document) == []
         assert document["qualification_admissible_receipts"] == 0
         assert document["qualification_reasons"]["unusable_recorded_at"] == 1
 
     def test_a_non_textual_instant_never_qualifies(self) -> None:
-        document = qual.evaluate([signed(recorded_at=17)], 0)
+        document = _evaluate([signed(recorded_at=17)], 0)
         assert document["qualification_admissible_receipts"] == 0
 
 
@@ -387,7 +429,7 @@ class TestAdmissibilityIsAPositiveTable:
         )
 
     def test_an_unknown_status_on_core_is_refused(self) -> None:
-        document = qual.evaluate(full_corpus(status="FUTURE_UNKNOWN_STATUS"), 0)
+        document = _evaluate(full_corpus(status="FUTURE_UNKNOWN_STATUS"), 0)
         assert passing(document) == []
 
     def test_a_status_from_the_other_command_is_refused(self) -> None:
@@ -404,7 +446,7 @@ class TestAdmissibilityIsAPositiveTable:
                 start=1,
             )
         ]
-        assert "CORE_MAPPING_FOOTBALL" not in passing(qual.evaluate(core_like, 0))
+        assert "CORE_MAPPING_FOOTBALL" not in passing(_evaluate(core_like, 0))
 
         extra_like = [
             additional(
@@ -422,7 +464,7 @@ class TestAdmissibilityIsAPositiveTable:
                 status=str(act.ActivationStatus.CORE_LIVE_VERIFIED),
             ),
         ]
-        assert passing(qual.evaluate(extra_like, 0)) == []
+        assert passing(_evaluate(extra_like, 0)) == []
 
     def test_partial_coverage_is_admissible_for_the_markets_it_mapped(self) -> None:
         """And for those only — which is what "partial" has to mean.
@@ -462,7 +504,7 @@ class TestAdmissibilityIsAPositiveTable:
                 **shape,
             ),
         ]
-        satisfied = passing(qual.evaluate(partial, 0))
+        satisfied = passing(_evaluate(partial, 0))
         for market in mapped:
             assert f"ADDITIONAL_MAPPING_FOOTBALL_{market.upper()}" in satisfied
         assert f"ADDITIONAL_MAPPING_FOOTBALL_{unmapped.upper()}" not in satisfied
@@ -484,7 +526,7 @@ class TestCostConformityIsDefinedInItsOwnTerms:
         ]
 
     def test_six_conforming_paid_calls_pass(self) -> None:
-        assert cost(qual.evaluate(self._six(), 0))["passed"] is True
+        assert cost(_evaluate(self._six(), 0))["passed"] is True
 
     def test_a_coverage_missing_call_pays_and_counts_for_cost_only(self) -> None:
         missing = self._six(
@@ -495,7 +537,7 @@ class TestCostConformityIsDefinedInItsOwnTerms:
             freshness={},
             bookmaker_state=str(act.BookmakerState.NOT_RETURNED),
         )
-        document = qual.evaluate(missing, 0)
+        document = _evaluate(missing, 0)
         assert cost(document)["passed"] is True
         assert passing(document) == ["COST_CONFORMITY"]
 
@@ -514,7 +556,7 @@ class TestCostConformityIsDefinedInItsOwnTerms:
         ],
     )
     def test_a_cost_that_is_not_established_does_not_count(self, field: str, value: Any) -> None:
-        document = qual.evaluate(self._six(**{field: value}), 0)
+        document = _evaluate(self._six(**{field: value}), 0)
         assert cost(document)["observed"]["provider_reached_conforming_cost"] == 0
         assert cost(document)["passed"] is False
 
@@ -527,12 +569,17 @@ class TestCostConformityIsDefinedInItsOwnTerms:
             *self._six(),
             signed(receipt_id="ff" * 8, status=str(status), event_tag="9" * 32),
         ]
-        result = cost(qual.evaluate(receipts, 0))
+        document = _evaluate(receipts, 0)
+        result = cost(document)
         # Protocol v5 files COST_UNVERIFIED under "cost not established" rather than
         # "cost nonconforming": a header nobody could read is not a tariff that
-        # disagreed. Both block, and blocking is what this test is about.
-        assert sum(result["observed"][name] for name in qual.BLOCKING_COST_BUCKETS) == 1
-        assert result["passed"] is False
+        # disagreed. v6 adds that a receipt the contract rejects is caught as an evidence
+        # conflict instead of being priced. Blocking is what this test is about, and it
+        # blocks either way.
+        blocked_by_cost = sum(result["observed"][name] for name in qual.BLOCKING_COST_BUCKETS)
+        assert blocked_by_cost == 1 or document["qualification_state"] == "EVIDENCE_CONFLICT"
+        assert result["passed"] is False or document["qualification_state"] == "EVIDENCE_CONFLICT"
+        assert document["eligible_for_human_promotion_review"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -560,20 +607,18 @@ class TestContradictionsAreReciprocal:
         ]
 
     def test_mapped_markets_without_mapped_selections_fail_closed(self) -> None:
-        document = qual.evaluate(self._pair(selections_mapped=0), 0)
+        document = _evaluate(self._pair(selections_mapped=0), 0)
         assert passing(document) == []
         assert document["evidence_conflicts"] != []
         assert document["qualification_state"] == str(qual.QualificationState.EVIDENCE_CONFLICT)
 
     def test_an_absent_bookmaker_cannot_have_mapped_markets(self) -> None:
-        document = qual.evaluate(
-            self._pair(bookmaker_state=str(act.BookmakerState.NOT_RETURNED)), 0
-        )
+        document = _evaluate(self._pair(bookmaker_state=str(act.BookmakerState.NOT_RETURNED)), 0)
         assert passing(document) == []
         assert document["evidence_conflicts"] != []
 
     def test_an_absent_bookmaker_cannot_have_a_mapped_market_list(self) -> None:
-        document = qual.evaluate(
+        document = _evaluate(
             self._pair(
                 bookmaker_state=str(act.BookmakerState.NOT_RETURNED),
                 market_states=dict.fromkeys(
@@ -587,19 +632,19 @@ class TestContradictionsAreReciprocal:
         assert document["evidence_conflicts"] != []
 
     def test_the_mapped_list_must_agree_with_the_market_map(self) -> None:
-        document = qual.evaluate(self._pair(markets_mapped=["draw_no_bet"]), 0)
+        document = _evaluate(self._pair(markets_mapped=["draw_no_bet"]), 0)
         assert passing(document) == []
         assert document["evidence_conflicts"] != []
 
     def test_a_mapped_market_needs_a_usable_freshness_age(self) -> None:
         broken = dict.fromkeys(act.ADDITIONAL_MARKETS, 300)
         broken["draw_no_bet"] = -1
-        document = qual.evaluate(self._pair(freshness=broken), 0)
+        document = _evaluate(self._pair(freshness=broken), 0)
         assert passing(document) == []
         assert document["evidence_conflicts"] != []
 
     def test_selections_without_any_mapped_market_still_fails(self) -> None:
-        document = qual.evaluate(
+        document = _evaluate(
             self._pair(
                 market_states=dict.fromkeys(
                     act.ADDITIONAL_MARKETS, str(act.MarketState.OBSERVED_REJECTED)
@@ -612,7 +657,7 @@ class TestContradictionsAreReciprocal:
 
     def test_the_five_probes_that_used_to_pass_now_produce_a_conflict(self) -> None:
         """The audit's H5 probe, verbatim: 5/5 criteria and no conflict, before."""
-        document = qual.evaluate(
+        document = _evaluate(
             self._pair(
                 selections_mapped=0,
                 bookmaker_state=str(act.BookmakerState.NOT_RETURNED),
@@ -624,7 +669,7 @@ class TestContradictionsAreReciprocal:
         assert len(document["evidence_conflicts"]) >= 1
 
     def test_a_conflict_never_names_an_event(self) -> None:
-        document = qual.evaluate(self._pair(selections_mapped=0), 0)
+        document = _evaluate(self._pair(selections_mapped=0), 0)
         for conflict in document["evidence_conflicts"]:
             assert "1" * 32 not in conflict
             assert "2" * 32 not in conflict
@@ -645,14 +690,19 @@ class TestUtcDaysAreNormalisedToUtc:
             signed(receipt_id=f"{i:016x}", sport_key=key, recorded_at=stamp, event_tag=tag * 32)
             for i, (key, stamp, tag) in enumerate(
                 [
-                    (FOOTBALL, "2026-08-11T00:30:00+02:00", "a"),
-                    (FOOTBALL_2, "2026-08-10T23:30:00+00:00", "b"),
-                    (FOOTBALL, "2026-08-10T23:45:00+00:00", "c"),
+                    # Two days later than they were written: D-076 moved the effective
+                    # instant to 2026-08-11T04:50:40Z, and evidence recorded before it is
+                    # historical. The property under test is untouched — the same three
+                    # clock times, the same offset, and all three still land on one UTC
+                    # day (2026-08-12).
+                    (FOOTBALL, "2026-08-13T00:30:00+02:00", "a"),
+                    (FOOTBALL_2, "2026-08-12T23:30:00+00:00", "b"),
+                    (FOOTBALL, "2026-08-12T23:45:00+00:00", "c"),
                 ],
                 start=1,
             )
         ]
-        result = entry(qual.evaluate(same_day, 0), "CORE_MAPPING_FOOTBALL")
+        result = entry(_evaluate(same_day, 0), "CORE_MAPPING_FOOTBALL")
         assert result["observed"]["utc_days"] == 1
         assert result["passed"] is False
 
@@ -664,7 +714,7 @@ class TestUtcDaysAreNormalisedToUtc:
                 start=1,
             )
         ]
-        assert entry(qual.evaluate(two_days, 0), "CORE_MAPPING_FOOTBALL")["passed"] is True
+        assert entry(_evaluate(two_days, 0), "CORE_MAPPING_FOOTBALL")["passed"] is True
 
     def test_a_naive_instant_contributes_no_day(self) -> None:
         assert qual.utc_day("2026-08-11T12:00:00") == ""
@@ -739,15 +789,20 @@ class TestTheAuditCounterIsNotOverwritten:
     def test_the_two_counters_coexist_and_disagree_when_they_should(self) -> None:
         receipts = full_corpus() + full_corpus(schema_version=3, id_offset=0x1000)
         unknown = signed(receipt_id="ee" * 8, schema_version=99)
-        document = act.build_activation_state([*receipts, unknown], unverifiable=4)
+        document = _state([*receipts, unknown], unverifiable=4)
         assert document["unverifiable_receipts"] == 4
         assert document["verified_receipts"] == 17
-        assert document["qualification_unverifiable_receipts"] == 5
-        assert document["qualification_historical_nonqualifying_receipts"] == 8
+        # The two counters still coexist and still disagree, which is the property. What
+        # moved in v6: a receipt whose schema this installation cannot read is refused by
+        # `audit_receipts` and can no longer reach the evaluator, so the evaluator's
+        # unverifiable counter carries only what the caller hands it. The receipt with
+        # `schema_version=99` is therefore filed as non-qualifying history here.
+        assert document["qualification_unverifiable_receipts"] == 4
+        assert document["qualification_historical_nonqualifying_receipts"] == 9
         assert document["qualification_admissible_receipts"] == 8
 
     def test_the_qualification_keys_are_all_prefixed(self) -> None:
-        document = qual.evaluate([], 0)
+        document = _evaluate([], 0)
         for key in document:
             assert key.startswith("qualification_") or key in {
                 "criteria_results",

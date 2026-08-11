@@ -38,6 +38,7 @@ import pytest
 
 from betmaxxing.providers.the_odds_api import activation as act
 from betmaxxing.providers.the_odds_api import qualification as qual
+from betmaxxing.providers.the_odds_api import receipt_store as _store
 
 #: Pinned literally, exactly as D-075 and the protocol publish it.
 EFFECTIVE_INSTANT = "2026-08-10T14:00:37+00:00"
@@ -57,6 +58,44 @@ SCRUB_SECRET = "ab" * 32
 #: A value that is not a boolean, in every shape a JSON file can carry.
 NOT_A_BOOLEAN: list[Any] = [None, "false", "true", 0, 1, [], {}]
 ABSENT = object()
+
+
+# `SCRUB_SECRET` is the *API key* this suite checks for redaction; the receipts are
+# signed with the injected receipt secret the `workspace` fixture installs, which is what
+# `audit_receipts` verifies them against.
+from helpers_activation import FAKE_RECEIPT_SECRET as _SIGNING  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# v6 provenance shim — see D-076
+# ---------------------------------------------------------------------------
+# `qualification.evaluate` and `build_activation_state` now require receipts whose
+# signature has already been checked, because until v6 they checked it themselves and
+# that dragged the secret — and a key file they created — into a module documented as
+# pure. These two helpers mint that provenance the way `audit_receipts` does, so every
+# assertion below keeps testing exactly what it tested before.
+def _verify_with_secret(payload: Any) -> bool:
+    """`verify_receipt` takes the secret explicitly since v6 (D-076)."""
+    return act.verify_receipt(payload, _SIGNING)
+
+
+def _tag_with_secret(event_id: str) -> str:
+    """`event_tag` takes the secret explicitly since v6 (D-076)."""
+    return act.event_tag(event_id, _SIGNING)
+
+
+def _trusted(receipts: Any, unverifiable: int = 0) -> Any:
+    return _store.VerifiedReceiptBatch(
+        tuple(_store.trust(r, secret=_SIGNING) for r in receipts), unverifiable
+    )
+
+
+def _evaluate(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
+    return qual.evaluate(_trusted(receipts, unverifiable), unverifiable, **kw)
+
+
+def _state(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
+    return act.build_activation_state(_trusted(receipts, unverifiable), unverifiable, **kw)
 
 
 @pytest.fixture(autouse=True)
@@ -112,7 +151,7 @@ def core(**over: Any) -> dict[str, Any]:
     document.update(over)
     for name in drop:
         document.pop(name, None)
-    document[act.SIGNATURE_FIELD] = act.sign_receipt(document)
+    document[act.SIGNATURE_FIELD] = act.sign_receipt(document, _SIGNING)
     return document
 
 
@@ -257,22 +296,26 @@ def with_flag(make: Any, field: str, value: Any, **over: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 class TestTheProtocolIsVersionFive:
     def test_the_versioned_constants(self) -> None:
-        assert qual.PROVIDER_VALIDATION_PROTOCOL_VERSION == 5
+        """The pins that v5 introduced and v6 keeps. The protocol number itself is
+        pinned exactly once, by the current suite, so a bump lands in one place."""
+        assert qual.PROVIDER_VALIDATION_PROTOCOL_VERSION >= 5
         assert qual.PROVIDER_ADAPTER_EVIDENCE_VERSION == 1
         assert qual.QUALIFYING_SCHEMA_VERSION == 4
         assert act.RECEIPT_SCHEMA_VERSION == 4
         assert qual.PROTOCOL_MAX_ODDS_AGE_SECONDS == 900
 
-    def test_the_effective_instant_is_the_published_literal(self) -> None:
-        assert qual.QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC == EFFECTIVE_INSTANT
+    def test_the_effective_instant_has_advanced_since_this_protocol(self) -> None:
+        """D-075's instant is history. What matters here is that it moved forward."""
+        current = datetime.fromisoformat(qual.QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC)
+        assert current >= datetime.fromisoformat(EFFECTIVE_INSTANT)
 
     def test_protocol_four_evidence_is_now_historical(self) -> None:
-        document = qual.evaluate(threshold_corpus(qualification_protocol_version=4), 0)
+        document = _evaluate(threshold_corpus(qualification_protocol_version=4), 0)
         assert passing(document) == []
         assert document["qualification_reasons"]["other_protocol_version"] == 8
 
     def test_a_current_well_formed_corpus_still_reaches_the_gate(self) -> None:
-        document = qual.evaluate(threshold_corpus(), 0)
+        document = _evaluate(threshold_corpus(), 0)
         assert passing(document) == sorted(c.criterion_id for c in qual.CRITERIA)
         assert document["eligible_for_human_promotion_review"] is True
         assert document["qualification_state"] == str(
@@ -326,7 +369,7 @@ class TestPositiveProofRequiresAnEstablishedReach:
     ) -> None:
         write_all(workspace, [with_flag(core, "may_have_reached_provider", value)])
         receipts, unverifiable = act.audit_receipts()
-        document = act.build_activation_state(receipts, unverifiable)
+        document = _state(receipts, unverifiable)
         assert document["bookmaker_coverage_observations"] == []
         assert document["mapping_freshness_proof"] == str(act.MappingProof.NOT_OBTAINED_LIVE)
         assert document["paid_activation_state"] != str(
@@ -341,7 +384,7 @@ class TestPositiveProofRequiresAnEstablishedReach:
         satisfied by a separate, honest population.
         """
         corpus = [*threshold_corpus(may_have_reached_provider=False), *six_conforming_costs()]
-        document = qual.evaluate(corpus, 0)
+        document = _evaluate(corpus, 0)
         assert document["eligible_for_human_promotion_review"] is False
         assert [
             c
@@ -356,7 +399,7 @@ class TestPositiveProofRequiresAnEstablishedReach:
                 assert entry(document, criterion.criterion_id)["observed"]["events"] == 0
         write_all(workspace, corpus)
         receipts, unverifiable = act.audit_receipts()
-        state = act.build_activation_state(receipts, unverifiable)
+        state = _state(receipts, unverifiable)
         assert state["eligible_for_human_promotion_review"] is False
         assert state["mapping_freshness_proof"] == str(act.MappingProof.NOT_OBTAINED_LIVE)
 
@@ -414,7 +457,7 @@ class TestTheAttemptStateHasThreeValues:
     ) -> None:
         write_all(workspace, [with_flag(core, "network_attempted", value)])
         receipts, unverifiable = act.audit_receipts()
-        document = act.build_activation_state(receipts, unverifiable)
+        document = _state(receipts, unverifiable)
         assert document["execution_state"] == str(
             act.ExecutionState.NETWORK_ATTEMPT_STATE_UNESTABLISHED
         )
@@ -429,17 +472,26 @@ class TestTheAttemptStateHasThreeValues:
     def test_the_published_population_never_says_a_real_attempt(self, workspace: Path) -> None:
         write_all(workspace, [core()])
         receipts, unverifiable = act.audit_receipts()
-        document = act.build_activation_state(receipts, unverifiable)
+        document = _state(receipts, unverifiable)
         label = document["paid_call_cost_census_population"]
         assert "réelle" not in label and "reelle" not in label
         assert "confirmée" in label or "confirmee" in label
 
     def test_an_unestablished_state_still_blocks_and_stays_visible(self) -> None:
+        """It blocks and it is visible. D-076 moved *where* it is visible.
+
+        An absent `network_attempted` is outside the structural contract, and since v6 a
+        receipt the contract rejects feeds no semantic counter — so it is counted in the
+        forensic census and named as an evidence conflict instead of being priced. It is
+        still impossible to miss, and the gate is still shut.
+        """
         unestablished = core(drop=("network_attempted",))
-        document = qual.evaluate([*six_conforming_costs(), unestablished], 0)
-        observed = cost_of(document)["observed"]
-        assert observed["paid_attempt_state_unestablished"] == 1
-        assert cost_of(document)["passed"] is False
+        document = _state([*six_conforming_costs(), unestablished], 0)
+        assert document["rejected_paid_cost_census"]["paid_attempt_state_unestablished"] == 1
+        assert document["rejected_paid_receipts"] == 1
+        assert document["qualification_state"] == "EVIDENCE_CONFLICT"
+        assert document["eligible_for_human_promotion_review"] is False
+        assert document["execution_state"] != "NO_NETWORK_ATTEMPTED"
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +659,7 @@ class TestThePaidStateIsSymmetric:
         over = dict(next(o for name, o in paid_state_rows(command) if name == label))
         write_all(workspace, [core(**over)])
         receipts, unverifiable = act.audit_receipts()
-        document = act.build_activation_state(receipts, unverifiable)
+        document = _state(receipts, unverifiable)
         observed = document["paid_activation_state"]
         expected = EXPECTED_PAID_STATE[label]
         if expected == "COVERAGE_ANSWERED":
@@ -628,7 +680,7 @@ class TestThePaidStateIsSymmetric:
         over = dict(next(o for name, o in paid_state_rows("additional") if name == "AUTH_FAILED"))
         write_all(workspace, [core(**over)])
         receipts, unverifiable = act.audit_receipts()
-        document = act.build_activation_state(receipts, unverifiable)
+        document = _state(receipts, unverifiable)
         assert document["paid_activation_state"] == str(
             act.PaidActivationState.PAID_ATTEMPT_INCONCLUSIVE
         )
@@ -639,7 +691,7 @@ class TestThePaidStateIsSymmetric:
         )
         write_all(workspace, [core(receipt_id="d1" * 8, **inconclusive)])
         receipts, unverifiable = act.audit_receipts()
-        assert act.build_activation_state(receipts, unverifiable)["paid_activation_state"] != str(
+        assert _state(receipts, unverifiable)["paid_activation_state"] != str(
             act.PaidActivationState.ADDITIONAL_EXECUTED
         )
 
@@ -711,7 +763,7 @@ class TestAPositiveStatusIsNeverEmpty:
         assert qual.structural_faults(receipt) != []
 
     def test_a_malformed_receipt_feeds_no_conforming_cost(self) -> None:
-        document = qual.evaluate([core(selections_mapped="3")], 0)
+        document = _evaluate([core(selections_mapped="3")], 0)
         assert cost_of(document)["observed"]["provider_reached_conforming_cost"] == 0
 
 
@@ -773,7 +825,7 @@ class TestExactCopiesChangeNothingSemantic:
                 names=[f"copy-{i:02d}.json" for i in range(count)],
             )
             receipts, unverifiable = act.audit_receipts()
-            document = act.build_activation_state(receipts, unverifiable)
+            document = _state(receipts, unverifiable)
             snapshots.append(
                 {
                     **{k: document[k] for k in SEMANTIC_KEYS},
@@ -795,7 +847,7 @@ class TestExactCopiesChangeNothingSemantic:
                 names=[f"copy-{i:02d}.json" for i in range(count)],
             )
             receipts, unverifiable = act.audit_receipts()
-            document = act.build_activation_state(receipts, unverifiable)
+            document = _state(receipts, unverifiable)
             seen.append(
                 (
                     document["verified_receipts"],
@@ -808,7 +860,7 @@ class TestExactCopiesChangeNothingSemantic:
         one = core(receipt_id="cc" * 8)
         write_all(workspace, [dict(one) for _ in range(9)], names=[f"c-{i}.json" for i in range(9)])
         receipts, unverifiable = act.audit_receipts()
-        document = act.build_activation_state(receipts, unverifiable)
+        document = _state(receipts, unverifiable)
         assert entry(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 1
         assert cost_of(document)["observed"]["provider_reached_conforming_cost"] == 1
         assert document["accounted_credits_total"] == 1
@@ -820,16 +872,34 @@ class TestExactCopiesChangeNothingSemantic:
 COST_KEYS = [
     "provider_reached_conforming_cost",
     "provider_reached_nonconforming_cost",
-    "provider_reached_unestablished_cost",
+    "provider_reached_cost_unestablished",
     "paid_attempt_state_unestablished",
     "confirmed_attempts_not_sent",
 ]
 
 
 class TestTheCostTaxonomyIsVersionFive:
-    def test_the_five_published_buckets(self) -> None:
-        document = qual.evaluate([core()], 0)
-        assert sorted(cost_of(document)["observed"]) == sorted(COST_KEYS)
+    def test_the_buckets_v5_introduced_are_still_published(self) -> None:
+        """Four of v5's five names survive verbatim; the fifth was split by D-076.
+
+        `provider_reached_unestablished_cost` asserted an established reach that two of
+        its three feeders denied, so it became `provider_reached_cost_unestablished` and
+        `provider_reach_unestablished`. Both block, which is what v5 required of it.
+        """
+        document = _evaluate([core()], 0)
+        published = set(cost_of(document)["observed"])
+        for kept in (
+            "provider_reached_conforming_cost",
+            "provider_reached_nonconforming_cost",
+            "paid_attempt_state_unestablished",
+            "confirmed_attempts_not_sent",
+        ):
+            assert kept in published
+        assert {"provider_reached_cost_unestablished", "provider_reach_unestablished"} <= published
+        assert "provider_reached_unestablished_cost" not in published
+        assert {"provider_reached_cost_unestablished", "provider_reach_unestablished"} <= set(
+            qual.BLOCKING_COST_BUCKETS
+        )
 
     def test_cost_unverified_is_unestablished_not_nonconforming(self) -> None:
         receipt = unclassified(
@@ -837,7 +907,7 @@ class TestTheCostTaxonomyIsVersionFive:
             observed_credits=None,
             accounted_credits=1,
         )
-        assert qual.cost_category(receipt) == "provider_reached_unestablished_cost"
+        assert qual.cost_category(receipt) == "provider_reached_cost_unestablished"
 
     def test_cost_mismatch_is_nonconforming(self) -> None:
         receipt = unclassified(
@@ -878,7 +948,7 @@ class TestTheCostTaxonomyIsVersionFive:
                 accounted_credits=0,
             ),
         ]
-        result = cost_of(qual.evaluate(corpus, 0))
+        result = cost_of(_evaluate(corpus, 0))
         assert result["observed"]["confirmed_attempts_not_sent"] == 1
         assert result["passed"] is True
 
@@ -912,8 +982,16 @@ class TestTheCostTaxonomyIsVersionFive:
         ],
     )
     def test_each_blocking_bucket_blocks(self, label: str, make: Any) -> None:
-        document = qual.evaluate([*six_conforming_costs(), make()], 0)
-        assert cost_of(document)["passed"] is False, label
+        receipt = make()
+        document = _state([*six_conforming_costs(), receipt], 0)
+        # Two roads to the same shut gate since D-076: a receipt the contract can read is
+        # priced into a blocking bucket, one it rejects is an evidence conflict. What may
+        # never happen is that it passes.
+        if qual.classify(receipt) == "":
+            assert cost_of(document)["passed"] is False, label
+        else:
+            assert document["qualification_state"] == "EVIDENCE_CONFLICT", label
+        assert document["eligible_for_human_promotion_review"] is False, label
 
     def test_exactly_one_bucket_per_paid_step(self) -> None:
         statuses = [
@@ -940,12 +1018,18 @@ class TestTheCostTaxonomyIsVersionFive:
                             fields[name] = value
                     fields["drop"] = tuple(drop)
                     receipt = unclassified(**fields)
-                    document = qual.evaluate([receipt], 0)
+                    document = _evaluate([receipt], 0)
                     observed = cost_of(document)["observed"]
                     total = sum(observed.values())
                     state = qual.attempt_state(receipt)
-                    expected = 0 if state is qual.AttemptState.NOT_ATTEMPTED else 1
+                    readable = qual.classify(receipt) == ""
+                    expected = 0 if state is qual.AttemptState.NOT_ATTEMPTED or not readable else 1
                     assert total == expected, (status, network, reach, observed)
+                    # Exhaustive and disjoint remains a property of the taxonomy itself,
+                    # which is a pure function of the receipt — D-076 only changed which
+                    # receipts the *census* is allowed to speak about.
+                    if state is not qual.AttemptState.NOT_ATTEMPTED:
+                        assert qual.cost_category(receipt) in qual.COST_BUCKETS
 
     def test_a_response_asserting_status_not_sent_is_contradictory(self) -> None:
         for status in (
@@ -969,8 +1053,8 @@ class TestTheCostTaxonomyIsVersionFive:
             assert qual.classify(receipt) == "self_contradictory", status
 
     def test_the_pass_rule(self) -> None:
-        assert cost_of(qual.evaluate(six_conforming_costs(), 0))["passed"] is True
-        assert cost_of(qual.evaluate(six_conforming_costs()[:5], 0))["passed"] is False
+        assert cost_of(_evaluate(six_conforming_costs(), 0))["passed"] is True
+        assert cost_of(_evaluate(six_conforming_costs()[:5], 0))["passed"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -983,7 +1067,7 @@ class TestMappingAndCostAreIndependentAxes:
         assert qual.cost_category(receipt) != "provider_reached_conforming_cost"
 
     def test_an_out_of_ceiling_cost_blocks_the_gate(self) -> None:
-        document = qual.evaluate(threshold_corpus(observed_credits=9, accounted_credits=9), 0)
+        document = _evaluate(threshold_corpus(observed_credits=9, accounted_credits=9), 0)
         assert document["eligible_for_human_promotion_review"] is False
         assert cost_of(document)["passed"] is False
 
@@ -1054,9 +1138,9 @@ class TestPublicationIsAtomic:
         payload = unsigned(receipt_id="d5" * 8)
         first = act.write_receipt(dict(payload))
         first.write_text("", encoding="utf-8")
-        quarantined = act.quarantine_incomplete_receipt(first)
-        assert quarantined.exists()
-        assert quarantined.parent == workspace
+        # D-076: a basename of the authorised directory, never a path.
+        quarantined = act.quarantine_incomplete_receipt(first.name)
+        assert (workspace / quarantined).exists()
         again = act.write_receipt(dict(payload))
         assert again.stat().st_size > 0
         assert act.audit_receipts()[0][0]["receipt_id"] == "d5" * 8
@@ -1133,13 +1217,13 @@ class TestNoLinkIsFollowedAtOpenTime:
         assert fired["n"] == 1
         assert target.is_symlink()
         assert SENTINEL not in jsonlib.dumps(receipts, default=str)
-        assert receipts == []
+        assert list(receipts) == []
         assert unverifiable == 1
 
     def test_a_directory_named_json_is_counted(self, workspace: Path) -> None:
         (workspace / "folder.json").mkdir(parents=True, exist_ok=True)
         receipts, unverifiable = act.audit_receipts()
-        assert receipts == [] and unverifiable == 1
+        assert list(receipts) == [] and unverifiable == 1
 
     def test_write_refuses_a_symbolic_target_without_reading_it(self, workspace: Path) -> None:
         workspace.mkdir(parents=True, exist_ok=True)
@@ -1156,8 +1240,11 @@ class TestNoLinkIsFollowedAtOpenTime:
         workspace.mkdir(parents=True, exist_ok=True)
         planted = foreign_file(workspace, "planted.secret", "ff" * 32)
         os.symlink(planted, workspace / act.SECRET_FILENAME)
-        with pytest.raises(act.Refused):
-            act.read_secret_file(workspace / act.SECRET_FILENAME)
+        # The environment wins when it is set, so it is removed: the property under test
+        # is about the *file*, and D-076 reads it through the same guarded primitive.
+        os.environ.pop(act.SECRET_VARIABLE, None)
+        with pytest.raises(_store.StoreRefused):
+            act.load_receipt_secret()
 
     def test_no_foreign_path_or_content_reaches_the_output(self, workspace: Path) -> None:
         from helpers_activation import run
@@ -1244,11 +1331,21 @@ PRODUCIBLE: list[tuple[str, str, str, dict[str, Any]]] = [
         "DISCOVERED",
         {**DISC, "event_tags": [], "events_admissible": 0},
     ),
+    # `discover/SCHEMA_MISMATCH` was declared producible here and no producer wrote it:
+    # `_event_of` and `_check_start_time`, the two functions that raise it, are reached
+    # from `run_core` and `run_additional` only. D-076 removed it from the table and added
+    # the two couples `run_discovery` really does write through `_settle_cost`.
     (
         "discover",
-        "SCHEMA_MISMATCH",
+        "COST_UNVERIFIED",
         "DISCOVERED",
-        {**DISC, "event_tags": [], "events_admissible": 0},
+        {**DISC, "observed": None},
+    ),
+    (
+        "discover",
+        "COST_MISMATCH",
+        "DISCOVERED",
+        {**DISC, "observed": 3},
     ),
     (
         "discover",
@@ -1376,7 +1473,7 @@ def produced(command: str, status: str, over: dict[str, Any]) -> dict[str, Any]:
     document = act.build_receipt(
         attempt_for(command, **over), act.ActivationStatus(status), SCRUB_SECRET
     )
-    document[act.SIGNATURE_FIELD] = act.sign_receipt(document)
+    document[act.SIGNATURE_FIELD] = act.sign_receipt(document, _SIGNING)
     return document
 
 
@@ -1404,8 +1501,11 @@ class TestTheTableIsFullyExercised:
             assert len(phases) == len(qual.RECEIPT_PHASES[(command, status)]), (command, status)
 
     def test_the_published_inventory_matches(self) -> None:
-        assert len(qual.RECEIPT_PHASES) == 25
-        assert len(PRODUCIBLE) == 29
+        # D-076 removed `discover/SCHEMA_MISMATCH`, which no producer wrote, and added
+        # the two cost couples `run_discovery` really does write.
+        assert len(qual.RECEIPT_PHASES) == 26
+        assert len(PRODUCIBLE) == 30
+        assert (qual.RECEIPT_COUPLE_COUNT, qual.RECEIPT_FORM_COUNT) == (26, 30)
 
     def test_an_unknown_producible_status_is_named_not_guessed(self) -> None:
         receipt = core(status="FUTURE_UNKNOWN_STATUS")
@@ -1420,7 +1520,7 @@ class TestTheTableIsFullyExercised:
             document = produced(command, status, over)
             document["receipt_id"] = f"{index:016x}"
             document[act.SIGNATURE_FIELD] = act.sign_receipt(
-                {k: v for k, v in document.items() if k != act.SIGNATURE_FIELD}
+                {k: v for k, v in document.items() if k != act.SIGNATURE_FIELD}, _SIGNING
             )
             receipts.append(document)
         write_all(workspace, receipts)
@@ -1446,14 +1546,14 @@ class TestMalformedReceiptsFeedNoSemanticCounter:
             ],
         )
         receipts, unverifiable = act.audit_receipts()
-        document = act.build_activation_state(receipts, unverifiable)
+        document = _state(receipts, unverifiable)
         assert document["accounted_credits_total"] == 2
         assert document["rejected_receipt_credits_not_counted"] == 7
 
     def test_the_two_credit_fields_are_named_apart(self, workspace: Path) -> None:
         write_all(workspace, [core()])
         receipts, unverifiable = act.audit_receipts()
-        document = act.build_activation_state(receipts, unverifiable)
+        document = _state(receipts, unverifiable)
         assert "rejected" in "rejected_receipt_credits_not_counted"
         assert document["accounted_credits_total"] == 1
         assert document["rejected_receipt_credits_not_counted"] == 0
@@ -1462,7 +1562,7 @@ class TestMalformedReceiptsFeedNoSemanticCounter:
     def test_a_mistyped_credit_is_never_summed(self, workspace: Path, value: Any) -> None:
         write_all(workspace, [core(accounted_credits=value)])
         receipts, unverifiable = act.audit_receipts()
-        document = act.build_activation_state(receipts, unverifiable)
+        document = _state(receipts, unverifiable)
         assert document["accounted_credits_total"] == 0
 
 
@@ -1508,61 +1608,8 @@ def current_sections(path: Path) -> str:
     return "\n".join(out)
 
 
-class TestTheDocumentsPublishOneNorm:
-    def test_the_protocol_document_states_the_current_version_once(self) -> None:
-        text = current_sections(Path("docs/provider-validation-protocol.md"))
-        assert "PROVIDER_VALIDATION_PROTOCOL_VERSION = 5" in text
-        assert "PROVIDER_VALIDATION_PROTOCOL_VERSION = 4" not in text
-        assert EFFECTIVE_INSTANT in text
-        for stale in SUPERSEDED_INSTANTS:
-            assert stale not in text, stale
-
-    @pytest.mark.parametrize("document", CURRENT_DOCUMENTS)
-    def test_no_current_section_publishes_a_superseded_instant(self, document: str) -> None:
-        text = current_sections(Path(document))
-        for stale in SUPERSEDED_INSTANTS:
-            assert stale not in text, (document, stale)
-
-    def test_the_history_is_still_readable(self) -> None:
-        """Superseded numbers must survive where they are the subject."""
-        whole = Path("docs/provider-validation-protocol.md").read_text(encoding="utf-8")
-        assert "### 0.3 Puis la v4 a été auditée à son tour" in whole
-        decisions = Path("docs/decisions.md").read_text(encoding="utf-8")
-        for stale in SUPERSEDED_INSTANTS:
-            assert stale in decisions, stale
-        assert "Supersédée pour la qualification par D-075" in decisions
-
-    def test_the_new_decision_exists_and_names_its_three_versions(self) -> None:
-        decisions = Path("docs/decisions.md").read_text(encoding="utf-8")
-        assert "### D-075 —" in decisions
-        assert "**Protocole 5, adaptateur 1, schéma 4.**" in decisions
-        assert EFFECTIVE_INSTANT in decisions
-
-    @pytest.mark.parametrize(
-        "term",
-        [
-            "may_have_reached_provider",
-            "CONFIRMED_ATTEMPT",
-            "ATTEMPT_STATE_UNESTABLISHED",
-            "confirmed_attempts_not_sent",
-            "provider_reached_conforming_cost",
-            "ADDITIONAL_EXECUTED",
-            "O_NOFOLLOW",
-        ],
-    )
-    def test_the_protocol_publishes_every_new_notion(self, term: str) -> None:
-        """A rule the code enforces and no document states is not a published rule."""
-        text = Path("docs/provider-validation-protocol.md").read_text(encoding="utf-8")
-        assert term in text, term
-
-    def test_the_dictionary_names_both_credit_fields(self) -> None:
-        text = Path("docs/data-dictionary.md").read_text(encoding="utf-8")
-        assert "accounted_credits_total" in text
-        assert "rejected_receipt_credits_not_counted" in text
-
-    def test_the_machine_ceiling_is_still_published(self) -> None:
-        """No document may promise more than the evaluator can conclude."""
-        for name in ("docs/provider-validation-protocol.md", "docs/decisions.md"):
-            text = Path(name).read_text(encoding="utf-8")
-            assert "CRITERIA_MET_AWAITING_HUMAN_REVIEW" in text, name
-        assert "VERIFIED" not in {str(state) for state in qual.QualificationState}
+# ---------------------------------------------------------------------------
+# `TestTheDocumentsPublishOneNorm` **moved** to `test_qualification_v6_contract.py`.
+# It asserts the norm of the *current* protocol: exactly one suite may do that, and it
+# must be the current one. The same move happened from v4 to v5 under D-075.
+# ---------------------------------------------------------------------------

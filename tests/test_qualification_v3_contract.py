@@ -31,6 +31,8 @@ import pytest
 
 from betmaxxing.providers.the_odds_api import activation as act
 from betmaxxing.providers.the_odds_api import qualification as qual
+from betmaxxing.providers.the_odds_api import receipt_store as _store
+from helpers_activation import FAKE_RECEIPT_SECRET
 
 #: The instant D-073 published, kept as the historical literal it is. This module
 #: guards the v3 closures, which are unchanged; the *current* effective instant is
@@ -48,6 +50,41 @@ D1 = datetime(2026, 8, 11, 12, tzinfo=UTC)
 D2 = datetime(2026, 8, 12, 12, tzinfo=UTC)
 D3 = datetime(2026, 8, 13, 12, tzinfo=UTC)
 MARKETS = list(act.ADDITIONAL_MARKETS)
+
+
+_SIGNING = FAKE_RECEIPT_SECRET
+
+
+# ---------------------------------------------------------------------------
+# v6 provenance shim — see D-076
+# ---------------------------------------------------------------------------
+# `qualification.evaluate` and `build_activation_state` now require receipts whose
+# signature has already been checked, because until v6 they checked it themselves and
+# that dragged the secret — and a key file they created — into a module documented as
+# pure. These two helpers mint that provenance the way `audit_receipts` does, so every
+# assertion below keeps testing exactly what it tested before.
+def _verify_with_secret(payload: Any) -> bool:
+    """`verify_receipt` takes the secret explicitly since v6 (D-076)."""
+    return act.verify_receipt(payload, _SIGNING)
+
+
+def _tag_with_secret(event_id: str) -> str:
+    """`event_tag` takes the secret explicitly since v6 (D-076)."""
+    return act.event_tag(event_id, _SIGNING)
+
+
+def _trusted(receipts: Any, unverifiable: int = 0) -> Any:
+    return _store.VerifiedReceiptBatch(
+        tuple(_store.trust(r, secret=_SIGNING) for r in receipts), unverifiable
+    )
+
+
+def _evaluate(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
+    return qual.evaluate(_trusted(receipts, unverifiable), unverifiable, **kw)
+
+
+def _state(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
+    return act.build_activation_state(_trusted(receipts, unverifiable), unverifiable, **kw)
 
 
 def core(**over: Any) -> dict[str, Any]:
@@ -88,7 +125,7 @@ def core(**over: Any) -> dict[str, Any]:
     document.update(over)
     for name in drop:
         document.pop(name, None)
-    document[act.SIGNATURE_FIELD] = act.sign_receipt(document)
+    document[act.SIGNATURE_FIELD] = act.sign_receipt(document, _SIGNING)
     return document
 
 
@@ -196,12 +233,12 @@ class TestTheProtocolIsVersionThree:
         assert current >= datetime.fromisoformat(D073_EFFECTIVE_INSTANT)
 
     def test_protocol_two_evidence_is_now_historical(self) -> None:
-        document = qual.evaluate(corpus(qualification_protocol_version=2), 0)
+        document = _evaluate(corpus(qualification_protocol_version=2), 0)
         assert passing(document) == []
         assert document["qualification_reasons"]["other_protocol_version"] == 8
 
     def test_a_current_well_formed_corpus_still_reaches_the_gate(self) -> None:
-        document = qual.evaluate(corpus(), 0)
+        document = _evaluate(corpus(), 0)
         assert sorted(passing(document)) == sorted(c.criterion_id for c in qual.CRITERIA)
         assert document["eligible_for_human_promotion_review"] is True
 
@@ -279,7 +316,7 @@ class TestAMalformedCurrentReceiptProvesNothing:
         self, label: str, over: dict[str, Any]
     ) -> None:
         seventh = {"receipt_id": "ff" * 8, "event_tag": "9" * 32, "moment": D2, **over}
-        document = qual.evaluate([*corpus(), core(**seventh)], 0)
+        document = _evaluate([*corpus(), core(**seventh)], 0)
         assert document["eligible_for_human_promotion_review"] is False
         assert document["qualification_state"] == str(qual.QualificationState.EVIDENCE_CONFLICT)
 
@@ -287,7 +324,7 @@ class TestAMalformedCurrentReceiptProvesNothing:
     def test_the_reason_is_named_without_leaking_anything(
         self, label: str, over: dict[str, Any]
     ) -> None:
-        document = qual.evaluate([core(**over)], 0)
+        document = _evaluate([core(**over)], 0)
         reasons = document["qualification_reasons"]
         assert sum(reasons.values()) == 1
         assert reasons["malformed_current_schema"] + reasons["unusable_recorded_at"] == 1
@@ -346,7 +383,7 @@ class TestMappingRequiresAnObservedBookmaker:
                 [(FOOTBALL, D1, "a"), (FOOTBALL_2, D2, "b"), (FOOTBALL, D2, "c")], start=1
             )
         ]
-        document = qual.evaluate(receipts, 0)
+        document = _evaluate(receipts, 0)
         assert entry(document, "CORE_MAPPING_FOOTBALL")["passed"] is False
         assert document["eligible_for_human_promotion_review"] is False
 
@@ -357,7 +394,7 @@ class TestMappingRequiresAnObservedBookmaker:
                 [(FOOTBALL, D1, "a"), (FOOTBALL_2, D2, "b"), (FOOTBALL, D2, "c")], start=1
             )
         ]
-        assert entry(qual.evaluate(receipts, 0), "CORE_MAPPING_FOOTBALL")["passed"] is True
+        assert entry(_evaluate(receipts, 0), "CORE_MAPPING_FOOTBALL")["passed"] is True
 
     def test_the_scope_still_says_what_it_now_checks(self) -> None:
         for criterion in qual.CRITERIA:
@@ -413,26 +450,42 @@ UNESTABLISHED: list[tuple[str, dict[str, Any]]] = [
 
 class TestAPaidCallWithUnestablishedCostBlocksTheCriterion:
     def test_six_conforming_calls_pass_on_their_own(self) -> None:
-        result = entry(qual.evaluate(six_paid(), 0), "COST_CONFORMITY")
+        result = entry(_evaluate(six_paid(), 0), "COST_CONFORMITY")
         assert result["passed"] is True
         assert result["observed"]["provider_reached_conforming_cost"] == 6
         assert result["observed"]["provider_reached_nonconforming_cost"] == 0
-        assert result["observed"]["provider_reached_unestablished_cost"] == 0
+        assert result["observed"]["provider_reached_cost_unestablished"] == 0
 
     @pytest.mark.parametrize(("label", "over"), UNESTABLISHED, ids=[c[0] for c in UNESTABLISHED])
     def test_a_seventh_paid_call_never_passes_unnoticed(
         self, label: str, over: dict[str, Any]
     ) -> None:
         seventh = core(receipt_id="ff" * 8, event_tag="9" * 32, moment=D2, **over)
-        result = entry(qual.evaluate([*six_paid(), seventh], 0), "COST_CONFORMITY")
+        document = _evaluate([*six_paid(), seventh], 0)
+        result = entry(document, "COST_CONFORMITY")
         observed = result["observed"]
-        # Protocol v5 split "the attempt state cannot be established" out of the
-        # unestablished-cost bucket, so a mistyped network flag now names itself. All
-        # three still block, which is the property this test defends.
-        counted = sum(observed[name] for name in qual.BLOCKING_COST_BUCKETS)
-        assert counted >= 1, observed
-        assert result["passed"] is False
-        assert result["missing"], "the reader must be told why the cost criterion fails"
+        # The property this test defends is that a seventh paid call which is not plainly
+        # conforming never passes unnoticed. **Where** it is caught moved twice. v5 split
+        # "the attempt state cannot be established" out of the unestablished-cost bucket.
+        # v6 (D-076) goes further: a receipt the structural contract rejects feeds no
+        # semantic counter at all, so a mistyped flag or an unknown status is now caught
+        # as an evidence conflict rather than as a cost population — and a receipt that is
+        # readable but not conforming is still caught by the cost criterion. Both roads
+        # end at a shut gate, and the assertion below says exactly that.
+        blocked_by_cost = sum(observed[name] for name in qual.BLOCKING_COST_BUCKETS)
+        rejected = (
+            document.get("qualification_current_malformed_receipts", 0)
+            + document.get("qualification_unknown_pair_receipts", 0)
+            + document.get("qualification_current_contradictory_receipts", 0)
+        )
+        assert blocked_by_cost >= 1 or rejected >= 1, (observed, document["qualification_reasons"])
+        if blocked_by_cost:
+            assert result["passed"] is False
+            assert result["missing"], "the reader must be told why the cost criterion fails"
+        else:
+            assert document["qualification_state"] == "EVIDENCE_CONFLICT"
+            assert document["evidence_conflicts"]
+        assert document["eligible_for_human_promotion_review"] is False
 
     def test_a_call_that_never_left_is_counted_separately(self) -> None:
         never = core(
@@ -450,20 +503,27 @@ class TestAPaidCallWithUnestablishedCostBlocksTheCriterion:
             selections_mapped=0,
             freshness={},
         )
-        observed = entry(qual.evaluate([*six_paid(), never], 0), "COST_CONFORMITY")["observed"]
+        observed = entry(_evaluate([*six_paid(), never], 0), "COST_CONFORMITY")["observed"]
         assert observed["confirmed_attempts_not_sent"] == 1
-        assert observed["provider_reached_unestablished_cost"] == 0
+        assert observed["provider_reached_cost_unestablished"] == 0
 
     def test_every_paid_receipt_lands_in_exactly_one_category(self) -> None:
         for _, over in UNESTABLISHED:
             seventh = core(receipt_id="ff" * 8, event_tag="9" * 32, moment=D2, **over)
-            observed = entry(qual.evaluate([seventh], 0), "COST_CONFORMITY")["observed"]
-            # Five buckets since protocol v5, still exhaustive and still disjoint.
+            observed = entry(_evaluate([seventh], 0), "COST_CONFORMITY")["observed"]
+            # Six buckets since v6, still exhaustive and still disjoint over the paid
+            # steps the contract can read. A receipt the contract rejects is priced
+            # nowhere semantic — D-076 — so for those the exhaustiveness is asserted on
+            # the taxonomy itself, which is a pure function of the receipt.
             total = sum(observed.values())
-            assert total == 1, (over, observed)
+            if qual.classify(seventh) == "":
+                assert total == 1, (over, observed)
+            else:
+                assert total == 0, (over, observed)
+                assert qual.cost_category(seventh) in qual.COST_BUCKETS, over
 
     def test_the_criterion_says_what_it_does_not_prove(self) -> None:
-        limit = entry(qual.evaluate([], 0), "COST_CONFORMITY")["limit"]
+        limit = entry(_evaluate([], 0), "COST_CONFORMITY")["limit"]
         assert "tarif" in limit
 
 
@@ -517,7 +577,7 @@ class TestNoUnexpectedJsonCanCrashTheAudit:
             jsonlib.dumps({"schema_version": value}), encoding="utf-8"
         )
         receipts, unverifiable = act.audit_receipts()
-        assert receipts == []
+        assert list(receipts) == []
         assert unverifiable == 1
 
     @pytest.mark.parametrize(
@@ -546,6 +606,7 @@ class TestNoUnexpectedJsonCanCrashTheAudit:
         with pytest.raises(act.Refused):
             act.load_parent(
                 str(path),
+                signing=_SIGNING,
                 command="discover",
                 status=act.ActivationStatus.DISCOVERY_VERIFIED,
                 sport=FOOTBALL,
@@ -603,7 +664,7 @@ class TestReceiptWritingIsExclusive:
 class TestADuplicateIdentifierIsAConflict:
     def test_byte_identical_copies_count_once(self) -> None:
         one = core(receipt_id="cc" * 8)
-        document = qual.evaluate([one, dict(one), dict(one)], 0)
+        document = _evaluate([one, dict(one), dict(one)], 0)
         assert entry(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 1
         assert document["evidence_conflicts"] == []
 
@@ -615,7 +676,7 @@ class TestADuplicateIdentifierIsAConflict:
             )
         ]
         twin = core(receipt_id=f"{1:016x}", sport_key=FOOTBALL, moment=D1, event_tag="x" * 32)
-        document = qual.evaluate([*three, twin], 0)
+        document = _evaluate([*three, twin], 0)
         observed = entry(document, "CORE_MAPPING_FOOTBALL")["observed"]
         assert observed["events"] <= 2, observed
         assert document["qualification_state"] == str(qual.QualificationState.EVIDENCE_CONFLICT)
@@ -624,7 +685,7 @@ class TestADuplicateIdentifierIsAConflict:
     def test_the_conflict_names_no_content(self) -> None:
         one = core(receipt_id="cc" * 8, event_tag="a" * 32)
         twin = core(receipt_id="cc" * 8, event_tag="b" * 32)
-        document = qual.evaluate([one, twin], 0)
+        document = _evaluate([one, twin], 0)
         assert document["evidence_conflicts"]
         rendered = " ".join(document["evidence_conflicts"])
         for forbidden in ("a" * 32, "b" * 32, "cc" * 8, BOOK, FOOTBALL):

@@ -37,6 +37,7 @@ import pytest
 from helpers_activation import (
     BOOKMAKER,
     EVENT_ID,
+    FAKE_RECEIPT_SECRET,
     NOW,
     OTHER_EVENT_ID,
     SPORT,
@@ -501,7 +502,7 @@ class TestTheSchemaIsVersionedForTheNewContract:
             assert receipt["schema_version"] == 4
             # v4's reason to exist: the receipt names the protocol that would
             # judge it and the parser that produced it, both under the signature.
-            assert receipt["qualification_protocol_version"] == 5
+            assert receipt["qualification_protocol_version"] == 6
             assert receipt["provider_adapter_evidence_version"] == 1
 
     def test_the_reader_accepts_every_supported_version(self) -> None:
@@ -551,7 +552,7 @@ class TestAnExistingV2ReceiptStaysUsableAndUntouched:
             payload.pop(field, None)
         payload["schema_version"] = 2
         payload.pop("signature", None)
-        payload["signature"] = A.sign_receipt(payload)
+        payload["signature"] = A.sign_receipt(payload, FAKE_RECEIPT_SECRET)
         path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         return payload
 
@@ -654,8 +655,8 @@ class TestEveryNewFieldIsCoveredByTheSignature:
         # after `core`) and several of these fields would be no-ops on it.
         core = [r for r in receipts_in(keyed) if r["command"] == "core"][-1]
         receipt = {k: v for k, v in core.items() if not k.startswith("_")}
-        assert A.verify_receipt(receipt)
-        assert not A.verify_receipt({**receipt, field: value})
+        assert A.verify_receipt(receipt, FAKE_RECEIPT_SECRET)
+        assert not A.verify_receipt({**receipt, field: value}, FAKE_RECEIPT_SECRET)
 
     @pytest.mark.parametrize(
         ("field", "value"),
@@ -673,5 +674,5 @@ class TestEveryNewFieldIsCoveredByTheSignature:
 
         run_discover(monkeypatch, [event(EVENT_ID, hours_ahead=6.0)])
         receipt = {k: v for k, v in discovery_receipt(keyed).items() if not k.startswith("_")}
-        assert A.verify_receipt(receipt)
-        assert not A.verify_receipt({**receipt, field: value})
+        assert A.verify_receipt(receipt, FAKE_RECEIPT_SECRET)
+        assert not A.verify_receipt({**receipt, field: value}, FAKE_RECEIPT_SECRET)

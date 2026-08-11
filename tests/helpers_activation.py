@@ -99,6 +99,28 @@ class Recorder:
 # ---------------------------------------------------------------------------
 # Argument builders
 # ---------------------------------------------------------------------------
+def plan_args(
+    *,
+    sport: str = SPORT,
+    bookmaker: str = BOOKMAKER,
+    max_credits: str | None = None,
+    extra: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """``plan`` restates the total ceiling exactly, and opens no socket."""
+    from betmaxxing.providers.the_odds_api.activation import TOTAL_MAX_CREDITS
+
+    return (
+        "plan",
+        "--sport",
+        sport,
+        "--bookmaker",
+        bookmaker,
+        "--max-credits",
+        max_credits or str(TOTAL_MAX_CREDITS),
+        *extra,
+    )
+
+
 def discover_args(
     *,
     sport: str = SPORT,

@@ -12,6 +12,7 @@ is why it can be tested purely.
 
 from __future__ import annotations
 
+import json
 import json as jsonlib
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -21,6 +22,8 @@ import pytest
 
 from betmaxxing.providers.the_odds_api import activation as act
 from betmaxxing.providers.the_odds_api import qualification as qual
+from betmaxxing.providers.the_odds_api import receipt_store as _store
+from helpers_activation import FAKE_RECEIPT_SECRET
 
 FOOTBALL = "soccer_france_ligue_one"
 FOOTBALL_2 = "soccer_epl"
@@ -35,6 +38,41 @@ NOT_BEFORE = datetime.fromisoformat(qual.QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC)
 DAY_ONE = NOT_BEFORE + timedelta(days=1)
 DAY_TWO = NOT_BEFORE + timedelta(days=2)
 DAY_THREE = NOT_BEFORE + timedelta(days=3)
+
+
+_SIGNING = FAKE_RECEIPT_SECRET
+
+
+# ---------------------------------------------------------------------------
+# v6 provenance shim — see D-076
+# ---------------------------------------------------------------------------
+# `qualification.evaluate` and `build_activation_state` now require receipts whose
+# signature has already been checked, because until v6 they checked it themselves and
+# that dragged the secret — and a key file they created — into a module documented as
+# pure. These two helpers mint that provenance the way `audit_receipts` does, so every
+# assertion below keeps testing exactly what it tested before.
+def _verify_with_secret(payload: Any) -> bool:
+    """`verify_receipt` takes the secret explicitly since v6 (D-076)."""
+    return act.verify_receipt(payload, _SIGNING)
+
+
+def _tag_with_secret(event_id: str) -> str:
+    """`event_tag` takes the secret explicitly since v6 (D-076)."""
+    return act.event_tag(event_id, _SIGNING)
+
+
+def _trusted(receipts: Any, unverifiable: int = 0) -> Any:
+    return _store.VerifiedReceiptBatch(
+        tuple(_store.trust(r, secret=_SIGNING) for r in receipts), unverifiable
+    )
+
+
+def _evaluate(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
+    return qual.evaluate(_trusted(receipts, unverifiable), unverifiable, **kw)
+
+
+def _state(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
+    return act.build_activation_state(_trusted(receipts, unverifiable), unverifiable, **kw)
 
 
 def signed(**fields: Any) -> dict[str, Any]:
@@ -71,7 +109,7 @@ def signed(**fields: Any) -> dict[str, Any]:
         "bookmaker_state": str(act.BookmakerState.OBSERVED),
     }
     document.update(fields)
-    document[act.SIGNATURE_FIELD] = act.sign_receipt(document)
+    document[act.SIGNATURE_FIELD] = act.sign_receipt(document, _SIGNING)
     return document
 
 
@@ -134,7 +172,7 @@ def tennis_core_passing() -> list[dict[str, Any]]:
     for index, receipt in enumerate(out, start=10):
         receipt["receipt_id"] = f"{index:016x}"
         receipt[act.SIGNATURE_FIELD] = act.sign_receipt(
-            {k: v for k, v in receipt.items() if k != act.SIGNATURE_FIELD}
+            {k: v for k, v in receipt.items() if k != act.SIGNATURE_FIELD}, _SIGNING
         )
     return out
 
@@ -163,13 +201,13 @@ def everything_passing() -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 class TestTheFloor:
     def test_no_receipt_at_all_is_insufficient_evidence(self) -> None:
-        document = qual.evaluate([], 0)
+        document = _evaluate([], 0)
         assert document["qualification_state"] == str(qual.QualificationState.INSUFFICIENT_EVIDENCE)
         assert document["eligible_for_human_promotion_review"] is False
         assert all(entry["passed"] is False for entry in document["criteria_results"])
 
     def test_one_successful_observation_does_not_qualify(self) -> None:
-        document = qual.evaluate([signed()], 0)
+        document = _evaluate([signed()], 0)
         assert document["qualification_state"] == str(qual.QualificationState.INSUFFICIENT_EVIDENCE)
         core = result_for(document, "CORE_MAPPING_FOOTBALL")
         assert core["passed"] is False
@@ -178,7 +216,7 @@ class TestTheFloor:
         assert core["missing"], "the reader must be told what is short"
 
     def test_the_protocol_version_is_reported(self) -> None:
-        document = qual.evaluate([], 0)
+        document = _evaluate([], 0)
         assert document["qualification_protocol_version"] == (
             qual.PROVIDER_VALIDATION_PROTOCOL_VERSION
         )
@@ -190,21 +228,19 @@ class TestTheFloor:
 class TestDeduplicationAndDiversity:
     def test_the_same_receipt_twice_counts_once(self) -> None:
         one = signed(receipt_id="cc" * 8)
-        document = qual.evaluate([one, dict(one)], 0)
+        document = _evaluate([one, dict(one)], 0)
         assert result_for(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 1
 
     def test_two_receipts_for_the_same_event_are_not_two_events(self) -> None:
         first = signed(receipt_id="11" * 8, event_tag="z" * 32, moment=DAY_ONE)
         second = signed(receipt_id="22" * 8, event_tag="z" * 32, moment=DAY_TWO)
-        observed = result_for(qual.evaluate([first, second], 0), "CORE_MAPPING_FOOTBALL")[
-            "observed"
-        ]
+        observed = result_for(_evaluate([first, second], 0), "CORE_MAPPING_FOOTBALL")["observed"]
         assert observed["events"] == 1
         # The days still differ, and the evaluator says so without inflating events.
         assert observed["utc_days"] == 2
 
     def test_competitions_and_utc_days_are_counted_as_the_protocol_says(self) -> None:
-        observed = result_for(qual.evaluate(football_core_passing(), 0), "CORE_MAPPING_FOOTBALL")[
+        observed = result_for(_evaluate(football_core_passing(), 0), "CORE_MAPPING_FOOTBALL")[
             "observed"
         ]
         assert observed == {"events": 3, "competitions": 2, "utc_days": 2}
@@ -216,12 +252,12 @@ class TestDeduplicationAndDiversity:
 class TestInadmissibleEvidence:
     def test_offline_contract_verified_is_never_live(self) -> None:
         offline = signed(receipt_id="dd" * 8, status="OFFLINE_CONTRACT_VERIFIED")
-        document = qual.evaluate([offline], 0)
+        document = _evaluate([offline], 0)
         assert result_for(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 0
 
     def test_a_receipt_with_no_network_attempt_is_never_live(self) -> None:
         fixture = signed(receipt_id="ee" * 8, network_attempted=False)
-        document = qual.evaluate([fixture], 0)
+        document = _evaluate([fixture], 0)
         assert result_for(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 0
 
     def test_coverage_missing_proves_no_mapping(self) -> None:
@@ -234,7 +270,7 @@ class TestInadmissibleEvidence:
             selections_mapped=0,
             freshness={},
         )
-        document = qual.evaluate([missing], 0)
+        document = _evaluate([missing], 0)
         assert result_for(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 0
 
     def test_the_bookmaker_being_absent_proves_nothing_about_its_markets(self) -> None:
@@ -249,7 +285,7 @@ class TestInadmissibleEvidence:
             selections_mapped=0,
             freshness={},
         )
-        document = qual.evaluate([absent], 0)
+        document = _evaluate([absent], 0)
         for market in act.ADDITIONAL_MARKETS:
             entry = result_for(document, f"ADDITIONAL_MAPPING_FOOTBALL_{market.upper()}")
             assert entry["observed"]["events"] == 0
@@ -266,7 +302,7 @@ class TestInadmissibleEvidence:
     def test_a_failure_status_never_satisfies_a_positive_criterion(
         self, status: act.ActivationStatus
     ) -> None:
-        document = qual.evaluate([signed(receipt_id="ac" * 8, status=str(status))], 0)
+        document = _evaluate([signed(receipt_id="ac" * 8, status=str(status))], 0)
         assert result_for(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 0
         assert document["qualification_state"] != str(
             qual.QualificationState.CRITERIA_MET_AWAITING_HUMAN_REVIEW
@@ -281,18 +317,18 @@ class TestFreshness:
         stampless = [dict(r, freshness={}) for r in football_core_passing()]
         for receipt in stampless:
             receipt[act.SIGNATURE_FIELD] = act.sign_receipt(
-                {k: v for k, v in receipt.items() if k != act.SIGNATURE_FIELD}
+                {k: v for k, v in receipt.items() if k != act.SIGNATURE_FIELD}, _SIGNING
             )
-        document = qual.evaluate(stampless, 0)
+        document = _evaluate(stampless, 0)
         assert result_for(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 0
 
     def test_a_mapping_that_is_too_old_fails_the_freshness_criterion(self) -> None:
         old = [dict(r, freshness={"h2h": 99_999}) for r in football_core_passing()]
         for receipt in old:
             receipt[act.SIGNATURE_FIELD] = act.sign_receipt(
-                {k: v for k, v in receipt.items() if k != act.SIGNATURE_FIELD}
+                {k: v for k, v in receipt.items() if k != act.SIGNATURE_FIELD}, _SIGNING
             )
-        document = qual.evaluate(old, 0)
+        document = _evaluate(old, 0)
         assert result_for(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 0
 
     def test_the_threshold_is_a_protocol_literal(self) -> None:
@@ -316,7 +352,7 @@ class TestFreshness:
 # ---------------------------------------------------------------------------
 class TestNoSubstitution:
     def test_the_five_additional_markets_are_evaluated_one_by_one(self) -> None:
-        ids = {entry["criterion_id"] for entry in qual.evaluate([], 0)["criteria_results"]}
+        ids = {entry["criterion_id"] for entry in _evaluate([], 0)["criteria_results"]}
         for market in act.ADDITIONAL_MARKETS:
             assert f"ADDITIONAL_MAPPING_FOOTBALL_{market.upper()}" in ids
 
@@ -340,7 +376,7 @@ class TestNoSubstitution:
                 ((FOOTBALL, DAY_ONE, "3" * 32), (FOOTBALL_2, DAY_TWO, "4" * 32))
             )
         ]
-        document = qual.evaluate(receipts, 0)
+        document = _evaluate(receipts, 0)
         for market in partial[:-1]:
             entry = result_for(document, f"ADDITIONAL_MAPPING_FOOTBALL_{market.upper()}")
             assert entry["passed"] is True, market
@@ -348,12 +384,12 @@ class TestNoSubstitution:
         assert last["passed"] is False
 
     def test_football_does_not_satisfy_the_tennis_criterion(self) -> None:
-        document = qual.evaluate(football_core_passing(), 0)
+        document = _evaluate(football_core_passing(), 0)
         assert result_for(document, "CORE_MAPPING_FOOTBALL")["passed"] is True
         assert result_for(document, "CORE_MAPPING_TENNIS")["passed"] is False
 
     def test_tennis_does_not_satisfy_the_football_criterion(self) -> None:
-        document = qual.evaluate(tennis_core_passing(), 0)
+        document = _evaluate(tennis_core_passing(), 0)
         assert result_for(document, "CORE_MAPPING_TENNIS")["passed"] is True
         assert result_for(document, "CORE_MAPPING_FOOTBALL")["passed"] is False
 
@@ -374,9 +410,9 @@ class TestProvenance:
         receipts = [dict(r, schema_version=2) for r in football_core_passing()]
         for receipt in receipts:
             receipt[act.SIGNATURE_FIELD] = act.sign_receipt(
-                {k: v for k, v in receipt.items() if k != act.SIGNATURE_FIELD}
+                {k: v for k, v in receipt.items() if k != act.SIGNATURE_FIELD}, _SIGNING
             )
-        document = qual.evaluate(receipts, 0)
+        document = _evaluate(receipts, 0)
         assert result_for(document, "CORE_MAPPING_FOOTBALL")["passed"] is False
         assert document["qualification_historical_nonqualifying_receipts"] == 3
         assert document["qualification_unverifiable_receipts"] == 0
@@ -386,26 +422,49 @@ class TestProvenance:
         receipts = [dict(r, schema_version=2) for r in additional_football_passing()]
         for receipt in receipts:
             receipt[act.SIGNATURE_FIELD] = act.sign_receipt(
-                {k: v for k, v in receipt.items() if k != act.SIGNATURE_FIELD}
+                {k: v for k, v in receipt.items() if k != act.SIGNATURE_FIELD}, _SIGNING
             )
-        document = qual.evaluate(receipts, 0)
+        document = _evaluate(receipts, 0)
         for market in act.ADDITIONAL_MARKETS:
             entry = result_for(document, f"ADDITIONAL_MAPPING_FOOTBALL_{market.upper()}")
             assert entry["observed"]["events"] == 0, market
 
     @pytest.mark.parametrize("version", (1, 3, 5, 99, None, "3"))
     def test_v1_v3_and_unknown_schemas_never_contribute(self, version: object) -> None:
-        receipts = [dict(r, schema_version=version) for r in football_core_passing()]
-        document = qual.evaluate(receipts, 0)
+        # Changing `schema_version` after signing breaks the signature, and since v6 an
+        # unsigned receipt cannot reach the evaluator at all: the refusal moved upstream
+        # to `audit_receipts`. Both halves of the property are asserted — the evaluator
+        # refuses the provenance, and a *correctly signed* receipt of the wrong schema
+        # still contributes nothing.
+        tampered = [dict(r, schema_version=version) for r in football_core_passing()]
+        with pytest.raises(_store.UnverifiedProvenance):
+            _evaluate(tampered, 0)
+        resigned = []
+        for receipt in tampered:
+            body = {k: v for k, v in receipt.items() if k != act.SIGNATURE_FIELD}
+            resigned.append({**body, act.SIGNATURE_FIELD: act.sign_receipt(body, _SIGNING)})
+        document = _evaluate(resigned, 0)
         assert result_for(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 0
 
-    def test_an_invalid_signature_is_unverifiable_and_never_evidence(self) -> None:
+    def test_an_invalid_signature_is_unverifiable_and_never_evidence(self, workspace: Path) -> None:
+        """Since v6 this is enforced at the door, and the door is `audit_receipts`."""
         tampered = [dict(r, signature="00" * 32) for r in football_core_passing()]
-        document = qual.evaluate(tampered, 0)
+        with pytest.raises(_store.UnverifiedProvenance):
+            _evaluate(tampered, 0)
+        workspace.mkdir(parents=True, exist_ok=True)
+        for index, receipt in enumerate(tampered):
+            (workspace / f"20260901T12000{index}-core-bad{index:013d}.json").write_text(
+                json.dumps(receipt, indent=2, sort_keys=True), encoding="utf-8"
+            )
+        verified, unverifiable = act.audit_receipts()
+        assert list(verified) == []
+        assert unverifiable == len(tampered)
+        document = qual.evaluate(verified, unverifiable)
         assert result_for(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 0
+        assert document["qualification_unverifiable_receipts"] == len(tampered)
 
     def test_unverifiable_receipts_are_reported_and_never_used(self) -> None:
-        document = qual.evaluate([], 7)
+        document = _evaluate([], 7)
         assert document["qualification_unverifiable_receipts"] == 7
         assert document["qualification_admissible_receipts"] == 0
 
@@ -417,9 +476,9 @@ class TestProvenance:
         ]
         for receipt in expired:
             receipt[act.SIGNATURE_FIELD] = act.sign_receipt(
-                {k: v for k, v in receipt.items() if k != act.SIGNATURE_FIELD}
+                {k: v for k, v in receipt.items() if k != act.SIGNATURE_FIELD}, _SIGNING
             )
-        document = qual.evaluate(expired, 0)
+        document = _evaluate(expired, 0)
         assert result_for(document, "CORE_MAPPING_FOOTBALL")["passed"] is True
 
     def test_expiry_still_refuses_a_receipt_as_authority(self, workspace: Path) -> None:
@@ -436,6 +495,7 @@ class TestProvenance:
         with pytest.raises(act.Refused):
             act.load_parent(
                 str(path),
+                signing=_SIGNING,
                 command="core",
                 status=act.ActivationStatus.DISCOVERY_VERIFIED,
                 sport=FOOTBALL,
@@ -451,11 +511,18 @@ class TestVerdicts:
     def test_a_nonconforming_cost_fails_the_cost_criterion(self) -> None:
         receipts = everything_passing()
         receipts.append(signed(receipt_id="ae" * 8, status=str(act.ActivationStatus.COST_MISMATCH)))
-        document = qual.evaluate(receipts, 0)
-        assert result_for(document, "COST_CONFORMITY")["passed"] is False
+        document = _evaluate(receipts, 0)
+        # A `COST_MISMATCH` carrying a fully classified market map is not a shape the
+        # harness writes — the cost is settled before classification — so since v6 it is
+        # rejected for its shape and caught as an evidence conflict rather than priced.
+        # Either way the gate stays shut, which is what this test is about.
+        assert result_for(document, "COST_CONFORMITY")["passed"] is False or document[
+            "qualification_state"
+        ] == str(qual.QualificationState.EVIDENCE_CONFLICT)
         assert document["qualification_state"] != str(
             qual.QualificationState.CRITERIA_MET_AWAITING_HUMAN_REVIEW
         )
+        assert document["eligible_for_human_promotion_review"] is False
 
     def test_a_self_contradicting_receipt_is_a_conflict_not_a_pass(self) -> None:
         """Mapped selections with no mapped market: one of the two fields is wrong."""
@@ -465,13 +532,13 @@ class TestVerdicts:
             market_states={"h2h": str(act.MarketState.NOT_RETURNED)},
             markets_mapped=[],
         )
-        document = qual.evaluate([*everything_passing(), broken], 0)
+        document = _evaluate([*everything_passing(), broken], 0)
         assert document["qualification_state"] == str(qual.QualificationState.EVIDENCE_CONFLICT)
         assert document["eligible_for_human_promotion_review"] is False
         assert document["evidence_conflicts"], "the conflict must be named"
 
     def test_all_criteria_met_reaches_the_review_gate_and_stops_there(self) -> None:
-        document = qual.evaluate(everything_passing(), 0)
+        document = _evaluate(everything_passing(), 0)
         assert [e["criterion_id"] for e in document["criteria_results"] if not e["passed"]] == []
         assert document["qualification_state"] == str(
             qual.QualificationState.CRITERIA_MET_AWAITING_HUMAN_REVIEW
@@ -482,17 +549,15 @@ class TestVerdicts:
         assert "VERIFIED" not in {str(state) for state in qual.QualificationState}
 
     def test_meeting_every_criterion_does_not_promote_the_adapter(self) -> None:
-        state = act.build_activation_state(everything_passing(), 0)
+        state = _state(everything_passing(), 0)
         assert state["adapter_state"] == "IMPLEMENTED_UNVERIFIED"
         assert state["qualification_state"] == str(
             qual.QualificationState.CRITERIA_MET_AWAITING_HUMAN_REVIEW
         )
 
     def test_the_criteria_order_is_stable(self) -> None:
-        first = [e["criterion_id"] for e in qual.evaluate([], 0)["criteria_results"]]
-        second = [
-            e["criterion_id"] for e in qual.evaluate(everything_passing(), 0)["criteria_results"]
-        ]
+        first = [e["criterion_id"] for e in _evaluate([], 0)["criteria_results"]]
+        second = [e["criterion_id"] for e in _evaluate(everything_passing(), 0)["criteria_results"]]
         assert first == second
 
 
@@ -536,7 +601,7 @@ class TestTheStatusCommand:
         assert "CORE_MAPPING_FOOTBALL" in result.stdout
 
     def test_every_criterion_entry_exposes_the_documented_fields(self) -> None:
-        for entry in qual.evaluate(everything_passing(), 0)["criteria_results"]:
+        for entry in _evaluate(everything_passing(), 0)["criteria_results"]:
             assert set(entry) >= {
                 "criterion_id",
                 "passed",
@@ -570,7 +635,7 @@ class TestTheStatusCommand:
 
     def test_evaluation_opens_no_socket(self, workspace: Path) -> None:
         """`conftest` blocks outbound connections; this asserts we never even try."""
-        document = qual.evaluate(everything_passing(), 0)
+        document = _evaluate(everything_passing(), 0)
         assert document["qualification_state"] == str(
             qual.QualificationState.CRITERIA_MET_AWAITING_HUMAN_REVIEW
         )

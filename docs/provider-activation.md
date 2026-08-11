@@ -413,17 +413,54 @@ de candidat en `paper` ou `live_analysis`, démarrage d'un ordonnanceur réel,
 envoi de notification, pari ou automatisme de mise, interface web, et
 versionnement d'un payload fournisseur brut.
 
-## Lire la qualification (D-071, corrigée par D-072, D-073, D-074 puis D-075)
+## Lire la qualification (D-071, corrigée par D-072 à D-076)
 
 `activation status` porte, depuis 03C-1, un sixième bloc : l'évaluation des
 critères **préenregistrés** de `docs/provider-validation-protocol.md`
-(`PROVIDER_VALIDATION_PROTOCOL_VERSION = 5`,
+(`PROVIDER_VALIDATION_PROTOCOL_VERSION = 6`,
 `PROVIDER_ADAPTER_EVIDENCE_VERSION = 1`, schéma de reçu `v4`).
 
 ```bash
 python -m betmaxxing.providers.the_odds_api.activation status         # lecture humaine
-python -m betmaxxing.providers.the_odds_api.activation status --json  # même contenu, parseable
+python -m betmaxxing.providers.the_odds_api.activation status --json  # les mêmes faits, parseable
 ```
+
+Les deux sorties portent les **mêmes faits matériels** : recensement du coût et sa
+population, crédits comptés, crédits rejetés non comptés, reçus payants rejetés, intents
+de tentative non résolus, états d'exécution et de commande, preuve de connectivité, et
+raisons bloquantes. La lecture humaine est plus compacte ; elle n'omet rien qui changerait
+une décision. Jusqu'à la v5 le recensement et les crédits rejetés n'existaient qu'en JSON
+alors que ce document annonçait « le même contenu ».
+
+### Reprendre après un reçu incomplet
+
+Une interruption peut laisser un fichier de reçu vide ou tronqué. Il est nommé comme tel
+et jamais confondu avec un reçu signé divergent, et la sortie de secours est une commande,
+pas une fonction interne :
+
+```bash
+python -m betmaxxing.providers.the_odds_api.activation receipts quarantine --name NOM.json
+```
+
+Elle exige un **nom de base** du répertoire de reçus, jamais un chemin ; elle conserve
+tous les octets sous un nom hors de l'audit, ne remplace jamais une quarantaine
+existante, libère le nom d'origine, et refuse un reçu signé complet sans `--force`.
+Rejouez ensuite l'étape : le même reçu est republié à l'identique.
+
+### Une tentative dont la preuve n'a pas pu être écrite
+
+Avant chaque requête, y compris `discover`, un **intent** local est écrit et synchronisé.
+Si la publication du reçu échoue ensuite, la commande sort avec un code non nul, dit
+lequel des faits est perdu, et l'intent reste : c'est la trace qu'une requête a pu partir.
+
+```bash
+python -m betmaxxing.providers.the_odds_api.activation status --json | \
+  python -c "import json,sys; d=json.load(sys.stdin); print(d['unresolved_attempt_intents'])"
+```
+
+Tant qu'un intent n'est pas résolu, `qualification_state` reste `EVIDENCE_CONFLICT` :
+le corpus est incomplet d'une manière que rien sur ce disque ne permet de chiffrer.
+Rejouer l'étape publie le reçu et résout l'intent, sans compter le coût deux fois.
 
 Ce que le bloc dit, et ce qu'il ne dit pas :
 

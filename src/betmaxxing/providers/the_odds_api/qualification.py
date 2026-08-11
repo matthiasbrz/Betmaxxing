@@ -5,13 +5,48 @@ advance, how much live evidence would justify asking a human to promote the
 adapter. Without that, any result can be read as encouraging: two `core` calls
 that found no coverage were once summarised as an activation that "worked".
 
-Protocol **v4**. Each version closed defects an independent read-only audit
-reproduced on the previous one. v2 fixed three false claims in D-071, v3 closed the
-type coercions that let a signed receipt manufacture positive proof, and v4 fixes
-the thing v3 got wrong in the other direction: strictness applied without asking
-what the producer actually writes.
+Protocol **v6**. Each version closed defects an independent read-only audit
+reproduced on the previous one. v2 fixed three false claims in D-071; v3 closed the
+type coercions that let a signed receipt manufacture positive proof; v4 fixed what v3
+got wrong in the other direction, strictness applied without asking what the producer
+writes; v5 made a proof of a response require a response. v6 closes the boundary
+itself: the secret is a validated format, the receipt directory is a descriptor rather
+than a path, an attempt leaves a durable trace *before* the wire, the command is a
+closed domain, and this module is finally pure because verification happens upstream.
 
-v4's one new idea is that the contract is **phase-aware**. What a receipt must
+**Pure, and now provably so.** :func:`evaluate` reads no environment, no clock and no
+file, writes nothing, and computes no HMAC. It accepts only receipts whose provenance
+is a type — :class:`~.receipt_store.VerifiedReceipt`, minted by
+:func:`~.activation.audit_receipts` — because until v6 its call graph reached
+``verify_receipt``, and through it the environment and a key file it created. A list of
+plain mappings is refused rather than verified here.
+
+**A closed command domain.** :class:`CommandState` reads ``command`` as strictly as
+:class:`AttemptState` reads ``network_attempted``. v5 fell through to
+``DISCOVERY_ATTEMPTED`` for any confirmed attempt that was not exactly ``core`` or
+``additional`` — ``plan``, an absent field, ``sync``, ``7``, ``Core``, ``" core "`` —
+and ``Core`` and ``" core "`` also escaped ``PAID_COMMANDS``, taking a paid step out of
+the cost census entirely.
+
+**Six cost populations.** v5's single unestablished bucket asserted in its own name
+that the provider had been reached, while two of its three feeders were exactly the
+receipts where the reach was not established. It is split, and both halves block.
+
+**Rejected receipts are forensic only.** A malformed, self-contradictory,
+unknown-couple or divergent-identifier receipt feeds the reasons, the populations and
+``rejected_receipt_credits_not_counted`` — and no semantic counter. It used to feed the
+census, the connectivity label, ``execution_state`` and ``paid_activation_state``.
+
+**A catalogue checked in both directions.** :data:`PERSISTED_COUPLES` is compared with
+what the real command paths write, so a couple the producer emits and the table lacks
+fails the suite, and so does a couple the table declares with no producer. v5 declared
+``discover/SCHEMA_MISMATCH``, which nothing writes, and lacked
+``discover/COST_UNVERIFIED`` and ``discover/COST_MISMATCH``, which ``run_discovery``
+writes whenever the free endpoints omit or overshoot the credit header — filing an
+honest receipt as an unknown couple and driving a whole corpus to
+``EVIDENCE_CONFLICT``.
+
+The contract is **phase-aware**, from v4. What a receipt must
 contain depends on how far its ``(command, status)`` pair actually got, and that
 mapping is the versioned table :data:`RECEIPT_PHASES` — tested against
 :func:`~.activation.build_receipt` rather than inferred from whether a field
@@ -28,7 +63,8 @@ What v2 changed, and why each change is a property rather than a preference:
   `max_odds_age_seconds`, so an operator's `.env` silently moved the
   "pre-registered" bound while the version number stayed at 1 — in the direction
   that matters, since raising it lets a stale quote support a freshness claim.
-  This module now reads no configuration at all.
+  This module reads no configuration at all, and since v6 nothing it calls does
+  either.
 * **Postdated.** Qualifying evidence must be recorded at or after
   :data:`QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC`, and must carry the protocol and
   adapter-evidence versions it was produced under. v1 accepted any signed v2/v3
@@ -68,9 +104,11 @@ And what v4 adds on top:
 
 Three properties are unchanged and still hold:
 
-* **Pure.** :func:`evaluate` takes a list of already-verified receipts and returns
-  a document. No network, no key, no clock, no configuration, no receipt is
-  written or modified.
+* **Pure.** :func:`evaluate` takes a batch of already-verified receipts and returns
+  a document. No network, no key, no HMAC, no clock, no configuration, no file read
+  and none written. v6 is where that became true rather than merely written down:
+  the signature check moved to :func:`~.activation.audit_receipts`, and the type of
+  the input is what proves it happened.
 * **Bounded above.** The best conclusion available here is
   ``CRITERIA_MET_AWAITING_HUMAN_REVIEW``. ``adapter_state`` stays
   ``IMPLEMENTED_UNVERIFIED`` whatever the outcome.
@@ -99,14 +137,14 @@ from .activation import (
     ActivationStatus,
     BookmakerState,
     MarketState,
-    verify_receipt,
 )
+from .receipt_store import require_verified
 
 #: Bump this when a threshold, a scope, an admissibility rule or the effective
 #: instant changes. Results computed under one version are not comparable with
 #: another, which is the whole reason the number exists: a criterion quietly
 #: relaxed after the fact is not a criterion.
-PROVIDER_VALIDATION_PROTOCOL_VERSION = 5
+PROVIDER_VALIDATION_PROTOCOL_VERSION = 6
 
 #: Bump this when the parser, the mapping, the freshness reading or the cost
 #: logic changes in a way that invalidates an earlier proof. A receipt stamped
@@ -125,7 +163,7 @@ PROTOCOL_MAX_ODDS_AGE_SECONDS = 900
 #: D-075 and `docs/provider-validation-protocol.md`. Evidence recorded before it
 #: is history, never qualification. Never recomputed at runtime, never read from
 #: the environment: a date that moves is not an effective date.
-QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC = "2026-08-10T14:00:37+00:00"
+QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC = "2026-08-11T04:50:40+00:00"
 
 #: Only v4 receipts carry the two version stamps, so only v4 can qualify. v2 and
 #: v3 stay readable, honoured as authority for chaining, and reported in the
@@ -298,9 +336,46 @@ QUALIFICATION_REASONS: tuple[str, ...] = (
     "before_effective_instant",
     "unusable_recorded_at",
     "self_contradictory",
-    "unverified_or_unknown_schema",
     "unknown_command_status_pair",
 )
+
+
+class CommandState(StrEnum):
+    """Which step a receipt is about, read as strictly as its attempt state.
+
+    Five values, because four plus coercion is what v5 had: ``execution_state`` fell
+    through to ``DISCOVERY_ATTEMPTED`` for any confirmed attempt whose command was not
+    exactly ``core`` or ``additional``, so ``plan``, an absent field, an empty string,
+    ``sync``, ``7``, ``["core"]``, ``Core`` and ``" core "`` all published a discovery
+    nobody had made. Worse, ``Core`` and ``" core "`` carried no structural fault and
+    escaped ``PAID_COMMANDS`` entirely, so a paid step vanished from the cost census.
+
+    No case folding, no trimming, no coercion: a command is one of four exact strings
+    or it is not established.
+    """
+
+    PLAN = "PLAN"
+    DISCOVER = "DISCOVER"
+    CORE = "CORE"
+    ADDITIONAL = "ADDITIONAL"
+    COMMAND_STATE_UNESTABLISHED = "COMMAND_STATE_UNESTABLISHED"
+
+
+#: The only four spellings a receipt may carry, and what each one means.
+COMMAND_NAMES: dict[str, CommandState] = {
+    "plan": CommandState.PLAN,
+    "discover": CommandState.DISCOVER,
+    "core": CommandState.CORE,
+    "additional": CommandState.ADDITIONAL,
+}
+
+
+def command_state(receipt: Mapping[str, Any]) -> CommandState:
+    """Which step this receipt is about, or that it does not establish one."""
+    value = receipt.get("command")
+    if not isinstance(value, str):
+        return CommandState.COMMAND_STATE_UNESTABLISHED
+    return COMMAND_NAMES.get(value, CommandState.COMMAND_STATE_UNESTABLISHED)
 
 
 class ReceiptPhase(StrEnum):
@@ -347,7 +422,16 @@ RECEIPT_PHASES: dict[tuple[str, str], frozenset[ReceiptPhase]] = {
     ("discover", str(ActivationStatus.PREPARED_NOT_EXECUTED)): frozenset({ReceiptPhase.DISCOVERED}),
     ("discover", str(ActivationStatus.DISCOVERY_VERIFIED)): frozenset({ReceiptPhase.DISCOVERED}),
     ("discover", str(ActivationStatus.COVERAGE_MISSING)): frozenset({ReceiptPhase.DISCOVERED}),
-    ("discover", str(ActivationStatus.SCHEMA_MISMATCH)): frozenset({ReceiptPhase.DISCOVERED}),
+    # `run_discovery` settles the cost of the two free endpoints like any other step,
+    # so it raises COST_UNVERIFIED whenever the credit header is absent or unusable and
+    # COST_MISMATCH above its nil ceiling. Both were missing from this table until v6,
+    # which filed an honest receipt the harness had just written as an unknown couple and
+    # drove the whole corpus to EVIDENCE_CONFLICT. `discover/SCHEMA_MISMATCH` went the
+    # other way: it was declared here and no producer ever wrote it — `_event_of` and
+    # `_check_start_time`, the two functions that raise it, are reached from `run_core`
+    # and `run_additional` only.
+    ("discover", str(ActivationStatus.COST_UNVERIFIED)): frozenset({ReceiptPhase.DISCOVERED}),
+    ("discover", str(ActivationStatus.COST_MISMATCH)): frozenset({ReceiptPhase.DISCOVERED}),
     ("discover", str(ActivationStatus.AUTH_FAILED)): frozenset({ReceiptPhase.DISCOVERED}),
     ("discover", str(ActivationStatus.PROVIDER_UNAVAILABLE)): frozenset({ReceiptPhase.DISCOVERED}),
     ("core", str(ActivationStatus.PREPARED_NOT_EXECUTED)): frozenset({ReceiptPhase.PLANNED}),
@@ -689,6 +773,11 @@ def _common_faults(receipt: Mapping[str, Any]) -> list[str]:
         if not condition:
             faults.append(field)
 
+    # v6: the command itself. ``Core``, ``" core "``, ``sync``, ``7`` and an absent
+    # field all used to pass the structural contract while escaping ``PAID_COMMANDS``,
+    # so a paid step could be reported as unpaid and vanish from the cost census.
+    require(command_state(receipt) is not CommandState.COMMAND_STATE_UNESTABLISHED, "command")
+
     # Versions are strictly positive: there is no version zero, and a counter's
     # rule is different — see below, where zero is accepted.
     for field in (
@@ -931,6 +1020,16 @@ def contradictions(receipt: Mapping[str, Any]) -> list[str]:
     they do not re-check their types.
     """
     found: list[str] = []
+    # v6: `plan` builds no client and opens no socket, and the CLI persists no plan
+    # receipt at all. A signed one claiming a confirmed attempt therefore disagrees with
+    # itself, and v5 read it as a discovery instead.
+    if command_state(receipt) is CommandState.PLAN and attempt_state(receipt) is not (
+        AttemptState.NOT_ATTEMPTED
+    ):
+        found.append(
+            "command = plan alors que l'état de tentative n'est pas « jamais tentée » ; "
+            "aucun chemin de plan n'ouvre de socket"
+        )
     mapped = _plain_int(receipt.get("selections_mapped")) or 0
     states = receipt.get("market_states")
     version = receipt.get("schema_version")
@@ -1001,13 +1100,20 @@ def contradictions(receipt: Mapping[str, Any]) -> list[str]:
 # Admissibility: is this receipt current evidence at all?
 # ---------------------------------------------------------------------------
 def _verifiable(receipt: Mapping[str, Any]) -> bool:
-    """Signed with our secret, and of a schema whose fields we can read."""
+    """Of a schema whose fields we can read, and verified **before** it got here.
+
+    v6 removed the signature check from this module. It used to call
+    ``verify_receipt``, which fetched the secret from the environment and created the
+    key file if it was missing — inside a function documented as pure, reached from
+    :func:`evaluate`. Verification now happens once, in
+    :func:`~.activation.audit_receipts`, and :func:`evaluate` refuses at its own door
+    anything that is not a :class:`~.receipt_store.VerifiedReceipt`. What is left here
+    is what this predicate always should have been: can these fields be read at all.
+    """
     from .activation import SUPPORTED_SCHEMA_VERSIONS
 
     version = _plain_int(receipt.get("schema_version"))
-    if version is None or version not in SUPPORTED_SCHEMA_VERSIONS:
-        return False
-    return verify_receipt(receipt)
+    return version is not None and version in SUPPORTED_SCHEMA_VERSIONS
 
 
 def currency_reason(receipt: Mapping[str, Any]) -> str:
@@ -1018,7 +1124,7 @@ def currency_reason(receipt: Mapping[str, Any]) -> str:
     out of the cost census — the mistake protocol v2 made.
     """
     if not _verifiable(receipt):
-        return "unverified_or_unknown_schema"
+        return "stale_schema"
     if _plain_int(receipt.get("schema_version")) != QUALIFYING_SCHEMA_VERSION:
         return "stale_schema"
     if (
@@ -1194,16 +1300,19 @@ def cost_conforming(receipt: Mapping[str, Any]) -> bool:
     return accounted == observed
 
 
-#: The five cost buckets of protocol v5, and the four that gate the criterion. Named
-#: after what they establish rather than after what the request did, because that is
-#: the question ``COST_CONFORMITY`` asks.
-#: ``provider_reached_unestablished_cost`` covers two readings that establish the same
-#: nothing: the provider answered and its cost is unreadable, **or** the request was
-#: confirmed issued and whether it was served cannot be established. Both block.
+#: The six cost buckets of protocol v6, and the four that gate the criterion. Named
+#: after what they establish rather than after what the request did, because that is the
+#: question ``COST_CONFORMITY`` asks — and named so that no population claims in its own
+#: name a fact its members do not carry.
 COST_BUCKETS: tuple[str, ...] = (
     "provider_reached_conforming_cost",
     "provider_reached_nonconforming_cost",
-    "provider_reached_unestablished_cost",
+    # v6 splits v5's single unestablished bucket. Its name asserted that the provider
+    # had been reached, and two of its three feeders were exactly the receipts where the
+    # reach was *not* established — an absent or mistyped flag. A population may not
+    # affirm in its own name a fact its members deny.
+    "provider_reached_cost_unestablished",
+    "provider_reach_unestablished",
     "paid_attempt_state_unestablished",
     "confirmed_attempts_not_sent",
 )
@@ -1214,14 +1323,56 @@ COST_BUCKETS: tuple[str, ...] = (
 #: invalidate six calls that really were served and really were conforming (D-075).
 BLOCKING_COST_BUCKETS: tuple[str, ...] = (
     "provider_reached_nonconforming_cost",
-    "provider_reached_unestablished_cost",
+    "provider_reached_cost_unestablished",
+    "provider_reach_unestablished",
     "paid_attempt_state_unestablished",
 )
 
 
+#: Which couples a real command path actually persists, and which are answers the
+#: contract owes without any producer writing them. v5 kept one hand-written list of
+#: "producible" couples, checked against ``build_receipt`` called directly — which is
+#: why it declared ``discover/SCHEMA_MISMATCH``, that nothing writes, and missed
+#: ``discover/COST_UNVERIFIED`` and ``discover/COST_MISMATCH``, that ``run_discovery``
+#: writes through ``_settle_cost``. The two lists are published so a test can compare
+#: them with what the CLI really leaves on disk, in both directions.
+#:
+#: ``plan`` is the whole of the second list: :func:`~.activation.build_receipt` accepts
+#: the command and the contract must have an answer for a planted plan receipt, but no
+#: CLI path persists one — ``plan`` costs nothing, touches nothing and writes nothing.
+NON_PERSISTED_COUPLES: tuple[tuple[str, str], ...] = (
+    # `plan` computes and prints; no CLI path persists a receipt for it at all.
+    ("plan", str(ActivationStatus.PLAN_ONLY)),
+    ("plan", str(ActivationStatus.PREPARED_NOT_EXECUTED)),
+    # A refusal *before* the wire writes nothing, deliberately: inventing a consumption
+    # record for a call that never happened is the same error as losing the record of one
+    # that did. So `PREPARED_NOT_EXECUTED` is a status the harness reports and never a
+    # receipt it files — the contract still owes an answer for a planted one, and the
+    # bidirectional test in the v6 suite is what proved this list wrong when it claimed
+    # otherwise.
+    ("discover", str(ActivationStatus.PREPARED_NOT_EXECUTED)),
+    ("core", str(ActivationStatus.PREPARED_NOT_EXECUTED)),
+    ("additional", str(ActivationStatus.PREPARED_NOT_EXECUTED)),
+)
+
+PERSISTED_COUPLES: tuple[tuple[str, str], ...] = tuple(
+    couple for couple in RECEIPT_PHASES if couple not in NON_PERSISTED_COUPLES
+)
+
+#: Published because they are quoted in the protocol, the runbook and the pull request,
+#: and a number quoted from memory is how "19 couples" survived three tranches.
+RECEIPT_COUPLE_COUNT = len(RECEIPT_PHASES)
+RECEIPT_FORM_COUNT = sum(len(phases) for phases in RECEIPT_PHASES.values())
+
+
 def is_paid_command(receipt: Mapping[str, Any]) -> bool:
-    """Whether this receipt belongs to a step that can be billed at all."""
-    return str(receipt.get("command")) in PAID_COMMANDS
+    """Whether this receipt belongs to a step that can be billed at all.
+
+    Through :func:`command_state`, so ``" core "`` and ``Core`` are not paid steps that
+    slipped out of the census — they are receipts whose command is not established, and
+    the structural contract says so.
+    """
+    return command_state(receipt) in {CommandState.CORE, CommandState.ADDITIONAL}
 
 
 def cost_category(receipt: Mapping[str, Any]) -> str:
@@ -1233,7 +1384,7 @@ def cost_category(receipt: Mapping[str, Any]) -> str:
     attempt state cannot be established stays *in* the census and blocks, because a
     receipt that cannot say whether it spent a credit is not evidence that it did not.
     """
-    if str(receipt.get("command")) not in PAID_COMMANDS:
+    if not is_paid_command(receipt):
         return ""
     state = attempt_state(receipt)
     if state is AttemptState.NOT_ATTEMPTED:
@@ -1246,15 +1397,15 @@ def cost_category(receipt: Mapping[str, Any]) -> str:
         # which is only defensible because both flags are exact booleans (D-075).
         return "confirmed_attempts_not_sent"
     if receipt.get("may_have_reached_provider") is not True:
-        # Issued, and unable to say whether it was served. Nothing is established about
-        # the tariff, so this blocks like any other unestablished cost. Filing it under
-        # "not sent" would claim a certainty the flag does not carry.
-        return "provider_reached_unestablished_cost"
+        # Issued, and unable to say whether it was served. Its own population, named for
+        # what is missing: v5 filed it under a name beginning `provider_reached_`, which
+        # asserted the very thing the flag failed to establish.
+        return "provider_reach_unestablished"
     if str(receipt.get("status")) in _NONCONFORMING_COST_STATUSES:
         return "provider_reached_nonconforming_cost"
     if cost_conforming(receipt):
         return "provider_reached_conforming_cost"
-    return "provider_reached_unestablished_cost"
+    return "provider_reached_cost_unestablished"
 
 
 def canonical(receipts: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
@@ -1363,7 +1514,8 @@ def _cost_result(receipts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
     labels = {
         "provider_reached_nonconforming_cost": "appels servis au coût non conforme",
-        "provider_reached_unestablished_cost": "appels servis au coût non établi",
+        "provider_reached_cost_unestablished": "appels servis au coût non établi",
+        "provider_reach_unestablished": "pas payants dont l'atteinte n'est pas établie",
         "paid_attempt_state_unestablished": "pas payants à l'état de tentative non établi",
     }
     missing: list[str] = []
@@ -1411,7 +1563,56 @@ def _divergent_identifiers(receipts: Sequence[Mapping[str, Any]]) -> set[str]:
     return {identifier for identifier, signatures in seen.items() if len(signatures) > 1}
 
 
-def evaluate(receipts: Sequence[Mapping[str, Any]], unverifiable: int) -> dict[str, Any]:
+def observed_phases(receipt: Mapping[str, Any]) -> frozenset[ReceiptPhase]:
+    """Which of its admissible phases this receipt's fields actually satisfy.
+
+    Used to compare the catalogue against the producer: a couple may declare two
+    honest forms, and a given receipt is in exactly one of them.
+    """
+    return frozenset(
+        phase for phase in admissible_phases(receipt) if not _phase_faults(receipt, phase)
+    )
+
+
+def rejection_reason(receipt: Mapping[str, Any], *, divergent: frozenset[str] | set[str]) -> str:
+    """Why this receipt may feed no semantic counter, or ``""``.
+
+    Four ways to be unreadable, and they are all *shape*, not currency: a receipt from
+    an earlier protocol is historical, which is a different thing — the money it
+    records was really spent, so it still counts in the census and in the credit total
+    while qualifying nothing.
+    """
+    if str(receipt.get("receipt_id") or "") in divergent:
+        return "duplicate_receipt_identifier"
+    if not admissible_phases(receipt):
+        return "unknown_command_status_pair"
+    if structural_faults(receipt):
+        return "malformed_current_schema"
+    if contradictions(receipt):
+        return "self_contradictory"
+    return ""
+
+
+def semantic_receipts(receipts: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The receipts that may feed a published semantic counter.
+
+    One reading, shared by :func:`evaluate` and
+    :func:`~.activation.build_activation_state`, so the strict block and the five
+    reported dimensions cannot disagree about which receipts are readable. Until v5 a
+    rejected receipt still fed the cost census, the connectivity label,
+    ``execution_state`` and ``paid_activation_state`` — while the pull request claimed
+    it fed no semantic counter at all.
+    """
+    divergent = _divergent_identifiers(receipts)
+    return [r for r in receipts if not rejection_reason(r, divergent=divergent)]
+
+
+def evaluate(
+    receipts: Sequence[Mapping[str, Any]],
+    unverifiable: int,
+    *,
+    unresolved_intents: int = 0,
+) -> dict[str, Any]:
     """Judge a list of receipts against the pre-registered criteria. Pure.
 
     ``unverifiable`` is passed in rather than recomputed: the caller already
@@ -1419,7 +1620,19 @@ def evaluate(receipts: Sequence[Mapping[str, Any]], unverifiable: int) -> dict[s
     appear in the report without ever being read as evidence. It is reported under
     a ``qualification_``-prefixed name so it can never overwrite the D-062 audit
     counter of the same meaning but different provenance.
+
+    ``unresolved_intents`` is the number of attempts whose local intent — written and
+    ``fsync``-ed *before* the request — has not been resolved by the durable
+    publication of its receipt. Each one means a request may have left and may have
+    been billed without leaving a proof, so each one is an evidence conflict. It is
+    passed in for the same reason as ``unverifiable``: this function does not read the
+    filesystem, and v6 is the version where that is finally true.
+
+    Pure, and now provably so: no environment, no clock, no file, no HMAC. The input
+    must already carry its provenance — a plain list of mappings is refused rather
+    than verified here, which is what used to drag the secret into this module.
     """
+    receipts = require_verified(receipts)
     reasons = dict.fromkeys(QUALIFICATION_REASONS, 0)
     current: list[Mapping[str, Any]] = []
     usable: list[Mapping[str, Any]] = []
@@ -1495,11 +1708,17 @@ def evaluate(receipts: Sequence[Mapping[str, Any]], unverifiable: int) -> dict[s
             f"{len(divergent)} identifiant(s) de reçu portent des contenus signés différents ; "
             "tous les reçus concernés sont écartés des critères"
         )
+    if unresolved_intents:
+        conflicts.append(
+            f"{unresolved_intents} intent(s) de tentative non résolu(s) : une requête a pu "
+            "partir sans que sa preuve soit publiée durablement, donc le corpus est "
+            "incomplet d'une manière que rien sur ce disque ne permet de chiffrer"
+        )
 
     results: list[dict[str, Any]] = []
     for criterion in CRITERIA:
         if criterion is COST_CONFORMITY:
-            results.append(_cost_result(current))
+            results.append(_cost_result(semantic_receipts(current)))
             continue
         evidence = _dedupe((r for r in usable if admissible_for(r, criterion)), criterion.market)
         observed = _observed_diversity(evidence)

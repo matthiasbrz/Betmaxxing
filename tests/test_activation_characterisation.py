@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 
 from betmaxxing.providers.the_odds_api import activation as act
+from helpers_activation import FAKE_RECEIPT_SECRET
 
 pytestmark = pytest.mark.usefixtures("workspace")
 
@@ -65,7 +66,7 @@ def _signed(**fields: Any) -> dict[str, Any]:
         "bookmaker_state": str(act.BookmakerState.OBSERVED),
     }
     document.update(fields)
-    document[act.SIGNATURE_FIELD] = act.sign_receipt(document)
+    document[act.SIGNATURE_FIELD] = act.sign_receipt(document, FAKE_RECEIPT_SECRET)
     return document
 
 
@@ -184,7 +185,7 @@ class TestD062FiveProofDimensionsReadByStatus:
 
     def test_an_empty_directory_is_an_empty_state_not_an_error(self, workspace: Path) -> None:
         receipts, unverifiable = act.audit_receipts()
-        assert (receipts, unverifiable) == ([], 0)
+        assert (list(receipts), unverifiable) == ([], 0)
         document = act.build_activation_state(receipts, unverifiable)
         assert document["execution_state"] == str(act.ExecutionState.NO_NETWORK_ATTEMPTED)
         assert document["mapping_freshness_proof"] == str(act.MappingProof.NOT_OBTAINED_LIVE)
@@ -193,7 +194,7 @@ class TestD062FiveProofDimensionsReadByStatus:
         workspace.mkdir(parents=True, exist_ok=True)
         (workspace / "broken.json").write_text("{not json", encoding="utf-8")
         receipts, unverifiable = act.audit_receipts()
-        assert receipts == []
+        assert list(receipts) == []
         assert unverifiable == 1
 
 
@@ -234,7 +235,7 @@ class TestD063ReceiptsAreV4AndOlderSchemasStayReadable:
         document = _signed(receipt_id="beef0000beef0002", schema_version=1)
         _write(workspace, document)
         receipts, unverifiable = act.audit_receipts()
-        assert receipts == []
+        assert list(receipts) == []
         assert unverifiable == 1
 
 
@@ -270,6 +271,7 @@ class TestD064AFixtureNeverEarnsALiveStatus:
         with pytest.raises(act.Refused):
             act.load_parent(
                 str(path),
+                signing=FAKE_RECEIPT_SECRET,
                 command="core",
                 status=act.ActivationStatus.DISCOVERY_VERIFIED,
                 sport="soccer_france_ligue_one",

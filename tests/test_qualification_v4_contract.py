@@ -33,6 +33,7 @@ import pytest
 
 from betmaxxing.providers.the_odds_api import activation as act
 from betmaxxing.providers.the_odds_api import qualification as qual
+from betmaxxing.providers.the_odds_api import receipt_store as _store
 
 #: The instant D-074 published, kept as the historical literal it is. This module
 #: guards the v4 closures, which are unchanged; the *current* effective instant is
@@ -55,6 +56,44 @@ SECRET = "ab" * 32
 # ---------------------------------------------------------------------------
 # Synthetic receipts
 # ---------------------------------------------------------------------------
+# `SECRET` is the API-key sentinel this suite checks for redaction. Receipts are
+# signed with the injected receipt secret the `workspace` fixture installs, which is
+# what `audit_receipts` verifies them against.
+from helpers_activation import FAKE_RECEIPT_SECRET as _SIGNING  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# v6 provenance shim — see D-076
+# ---------------------------------------------------------------------------
+# `qualification.evaluate` and `build_activation_state` now require receipts whose
+# signature has already been checked, because until v6 they checked it themselves and
+# that dragged the secret — and a key file they created — into a module documented as
+# pure. These two helpers mint that provenance the way `audit_receipts` does, so every
+# assertion below keeps testing exactly what it tested before.
+def _verify_with_secret(payload: Any) -> bool:
+    """`verify_receipt` takes the secret explicitly since v6 (D-076)."""
+    return act.verify_receipt(payload, _SIGNING)
+
+
+def _tag_with_secret(event_id: str) -> str:
+    """`event_tag` takes the secret explicitly since v6 (D-076)."""
+    return act.event_tag(event_id, _SIGNING)
+
+
+def _trusted(receipts: Any, unverifiable: int = 0) -> Any:
+    return _store.VerifiedReceiptBatch(
+        tuple(_store.trust(r, secret=_SIGNING) for r in receipts), unverifiable
+    )
+
+
+def _evaluate(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
+    return qual.evaluate(_trusted(receipts, unverifiable), unverifiable, **kw)
+
+
+def _state(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
+    return act.build_activation_state(_trusted(receipts, unverifiable), unverifiable, **kw)
+
+
 def core(**over: Any) -> dict[str, Any]:
     """A signed, current, well-formed `core` receipt: admissible by default."""
     moment: datetime = over.pop("moment", D1)
@@ -93,7 +132,7 @@ def core(**over: Any) -> dict[str, Any]:
     document.update(over)
     for name in drop:
         document.pop(name, None)
-    document[act.SIGNATURE_FIELD] = act.sign_receipt(document)
+    document[act.SIGNATURE_FIELD] = act.sign_receipt(document, _SIGNING)
     return document
 
 
@@ -243,15 +282,20 @@ PRODUCER_MATRIX: list[tuple[str, str, dict[str, Any]]] = [
             "observed": None,
         },
     ),
+    # D-076 removed `discover/SCHEMA_MISMATCH`: the two functions that raise it,
+    # `_event_of` and `_check_start_time`, are reached from `run_core` and
+    # `run_additional` only, so no discovery ever wrote this receipt. In its place the
+    # table gained the two couples `run_discovery` really does write, through
+    # `_settle_cost`.
     (
         "discover",
-        "SCHEMA_MISMATCH",
+        "COST_UNVERIFIED",
         {
             "network_attempted": True,
             "reached_provider": True,
             "attempts": 2,
             "endpoints": ["/v4/sports", "/v4/sports/{sport}/events"],
-            "observed": 0,
+            "observed": None,
         },
     ),
     (
@@ -447,7 +491,7 @@ def produced(command: str, status: str, over: dict[str, Any]) -> dict[str, Any]:
     exercise the consumer rather than its rejection path.
     """
     document = act.build_receipt(attempt_for(command, **over), act.ActivationStatus(status), SECRET)
-    document[act.SIGNATURE_FIELD] = act.sign_receipt(document)
+    document[act.SIGNATURE_FIELD] = act.sign_receipt(document, _SIGNING)
     return document
 
 
@@ -478,12 +522,12 @@ class TestTheProtocolIsVersionFour:
         assert current >= datetime.fromisoformat(D074_EFFECTIVE_INSTANT)
 
     def test_protocol_three_evidence_is_now_historical(self) -> None:
-        document = qual.evaluate(corpus(qualification_protocol_version=3), 0)
+        document = _evaluate(corpus(qualification_protocol_version=3), 0)
         assert [e for e in document["criteria_results"] if e["passed"]] == []
         assert document["qualification_reasons"]["other_protocol_version"] == 8
 
     def test_a_current_well_formed_corpus_still_reaches_the_gate(self) -> None:
-        document = qual.evaluate(corpus(), 0)
+        document = _evaluate(corpus(), 0)
         assert all(e["passed"] for e in document["criteria_results"])
         assert document["eligible_for_human_promotion_review"] is True
 
@@ -510,7 +554,7 @@ class TestTheContractAcceptsItsOwnProducer:
     def test_it_is_never_a_structural_conflict(
         self, command: str, status: str, over: dict[str, Any]
     ) -> None:
-        document = qual.evaluate([produced(command, status, over)], 0)
+        document = _evaluate([produced(command, status, over)], 0)
         assert document["qualification_reasons"]["malformed_current_schema"] == 0
         assert document["qualification_reasons"]["unknown_command_status_pair"] == 0
 
@@ -533,12 +577,12 @@ class TestTheContractAcceptsItsOwnProducer:
     def test_an_unknown_pair_is_named_rather_than_guessed(self) -> None:
         receipt = core(status="FUTURE_UNKNOWN_STATUS")
         assert qual.classify(receipt) == "unknown_command_status_pair"
-        document = qual.evaluate([receipt], 0)
+        document = _evaluate([receipt], 0)
         assert document["eligible_for_human_promotion_review"] is False
 
     def test_an_error_receipt_stays_current_but_proves_nothing(self) -> None:
         receipt = produced("core", "AUTH_FAILED", dict(PRODUCER_MATRIX[10][2]))
-        document = qual.evaluate([receipt], 0)
+        document = _evaluate([receipt], 0)
         assert qual.classify(receipt) == ""
         assert [e["criterion_id"] for e in document["criteria_results"] if e["passed"]] == []
         assert document["qualification_state"] != str(qual.QualificationState.EVIDENCE_CONFLICT)
@@ -733,29 +777,29 @@ class TestTheOlderDimensionsAgreeWithTheStrictBlock:
         zero current ones, and comparing those two numbers is a population error, not
         a contradiction. Both are asserted, each against its own population.
         """
-        document = act.build_activation_state(dimension_corpus(label), 0)
+        document = _state(dimension_corpus(label), 0)
         census = document["paid_call_cost_census"]
         criterion = cost_of(document)["observed"]
         if document["connectivity_and_cost_proof"] == str(act.CostProof.EXERCISED_CONFORMING):
             assert census["provider_reached_nonconforming_cost"] == 0, label
-            assert census["provider_reached_unestablished_cost"] == 0, label
+            assert census["provider_reached_cost_unestablished"] == 0, label
             assert census["provider_reached_conforming_cost"] >= 1, label
             # The criterion's population is a subset, so it cannot show a defect the
             # broader census does not.
             assert criterion["provider_reached_nonconforming_cost"] == 0, label
-            assert criterion["provider_reached_unestablished_cost"] == 0, label
+            assert criterion["provider_reached_cost_unestablished"] == 0, label
 
     @pytest.mark.parametrize("label", DIMENSION_LABELS)
     def test_obtained_live_never_rests_on_rejected_evidence(self, label: str) -> None:
         receipts = dimension_corpus(label)
-        document = act.build_activation_state(receipts, 0)
+        document = _state(receipts, 0)
         if document["mapping_freshness_proof"] == str(act.MappingProof.OBTAINED_LIVE):
             assert any(qual.mapping_observation_is_sound(r) for r in receipts), label
 
     @pytest.mark.parametrize("label", DIMENSION_LABELS)
     def test_coverage_observed_needs_an_observed_bookmaker(self, label: str) -> None:
         receipts = dimension_corpus(label)
-        document = act.build_activation_state(receipts, 0)
+        document = _state(receipts, 0)
         if document["paid_activation_state"] == str(
             act.PaidActivationState.CORE_EXECUTED_COVERAGE_OBSERVED
         ):
@@ -763,7 +807,7 @@ class TestTheOlderDimensionsAgreeWithTheStrictBlock:
 
     @pytest.mark.parametrize("label", DIMENSION_LABELS)
     def test_coverage_observations_only_carry_sound_receipts(self, label: str) -> None:
-        document = act.build_activation_state(dimension_corpus(label), 0)
+        document = _state(dimension_corpus(label), 0)
         for observation in document["bookmaker_coverage_observations"]:
             assert observation["bookmaker_state"] in {
                 str(act.BookmakerState.OBSERVED),
@@ -791,24 +835,51 @@ class TestTheOlderDimensionsAgreeWithTheStrictBlock:
                 freshness={},
             ),
         ]
-        document = act.build_activation_state(receipts, 0)
+        document = _state(receipts, 0)
         assert document["connectivity_and_cost_proof"] == str(act.CostProof.EXERCISED_UNESTABLISHED)
 
     def test_a_paid_attempt_that_proves_nothing_has_its_own_label(self) -> None:
         values = {str(v) for v in act.PaidActivationState}
         assert "PAID_ATTEMPT_INCONCLUSIVE" in values
-        document = act.build_activation_state(six_paid(selections_mapped="3"), 0)
+        # `selections_mapped="3"` is outside the structural contract, so since D-076 the
+        # receipts are rejected and the paid state says the attempt state is not
+        # established rather than claiming an inconclusive *attempt*. Both labels exist
+        # and neither is a positive proof, which is the property; the sound-but-useless
+        # case below is the one that still reads `PAID_ATTEMPT_INCONCLUSIVE`.
+        document = _state(six_paid(selections_mapped="3"), 0)
         assert document["paid_activation_state"] == str(
+            act.PaidActivationState.PAID_ATTEMPT_STATE_UNESTABLISHED
+        )
+        sound = _state(
+            [
+                produced(
+                    "core",
+                    "AUTH_FAILED",
+                    {
+                        "network_attempted": True,
+                        "reached_provider": True,
+                        "attempts": 1,
+                        "estimated": 1,
+                        "observed": None,
+                        "markets_requested": ["h2h"],
+                        "event_id": "evt-v4-inconclusive",
+                        "event_tags": ["e" * 32],
+                    },
+                )
+            ],
+            0,
+        )
+        assert sound["paid_activation_state"] == str(
             act.PaidActivationState.PAID_ATTEMPT_INCONCLUSIVE
         )
 
     def test_a_free_discovery_alone_leaves_the_paid_cost_unexercised(self) -> None:
         discovery = produced("discover", "DISCOVERY_VERIFIED", dict(PRODUCER_MATRIX[2][2]))
-        document = act.build_activation_state([discovery], 0)
+        document = _state([discovery], 0)
         assert document["connectivity_and_cost_proof"] == str(act.CostProof.NOT_EXERCISED)
 
     def test_accounted_credits_total_ignores_anything_that_is_not_a_count(self) -> None:
-        document = act.build_activation_state(
+        document = _state(
             [
                 core(accounted_credits=True),
                 core(receipt_id="11" * 8, accounted_credits="7"),
@@ -825,8 +896,24 @@ class TestTheOlderDimensionsAgreeWithTheStrictBlock:
 # ---------------------------------------------------------------------------
 class TestTheCostCategoriesSayWhatTheyKnow:
     def test_never_left_requires_an_exact_false(self) -> None:
-        receipt = core(may_have_reached_provider=False, observed_credits=None, accounted_credits=1)
-        observed = cost_of(qual.evaluate([receipt], 0))["observed"]
+        # A `CORE_LIVE_VERIFIED` that says it never left is self-contradictory since v5,
+        # so the population is exercised on the status a provider error really writes.
+        receipt = produced(
+            "core",
+            "PROVIDER_UNAVAILABLE",
+            {
+                "network_attempted": True,
+                "reached_provider": False,
+                "attempts": 1,
+                "estimated": 1,
+                "observed": None,
+                "markets_requested": ["h2h"],
+                "event_id": "evt-v4-never-left",
+                "event_tags": ["f" * 32],
+            },
+        )
+        assert qual.classify(receipt) == "", qual.structural_faults(receipt)
+        observed = cost_of(_evaluate([receipt], 0))["observed"]
         assert observed["confirmed_attempts_not_sent"] == 1
 
     @pytest.mark.parametrize("flag", ["network_attempted", "may_have_reached_provider"])
@@ -840,23 +927,43 @@ class TestTheCostCategoriesSayWhatTheyKnow:
         blocks, and it is never reported as a call proven not to have left.
         """
         receipt = core(**{flag: value})
-        result = cost_of(qual.evaluate([receipt], 0))
+        document = _state([receipt], 0)
+        result = cost_of(document)
         observed = result["observed"]
+        # D-076: a mistyped flag is outside the structural contract, and a receipt the
+        # contract rejects is no longer priced — it is counted in the forensic census and
+        # named as an evidence conflict. The three properties this test defends survive
+        # unchanged: it counts, it blocks, and it is never called a call proven not to
+        # have left.
+        if qual.classify(receipt) != "":
+            assert sum(document["rejected_paid_cost_census"].values()) == 1
+            assert document["rejected_paid_cost_census"]["confirmed_attempts_not_sent"] == 0
+            assert document["qualification_state"] == "EVIDENCE_CONFLICT"
+            assert document["eligible_for_human_promotion_review"] is False
+            return
         assert observed["confirmed_attempts_not_sent"] == 0
         assert sum(observed[name] for name in qual.BLOCKING_COST_BUCKETS) == 1
         assert result["passed"] is False
 
     @pytest.mark.parametrize("flag", ["network_attempted", "may_have_reached_provider"])
     def test_an_absent_flag_is_an_unestablished_cost(self, flag: str) -> None:
-        result = cost_of(qual.evaluate([core(drop=(flag,))], 0))
+        receipt = core(drop=(flag,))
+        document = _state([receipt], 0)
+        result = cost_of(document)
         observed = result["observed"]
+        if qual.classify(receipt) != "":
+            # See above: rejected receipts are counted forensically, never priced.
+            assert sum(document["rejected_paid_cost_census"].values()) == 1
+            assert document["rejected_paid_cost_census"]["confirmed_attempts_not_sent"] == 0
+            assert document["qualification_state"] == "EVIDENCE_CONFLICT"
+            return
         assert sum(observed[name] for name in qual.BLOCKING_COST_BUCKETS) == 1
         assert observed["confirmed_attempts_not_sent"] == 0
         assert result["passed"] is False
 
     def test_a_step_refused_before_the_network_is_not_a_paid_call(self) -> None:
         refused = produced("core", "PREPARED_NOT_EXECUTED", {"markets_requested": ["h2h"]})
-        observed = cost_of(qual.evaluate([refused], 0))["observed"]
+        observed = cost_of(_evaluate([refused], 0))["observed"]
         assert sum(observed.values()) == 0
 
     def test_every_real_paid_attempt_lands_in_exactly_one_category(self) -> None:
@@ -893,8 +1000,17 @@ class TestTheCostCategoriesSayWhatTheyKnow:
                         receipt = core(
                             receipt_id="ff" * 8, event_tag="9" * 32, drop=tuple(drop), **over
                         )
-                        observed = cost_of(qual.evaluate([receipt], 0))["observed"]
+                        observed = cost_of(_evaluate([receipt], 0))["observed"]
                         total = sum(observed.values())
+                        if qual.classify(receipt) != "":
+                            # Rejected: priced nowhere semantic, but the taxonomy itself
+                            # still names exactly one population for it (D-076).
+                            assert total == 0
+                            assert (
+                                qual.cost_category(receipt) in qual.COST_BUCKETS
+                                or qual.attempt_state(receipt) is qual.AttemptState.NOT_ATTEMPTED
+                            )
+                            continue
                         # The denominator as protocol v5 documents it: a paid step whose
                         # attempt state is anything other than "never attempted". v4
                         # wrote this as `network_attempted is not False`, which put an
@@ -905,8 +1021,8 @@ class TestTheCostCategoriesSayWhatTheyKnow:
                         assert total == (1 if counted else 0), (over, drop, observed)
 
     def test_the_pass_rule(self) -> None:
-        assert cost_of(qual.evaluate(six_paid(), 0))["passed"] is True
-        assert cost_of(qual.evaluate(six_paid()[:5], 0))["passed"] is False
+        assert cost_of(_evaluate(six_paid(), 0))["passed"] is True
+        assert cost_of(_evaluate(six_paid()[:5], 0))["passed"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -940,22 +1056,22 @@ class TestTheAuditNeverLeavesItsDirectory:
         workspace.mkdir(parents=True, exist_ok=True)
         os.symlink(self._outside(workspace), workspace / "link.json")
         receipts, unverifiable = act.audit_receipts()
-        assert receipts == []
+        assert list(receipts) == []
         assert unverifiable == 1
-        document = act.build_activation_state(receipts, unverifiable)
+        document = _state(receipts, unverifiable)
         assert entry(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 0
 
     def test_a_broken_symlink_is_counted_not_opened(self, workspace: Path) -> None:
         workspace.mkdir(parents=True, exist_ok=True)
         os.symlink(workspace / "nothing-here.json", workspace / "broken.json")
         receipts, unverifiable = act.audit_receipts()
-        assert receipts == []
+        assert list(receipts) == []
         assert unverifiable == 1
 
     def test_a_directory_named_json_is_counted(self, workspace: Path) -> None:
         (workspace / "folder.json").mkdir(parents=True, exist_ok=True)
         receipts, unverifiable = act.audit_receipts()
-        assert receipts == []
+        assert list(receipts) == []
         assert unverifiable == 1
 
     def test_no_foreign_path_or_content_is_exposed(self, workspace: Path) -> None:
@@ -1036,7 +1152,7 @@ class TestThePopulationsReconcile:
 
     def test_every_receipt_is_in_exactly_one_population(self) -> None:
         receipts = self._mixed()
-        document = qual.evaluate(receipts, 0)
+        document = _evaluate(receipts, 0)
         total = (
             document["qualification_usable_receipts"]
             + document["qualification_current_malformed_receipts"]
@@ -1048,7 +1164,7 @@ class TestThePopulationsReconcile:
         assert total == len(receipts)
 
     def test_a_current_malformed_receipt_is_not_called_historical(self) -> None:
-        document = qual.evaluate([core(selections_mapped="3")], 0)
+        document = _evaluate([core(selections_mapped="3")], 0)
         assert document["qualification_current_malformed_receipts"] == 1
         assert document["qualification_historical_nonqualifying_receipts"] == 0
 
@@ -1061,13 +1177,13 @@ class TestThePopulationsReconcile:
         is structurally impeccable and still disagrees with itself — accounting for fewer
         credits than the provider reported — which is what this test is about.
         """
-        document = qual.evaluate([core(observed_credits=1, accounted_credits=0)], 0)
+        document = _evaluate([core(observed_credits=1, accounted_credits=0)], 0)
         assert document["qualification_current_contradictory_receipts"] == 1
         assert document["qualification_historical_nonqualifying_receipts"] == 0
 
     def test_an_exact_copy_is_one_observation(self) -> None:
         one = core(receipt_id="cc" * 8)
-        document = qual.evaluate([one, dict(one), dict(one)], 0)
+        document = _evaluate([one, dict(one), dict(one)], 0)
         assert entry(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 1
         assert document["qualification_duplicate_excluded_receipts"] == 0
 
@@ -1096,7 +1212,7 @@ class TestThePopulationsReconcile:
             core(receipt_id="dd" * 8, event_tag="a" * 32, **first),
             core(receipt_id="dd" * 8, **second),
         ]
-        document = qual.evaluate(receipts, 0)
+        document = _evaluate(receipts, 0)
         assert entry(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 0, label
         assert document["qualification_duplicate_excluded_receipts"] == 2, label
         assert document["evidence_conflicts"], label
@@ -1158,6 +1274,6 @@ class TestAMalformedValueIsNeverReflected:
             assert sentinel not in human.stdout, (label, sentinel)
 
     def test_the_reason_still_names_the_field(self) -> None:
-        document = qual.evaluate([core(selections_mapped="3")], 0)
+        document = _evaluate([core(selections_mapped="3")], 0)
         assert document["qualification_reasons"]["malformed_current_schema"] == 1
         assert any("selections_mapped" in c for c in document["evidence_conflicts"])

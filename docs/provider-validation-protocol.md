@@ -1,4 +1,4 @@
-# Protocole de qualification du fournisseur — `PROVIDER_VALIDATION_PROTOCOL_VERSION = 5`
+# Protocole de qualification du fournisseur — `PROVIDER_VALIDATION_PROTOCOL_VERSION = 6`
 
 Ce document dit, **avant** les appels, combien de preuve live justifierait de
 *demander* à un humain de promouvoir l'adaptateur The Odds API. Il ne promeut rien
@@ -108,6 +108,51 @@ C'est la **seule** forme installée : `[project.scripts]` ne déclare que
 `betmaxxing`, et un test structurel vérifie qu'aucun runbook n'invite à taper une
 commande absente.
 
+### 0.4 Puis la v5 a été auditée à son tour
+
+Le cinquième réaudit indépendant en lecture seule a reproduit, sur `e43851e`, **un P1,
+cinq P2 et douze P3**. Tous portaient sur la même frontière : ce qui est sur le disque
+et ce que le programme accepte de croire.
+
+**P1 — le secret n'était jamais validé.** `receipt_secret()` créait
+`signing-key.secret` puis faisait confiance à ce qu'il relisait. Un fichier vide, un
+retour à la ligne, un caractère, le mot `secret`, soixante-quatre caractères non
+hexadécimaux et cent mille caractères étaient tous acceptés, tous utilisés pour signer
+et tous vérifiés ; un corpus synthétique signé avec une telle clé atteignait
+`CRITERIA_MET_AWAITING_HUMAN_REVIEW`. Une route ne demandait aucun adversaire : une
+première exécution interrompue entre la création exclusive et l'écriture laissait un
+fichier de zéro octet que chaque exécution suivante lisait comme une clé vide.
+
+**P2 — cinq constats.** `evaluate` se disait pur alors que son graphe d'appels
+atteignait le HMAC, l'environnement et un fichier qu'il créait. Le *répertoire* de
+reçus était ouvert par chemin sans `O_NOFOLLOW`, et `link`, `unlink` et le `fsync` du
+répertoire repassaient par un chemin : un répertoire-lien, un parent substitué et un
+répertoire permuté entre le listing et l'ouverture faisaient lire, vérifier et
+rapporter un fichier extérieur. Les cinq sites de `write_receipt` étaient hors de tout
+gestionnaire : `ENOSPC` sur `discover` sortait sur un `OSError` nu, **sans aucune
+sortie**, sans reçu, et au site `additional` la même forme perd la seule preuve d'un
+appel à cinq crédits. `run_discovery` produit `COST_UNVERIFIED` et `COST_MISMATCH` par
+`_settle_cost`, deux couples absents de la table — un reçu honnête écrit par le harnais
+était classé « couple inconnu » et faisait basculer tout un corpus en
+`EVIDENCE_CONFLICT` — tandis que `discover/SCHEMA_MISMATCH` y était déclaré sans
+producteur. Enfin `execution_state` arrondissait toute tentative confirmée qui n'était
+pas exactement `core` ou `additional` en `DISCOVERY_ATTEMPTED`, y compris `plan`, une
+commande absente, `sync`, `7`, `Core` et `" core "`.
+
+**Ce que la v6 change**, point par point, avec la décision D-076 :
+
+| Défaut v5 | Correction v6 |
+| --- | --- |
+| secret non validé, réparé silencieusement, créé non atomiquement | format strict — 64 caractères hexadécimaux minuscules, ni `strip()` ni casse tolérés ; `load_receipt_secret` lit sans créer, `ensure_receipt_secret` crée atomiquement ; un secret invalide échoue **fermé** et n'est jamais réécrit, car le réécrire invaliderait tous les reçus déjà signés |
+| `evaluate` impur par son graphe d'appels | la vérification remonte à `audit_receipts`, qui est le seul endroit où une provenance est frappée ; `evaluate` n'accepte que des `VerifiedReceipt` et refuse une liste de mappings brute |
+| frontière portant sur le nom, pas sur le répertoire | un seul descripteur de répertoire, ouvert composant par composant avec `O_NOFOLLOW`, conservé pour tout le cycle : listing, lecture, publication, link, unlink, quarantaine et `fsync` passent par lui |
+| erreur de persistance en `OSError` nu, preuve perdue | un **intent** local est écrit et `fsync`-é *avant* la requête ; toute erreur de publication devient une erreur métier typée, non vide, à code de sortie non nul ; l'intent non résolu bloque la porte |
+| commande lue par coercition | `CommandState` à cinq valeurs, domaine fermé, sans casse ni espace ; seul `discover` exact peut rapporter `DISCOVERY_ATTEMPTED` |
+| un seul seau « non établi » suraffirmant l'atteinte | six populations de coût, dont `provider_reached_cost_unestablished` et `provider_reach_unestablished` séparés ; quatre bloquent |
+| reçu rejeté alimentant des compteurs sémantiques | un reçu malformé, contradictoire, de couple inconnu ou d'identifiant divergent n'alimente que les raisons, les populations, `rejected_receipt_credits_not_counted` et un recensement **médico-légal** distinct |
+| catalogue vérifié dans un seul sens | `PERSISTED_COUPLES` est comparé à ce que les vrais chemins de commande écrivent, dans les deux sens |
+| quarantaine non bornée, remplaçante, inaccessible | elle opère sur un **nom de base** du répertoire déjà ouvert, réessaie au lieu de remplacer, et une commande `receipts quarantine --name` l'expose |
+
 ## 1. Neuf faits, jamais condensés
 
 | # | Fait | Établi par |
@@ -135,7 +180,7 @@ Portée commune à tous : provider `the_odds_api`, un seul bookmaker par
 observation **et `bookmaker_state = OBSERVED`**, âge du marché ≤ **900 s**, reçu
 **v4** portant `qualification_protocol_version = 5` et
 `provider_adapter_evidence_version = 1`, `recorded_at`
-**≥ `2026-08-10T14:00:37+00:00`**, **atteinte du fournisseur établie** au sens du §2.4,
+**≥ `2026-08-11T04:50:40+00:00`**, **atteinte du fournisseur établie** au sens du §2.4,
 et **contrat structurel du §2.0 satisfait**.
 
 Le 900 est un littéral du protocole. Le produit a par ailleurs un réglage runtime
@@ -270,71 +315,68 @@ seulement non qualifiant.
 `PROVIDER_UNAVAILABLE` n'en fait pas partie : un timeout de lecture et un 5xx sont deux
 issues différentes, et le harnais ne prétend pas savoir laquelle.
 
+### 2.5 État de commande : un domaine fermé
+
+`CommandState` lit `command` aussi strictement qu'`AttemptState` lit
+`network_attempted` : `PLAN`, `DISCOVER`, `CORE`, `ADDITIONAL`, ou
+`COMMAND_STATE_UNESTABLISHED`. Aucune casse, aucun espace, aucune coercition —
+`Core`, `" core "`, `sync`, `7`, `["core"]`, `None` et un champ absent sont tous non
+établis, et c'est une **faute structurelle**.
+
+Trois conséquences :
+
+* seul `discover` exact, avec une tentative confirmée cohérente, peut rapporter
+  `DISCOVERY_ATTEMPTED`. La v5 y arrondissait tout le reste ;
+* seuls `core` et `additional` entrent dans le dénominateur payant. `Core` et
+  `" core "` échappaient à `PAID_COMMANDS` **et** au contrat structurel, donc un pas
+  payant pouvait être rapporté comme non payant et disparaître du recensement ;
+* un reçu `plan` portant une tentative est rejeté : la phase `PLANNED` exige déjà
+  `network_attempted` faux et `attempts` nul, et `contradictions` le nomme aussi, pour
+  que l'invariant survive à un changement de la table.
+
 ### 2.1 Ce qu'est un coût conforme
 
-Pas « tout reçu payant qui n'est pas un `COST_MISMATCH` ». Un coût est **établi**
-quand, cumulativement : le reçu est admissible au sens ci-dessus ; la commande est
-payante (`core` ou `additional`) ; une socket a été ouverte **et** la requête a pu
-être servie ; `estimated_credits` est un entier dans `[0, plafond de la commande]` ;
-`observed_credits` est un entier — jamais un booléen — dans le même intervalle ;
-`accounted_credits == observed_credits` ; et le statut appartient à
-`{CORE_LIVE_VERIFIED, ADDITIONAL_LIVE_VERIFIED, ADDITIONAL_PARTIAL_COVERAGE,
-COVERAGE_MISSING}`.
+Un pas payant conforme est un pas dont le coût est **établi** et tenu : l'estimation
+respecte le plafond contractuel, l'observation existe, et les deux concordent avec ce
+que le reçu comptabilise. Tout le reste est nommé pour ce qui manque.
 
-Deux conséquences voulues. Un `COVERAGE_MISSING` **postérieur** à la date d'effet
-compte pour le coût — il a été facturé et son en-tête était lisible — et ne compte
-jamais pour un critère de mapping. Un coût seulement **supposé** après un timeout,
-où `accounted_credits` retombe sur l'estimation, n'est pas une preuve de coût : c'est
-une écriture de prudence.
-
-**Le dénominateur : un pas payant distinct.** Les catégories sont exhaustives et
-disjointes sur une population **explicitement définie** — tout reçu de commande payante
-(`core` ou `additional`) du protocole courant, **dédupliqué** par identifiant et empreinte
-scellée, dont l'état de tentative n'est pas `NOT_ATTEMPTED`.
-
-Un pas jamais tenté est hors recensement : ce n'est pas un défaut, simplement pas un appel
-payant. Un pas dont l'état de tentative n'est pas établi y **reste** et bloque, parce qu'un
-reçu incapable de dire s'il a dépensé un crédit n'est pas une preuve qu'il n'en a pas
-dépensé.
-
-**Cinq catégories, exhaustives et disjointes**, plus l'exclusion :
-
-| Catégorie | Conditions | Effet sur `COST_CONFORMITY` |
-| --- | --- | --- |
-| — (hors recensement) | `network_attempted is false` **et** `attempts == 0` | exclu, non bloquant |
-| `paid_attempt_state_unestablished` | drapeau réseau absent, mal typé ou incohérent avec `attempts` | **bloque**, ne qualifie pas |
-| `confirmed_attempts_not_sent` | tentative confirmée **et** `may_have_reached_provider is false` — les deux drapeaux exacts | **exclu du dénominateur fournisseur, non bloquant**, et ne qualifie rien |
-| `provider_reached_conforming_cost` | atteinte établie et coût établi conforme au sens ci-dessus | contribue au seuil de **6** |
-| `provider_reached_nonconforming_cost` | `COST_MISMATCH` | **bloque** |
-| `provider_reached_unestablished_cost` | `COST_UNVERIFIED`, coût illisible, hors borne ou incohérent — **ou** atteinte non établie alors que la tentative l'est | **bloque** |
-
-Le critère passe **si et seulement si** :
+**Six populations, exhaustives et disjointes** sur tout pas payant distinct que le
+contrat accepte de lire, dont l'état de tentative n'est pas « jamais tentée » :
 
 ```text
-provider_reached_conforming_cost >= 6
-provider_reached_nonconforming_cost == 0
-provider_reached_unestablished_cost == 0
-paid_attempt_state_unestablished == 0
+provider_reached_conforming_cost      >= 6   (contribue au seuil)
+provider_reached_nonconforming_cost   == 0   (COST_MISMATCH — bloque)
+provider_reached_cost_unestablished   == 0   (atteinte établie, coût illisible ou
+                                              hors borne — bloque)
+provider_reach_unestablished          == 0   (l'atteinte elle-même n'est pas établie
+                                              — bloque)
+paid_attempt_state_unestablished      == 0   (drapeau ou compteur de tentative non
+                                              établi — bloque)
+confirmed_attempts_not_sent            —     (recensé à part : ni aide, ni blocage)
 ```
 
-**Pourquoi `confirmed_attempts_not_sent` ne bloque pas.** Une requête dont il est certain
-qu'elle n'a pas été servie n'a mesuré aucun tarif. Elle ne doit donc ni aider le seuil, ni
-invalider six observations réellement servies et réellement conformes. C'est une décision
-de propriétaire, et elle ne tient que parce que les deux drapeaux sont des booléens exacts
-et cohérents : dès que l'un ne l'est pas, le reçu retombe dans une catégorie bloquante.
+La v5 n'en avait que cinq, et le nom du seau « non établi » affirmait que le
+fournisseur avait été atteint alors que deux de ses trois alimentations étaient
+exactement les reçus où l'atteinte n'était pas établie. Une population ne peut pas
+affirmer dans son nom un fait que ses membres démentent.
 
-**`COST_UNVERIFIED` signifie coût non établi**, pas coût non conforme. La v4 le rangeait
-sous « non conforme », si bien que le même reçu changeait de sens selon le bloc consulté.
-Les deux bloquent ; ils ne disent pas la même chose.
+**Conséquence assumée, énoncée plutôt que cachée.** `may_have_reached_provider` est un
+booléen et `attempts` un compteur : un reçu qui laisse l'un des deux non établi est hors
+du contrat structurel, donc rejeté, donc — par la règle ci-dessous — hors de tout
+compteur sémantique. Les deux populations `provider_reach_unestablished` et
+`paid_attempt_state_unestablished` restent donc à zéro dans le recensement sémantique et
+sont comptées dans le recensement **médico-légal** `rejected_paid_cost_census`, qui est
+la place d'un reçu que le contrat refuse de lire. Le contrat structurel n'est pas
+affaibli pour rendre un seau atteignable.
 
-Un `PROVIDER_UNAVAILABLE` qui a pu atteindre le fournisseur fait donc échouer le
-critère, même après six appels conformes. La v2 l'ignorait en silence.
-
-**Ce que ce critère ne prouve pas.** Il établit deux choses : aucun appel n'a
-dépassé la borne annoncée, et ce que nous comptabilisons égale ce que le
-fournisseur a annoncé. Il n'établit **pas** que le tarif contractuel a été appliqué
-exactement — un appel annoncé à 0 crédit reste conforme, ce qui prouve l'absence de
-dépassement et non le tarif.
+**Un reçu rejeté n'alimente aucun compteur sémantique.** Un reçu courant malformé,
+contradictoire, de couple inconnu ou dont l'identifiant désigne deux contenus signés
+différents alimente : les raisons, les populations de réconciliation,
+`rejected_receipt_credits_not_counted`, `rejected_paid_receipts` et
+`rejected_paid_cost_census`. Il n'alimente pas : `execution_state`,
+`paid_activation_state`, `connectivity_and_cost_proof`, `paid_call_cost_census`, les
+observations de couverture, ni `accounted_credits_total`. Il bloque déjà la porte par
+`EVIDENCE_CONFLICT`, et il reste visible dans les compteurs physiques.
 
 ### 2.2 Contradictions qui font échouer fermé
 
@@ -486,7 +528,7 @@ Une observation compte si, et seulement si, elle est :
 
 1. portée par un reçu **v4** dont la **signature se vérifie localement**, portant
    `qualification_protocol_version = 5` et `provider_adapter_evidence_version = 1` ;
-2. **postérieure ou égale** à `2026-08-10T14:00:37+00:00`, `recorded_at` étant un
+2. **postérieure ou égale** à `2026-08-11T04:50:40+00:00`, `recorded_at` étant un
    ISO 8601 avec timezone, normalisé en UTC pour la comparaison ;
 3. rattachée à une **tentative confirmée dont le fournisseur a réellement été
    atteint** : `network_attempted is true`, `attempts ≥ 1` **et**
@@ -543,6 +585,24 @@ population : la même observation deux fois reste dans la population de son cont
 seuls les compteurs de diversité la dédupliquent. Le nombre est publié séparément sous
 `qualification_exact_duplicate_copies`. Mélanger les deux modèles est la façon dont
 une équation de réconciliation cesse de s'équilibrer.
+
+### 3.2 Intents de tentative non résolus
+
+Avant chaque requête — `discover` comprise — un **intent** local est écrit
+atomiquement et `fsync`-é : identifiant, commande, portée, plafond contractuel, état
+`PREPARED`. Aucune clé, aucune URL, aucun événement en clair, aucune cote, aucun
+payload. Il n'est supprimé qu'après la publication durable du reçu final portant le
+même identifiant.
+
+Sa survie est la seule chose qui reste quand la publication échoue, et c'est le trou
+que la v5 laissait ouvert : cinq crédits engagés, `write_receipt` en échec, et aucune
+trace qu'une requête avait été tentée. Donc :
+
+* `unresolved_attempt_intents` est publié, en JSON **et** en lecture humaine ;
+* tout intent non résolu est un **conflit de preuve** et bloque la porte ;
+* le rapprochement est idempotent : si le reçu existe déjà, l'intent est résolu sans
+  rien compter deux fois ;
+* deux workers sur le même identifiant obtiennent un seul intent.
 
 ## 4. Déduplication
 
@@ -705,69 +765,83 @@ et requêtes fait échouer la suite au lieu de passer inaperçue.
 
 Le pire cas coûte 16 crédits. Le cas d'échec précoce en coûte 1.
 
-## 9. Écriture et audit des reçus : une frontière, appliquée avant toute lecture
+## 9. Écriture et audit des reçus : un descripteur, pas un chemin
 
-Le répertoire de reçus est local, gitignoré, sans distant, et **tout ce qui peut y
-écrire n'est pas nous**. Les deux fonctions qui le touchent appliquent donc la même
-frontière, et l'appliquent **avant** d'ouvrir quoi que ce soit.
+**Frontière du répertoire.** Le répertoire de reçus est ouvert **une fois**, composant
+par composant, chacun avec `O_DIRECTORY`, `O_NOFOLLOW` et `O_CLOEXEC` relativement au
+descripteur du parent déjà sûr, `fstat` à l'appui. Le descripteur obtenu sert à tout :
+`os.listdir(fd)`, `os.open(..., dir_fd=fd)`, `os.link(..., src_dir_fd=fd,
+dst_dir_fd=fd, follow_symlinks=False)`, `os.unlink(..., dir_fd=fd)`, `os.stat(...,
+dir_fd=fd, follow_symlinks=False)` et `os.fsync(fd)`. Aucune opération sensible ne
+revient à `répertoire / nom` après l'ouverture.
 
-`audit_receipts()` — lecture, jamais autorité. Aucun reçu trouvé ici n'autorise une
-étape : une étape est autorisée par un reçu que l'opérateur nomme en ligne de
-commande. Jusqu'à la v3 cette fonction **suivait** les liens symboliques, si bien
-qu'un reçu placé n'importe où sur le disque pouvait satisfaire un critère — alors que
-`load_parent()` refusait exactement le même lien.
+La v5 protégeait le *nom* et pas le *répertoire* : elle l'ouvrait par chemin avec
+`O_DIRECTORY` seul, puis reprenait des chemins pour `link`, `unlink` et le `fsync`.
+Trois probes déterministes en ont fait la démonstration — répertoire-lien, parent
+substitué, répertoire permuté entre le listing et l'ouverture — et dans les trois cas
+le contenu d'un fichier extérieur a été lu, vérifié et rapporté. Sur une plateforme
+sans `O_NOFOLLOW` ou sans opérations relatives à un descripteur, le répertoire n'est
+**pas lu** : échec fermé, jamais un retour au contrôle vulnérable.
 
-| Cas | Résultat |
-| --- | --- |
-| fichier régulier interne valide | vérifié et lu |
-| copie régulière byte-à-byte identique | **une** observation (dimension croisée du §3.1) |
-| lien symbolique interne | jamais suivi, compté invérifiable |
-| lien symbolique externe | jamais suivi, compté invérifiable, **zéro** contribution |
-| lien brisé | compté invérifiable, jamais ouvert |
-| répertoire nommé `x.json` | compté invérifiable |
-| cible se résolvant hors du répertoire | jamais lue |
+**Publication atomique, dans cet ordre exact :**
 
-Aucun de ces cas ne fait apparaître un chemin ni un contenu étranger dans une sortie.
+1. écrire tous les octets dans un temporaire neuf du même répertoire, sous un nom qui
+   n'est pas `*.json` ;
+2. `fsync` du temporaire ;
+3. publier sous le nom final par un lien dur, qui **échoue** au lieu de remplacer si le
+   nom est pris ;
+4. `fsync` du répertoire, pour que la nouvelle entrée survive ;
+5. supprimer le temporaire ;
+6. `fsync` du répertoire, pour que sa suppression survive aussi.
 
-**L'ouverture porte la garantie, pas un contrôle préalable.** Un `is_symlink()` suivi
-d'un `read_text()` séparé vérifie un objet et lit ce qui occupe le nom un instant plus
-tard. Toute lecture servant à une décision passe donc par une primitive unique : ouverture
-relative à un **descripteur de répertoire**, `O_NOFOLLOW`, `fstat` pour exiger un fichier
-régulier, et lecture **depuis ce descripteur**. Un `resolve()` antérieur ne prouve rien : un
-probe déterministe remplaçait un reçu régulier par un lien vers l'extérieur dans cette
-fenêtre, et son contenu devenait un reçu vérifié. Sur une plateforme sans `O_NOFOLLOW`, le
-répertoire n'est **pas lu** — échec fermé, jamais un retour au contrôle vulnérable.
-`receipt_secret` utilise la même primitive : ce fichier *est* le secret.
+La v5 documentait l'ordre 5-puis-6 à l'envers de ce qu'elle faisait, et **supprimait**
+l'erreur de `fsync` du répertoire avec `contextlib.suppress(OSError)` tout en
+revendiquant la durabilité. Ici aucune étape n'est supprimée : une erreur de durabilité
+est levée et dit si la preuve avait été publiée avant l'échec (`published`) et s'il
+reste quelque chose à nettoyer (`cleanup_pending`). La boucle d'écriture n'a pas de
+`written += os.write(...)` sans garde : un retour à zéro est absorbé au plus trois fois,
+puis c'est une erreur — un probe de la v5 tournait indéfiniment et a dû être tué.
 
-**Publication atomique.** `O_CREAT | O_EXCL` est atomique sur l'*existence* et ne dit rien
-du contenu : le nom final apparaissait vide puis était rempli, donc une interruption entre
-les deux publiait un reçu qui n'en était pas un — et le même reçu était ensuite refusé pour
-toujours sous « contenu signé différent », ce qui était faux. La séquence est désormais :
+Sur cible finale existante : un fichier régulier identique est idempotent ; un **reçu
+signé valide** divergent est une collision explicite et reste intact ; un fichier vide,
+tronqué ou qui n'est pas du JSON signé n'est **jamais** appelé « contenu signé
+différent » — il est nommé incomplet, et le message renvoie vers la commande qui le met
+de côté.
 
-1. sérialiser et signer entièrement en mémoire ;
-2. créer un temporaire neuf du même répertoire, sans suivre de lien, en `0600`, sous un nom
-   qui n'est pas `*.json` — l'audit ne le voit donc jamais ;
-3. écrire tous les octets, puis `fsync` du fichier ;
-4. publier sous le nom final avec un lien dur, qui **échoue** au lieu de remplacer si le nom
-   est pris — `rename` aurait écrasé silencieusement une cible concurrente ;
-5. `fsync` du répertoire ;
-6. supprimer le temporaire, y compris après échec ;
-7. une interruption avant publication ne laisse **aucun** `*.json` final partiel.
+**Quarantaine.** `quarantine_incomplete_receipt` prend un **nom de base** du répertoire
+déjà ouvert, jamais un chemin. La v5 dérivait son répertoire de son argument, donc elle
+renommait n'importe quel fichier que le processus pouvait atteindre — y compris hors du
+répertoire de reçus, et, sous parent substitué, un fichier étranger. Elle utilisait
+aussi `os.rename`, qui **remplace** : une collision forcée détruisait les octets du
+premier fichier mis de côté, contre la promesse du protocole de n'en perdre aucun. La
+v6 déplace par lien dur puis suppression, réessaie un nombre borné de fois sur
+collision, et refuse un reçu signé complet sans `--force`.
 
-Sur cible finale existante : un fichier régulier identique est idempotent ; un **reçu signé
-valide** divergent est une collision explicite et reste intact ; un fichier vide, tronqué ou
-qui n'est pas du JSON signé n'est **jamais** appelé « contenu signé différent » — il est
-nommé incomplet, et `quarantine_incomplete_receipt` le met de côté sous un nom hors de
-l'audit, sans perdre un octet, ce qui libère le nom et permet la reprise à l'identique.
+Elle est enfin **exécutable** :
 
-`write_receipt()` — nom construit depuis des composants
-**validés**. `command` et `receipt_id` doivent être des chaînes non vides sans
-séparateur de chemin ; `recorded_at` est **parsé** puis reformaté, au lieu d'être
-découpé dans le texte. Cette dernière règle est ce qui manquait : un `recorded_at` de
-`"../../2026-08-11T12:00:00+00:00"` survivait au découpage sous la forme
-`"../../20260811T"` et plaçait le reçu deux répertoires au-dessus du sien.
+```bash
+python -m betmaxxing.providers.the_odds_api.activation receipts quarantine --name NOM.json
+```
 
-Le parent résolu est revérifié juste avant l'ouverture exclusive, et un lien
-symbolique déjà présent à la cible est refusé **sans** lire ce qu'il désigne. Réécrire
-un reçu byte-à-byte identique est idempotent ; un contenu divergent sous le même nom
-est refusé plutôt que substitué — un reçu n'est jamais remplacé.
+La v5 renvoyait l'opérateur vers une fonction qu'aucune commande n'exposait : la seule
+sortie de secours documentée n'était pas jouable.
+
+**`write_receipt()`** — nom construit depuis des composants **validés**. `command` et
+`receipt_id` doivent être des chaînes non vides sans séparateur de chemin ;
+`recorded_at` est **parsé** puis reformaté, au lieu d'être découpé dans le texte. Un
+`recorded_at` de `"../../2026-08-11T12:00:00+00:00"` survivait au découpage sous la
+forme `"../../20260811T"` et plaçait le reçu deux répertoires au-dessus du sien.
+
+**`audit_receipts()`** — le seul endroit où une provenance est frappée. La signature est
+vérifiée une fois, ici, contre un secret que cette fonction **charge** sans jamais le
+créer : une installation qui a des reçus et pas de secret les rapporte tous comme
+invérifiables au lieu d'inventer une clé qui les rendrait valides. Ce qui en sort est un
+`VerifiedReceiptBatch`, et `evaluate` refuse tout le reste.
+
+**Table des couples.** `RECEIPT_PHASES` contient **26 couples** et **30 formes** en
+comptant les quatre couples bi-phase. Parmi eux, **21** sont réellement persistés par un
+chemin de commande et **5** sont des réponses que le contrat doit avoir sans qu'aucun
+producteur ne les écrive : les deux couples `plan`, qui n'écrit rien du tout, et les
+trois `PREPARED_NOT_EXECUTED` de `discover`, `core` et `additional` — un refus *avant*
+le réseau n'écrit aucun reçu, délibérément. Le test qui compare la table aux chemins
+réels échoue dans les **deux** sens.
