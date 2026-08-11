@@ -141,7 +141,11 @@ que soient les régions configurées.
   incomparablement plus forte qu'un booléen : on ne peut pas les fournir sans
   savoir ce que l'étape coûte.
 * **Chaîne explicite.** `core` exige `--discovery-receipt`, `additional` exige
-  `--core-receipt`. L'outil ne parcourt plus le répertoire de reçus pour se
+  `--core-receipt`. Depuis D-077 la valeur est réduite **textuellement** à un nom de
+  base du répertoire de reçus autorisé : le nom seul, ou le chemin que la commande
+  précédente a imprimé, et rien d'autre. Aucune cible n'est résolue, donc aucun lien
+  n'est suivi, et le fichier est lu par le même descripteur que l'audit.
+  L'outil ne parcourt plus le répertoire de reçus pour se
   choisir une preuve à la place de l'opérateur.
 * **Aucun endpoint historique ou payant** n'est joignable depuis cet outil.
 * **Toute tentative réseau laisse un reçu**, quel que soit son statut terminal.
@@ -184,9 +188,25 @@ appartient à l'opérateur, pas au dépôt.
 ### Le secret local de signature
 
 Un secret aléatoire est créé au premier besoin réseau, dans le répertoire de
-reçus, en `O_CREAT | O_EXCL` et mode `0600`. Il n'est jamais affiché, jamais
+reçus, publié atomiquement en mode `0600`. Il n'est jamais affiché, jamais
 journalisé, jamais versionné. Les tests injectent un secret déterministe par
 `BETMAXXING_ACTIVATION_RECEIPT_SECRET` et ne dépendent d'aucun aléa réel.
+
+Sa politique, depuis D-077, en toutes lettres :
+
+* **un secret est exactement 64 caractères hexadécimaux minuscules.** Rien n'est
+  « réparé » : ni `strip()`, ni casse tolérée, ni régénération d'un secret invalide —
+  le régénérer rendrait invérifiable chaque reçu déjà signé ;
+* **la variable d'environnement est une configuration, pas un argument.** Elle gagne
+  quand elle est *positionnée*, et une variable **présente mais vide** est une valeur
+  invalide, plus une absence. Seule l'absence réelle autorise la lecture du fichier ou
+  la création ;
+* **sur POSIX, un secret que quelqu'un d'autre peut lire est refusé** : non régulier,
+  appartenant à un autre UID, ou accordant un droit au groupe ou à tous. Le mode
+  attendu est `0600`. Sur une plateforme sans propriété ni bits de permission POSIX ce
+  contrôle est **sauté**, et c'est une limite énoncée, pas une garantie implicite ;
+* **des octets qui ne sont pas de l'UTF-8 valide sont un refus typé**, jamais un
+  `UnicodeDecodeError` remonté à l'opérateur.
 
 ### Contenu (schéma v3)
 
@@ -337,7 +357,7 @@ python -m betmaxxing.providers.the_odds_api.activation core \
   --sport soccer_france_ligue_one \
   --bookmaker winamax_fr \
   --event-id EVENT_ID_CHOISI \
-  --discovery-receipt CHEMIN_RECU_DISCOVER \
+  --discovery-receipt NOM_RECU_DISCOVER.json \
   --max-credits 1 \
   --acknowledge-credits 1 \
   --allow-network
@@ -359,7 +379,7 @@ python -m betmaxxing.providers.the_odds_api.activation additional \
   --sport soccer_france_ligue_one \
   --bookmaker winamax_fr \
   --event-id LE_MEME_EVENT_ID \
-  --core-receipt CHEMIN_RECU_CORE \
+  --core-receipt NOM_RECU_CORE.json \
   --max-credits 5 \
   --acknowledge-credits 5 \
   --allow-network
@@ -413,11 +433,11 @@ de candidat en `paper` ou `live_analysis`, démarrage d'un ordonnanceur réel,
 envoi de notification, pari ou automatisme de mise, interface web, et
 versionnement d'un payload fournisseur brut.
 
-## Lire la qualification (D-071, corrigée par D-072 à D-076)
+## Lire la qualification (D-071, corrigée par D-072 à D-077)
 
 `activation status` porte, depuis 03C-1, un sixième bloc : l'évaluation des
 critères **préenregistrés** de `docs/provider-validation-protocol.md`
-(`PROVIDER_VALIDATION_PROTOCOL_VERSION = 6`,
+(`PROVIDER_VALIDATION_PROTOCOL_VERSION = 7`,
 `PROVIDER_ADAPTER_EVIDENCE_VERSION = 1`, schéma de reçu `v4`).
 
 ```bash
@@ -431,6 +451,47 @@ de tentative non résolus, états d'exécution et de commande, preuve de connect
 raisons bloquantes. La lecture humaine est plus compacte ; elle n'omet rien qui changerait
 une décision. Jusqu'à la v5 le recensement et les crédits rejetés n'existaient qu'en JSON
 alors que ce document annonçait « le même contenu ».
+
+### Trois états de la frontière des reçus
+
+`activation status` publie, en JSON et en lecture humaine, l'état de la frontière
+elle-même — parce qu'un répertoire qu'on ne peut pas lire n'est pas un répertoire vide,
+et que la v6 rapportait les deux à l'identique :
+
+| État | Ce qu'il dit | Effet sur la porte |
+| :-- | :-- | :-- |
+| `ABSENT` | aucun répertoire de reçus : rien n'a encore été exécuté, et **rien n'est créé** par la lecture | aucune preuve, donc fermée |
+| `AVAILABLE` | répertoire sûr et lu ; les comptes de reçus valent ce qu'ils disent | selon les critères |
+| `UNAVAILABLE` | le répertoire existe et n'est pas lisible sans ambiguïté — lien symbolique, composant substitué, objet non régulier, permission refusée, garantie noyau absente | **conflit de preuve**, fermée |
+
+`UNAVAILABLE` est accompagné d'une **catégorie** (`ambiguous_component`,
+`not_a_directory`, `permission_denied`, `kernel_support_missing`, `unreadable`), jamais
+d'un chemin. La lecture humaine ajoute une ligne `FRONTIÈRE INDISPONIBLE` qui dit que
+plus aucun compte n'est établi.
+
+### Le contrat d'un intent de tentative
+
+Un intent est un **bloqueur prudent**, jamais une preuve positive. Depuis D-077 son
+contrat est fermé dans les deux sens : neuf champs exactement — `intent_version`,
+`attempt_id`, `command`, `sport_key`, `bookmaker`, `event_tag`, `max_credits`, `state`,
+`prepared_at` —, types et bornes vérifiés, commande dans un domaine fermé, et
+identifiant du corps égal au nom du fichier. Un champ absent, un champ en trop, une
+valeur mal typée ou hors borne : l'intent est **invalide**, il reste **bloquant**, et il
+est rapporté sous son seul nom local avec l'état `UNREADABLE_OR_INVALID`. Aucune valeur
+de son contenu n'est réfléchie dans le JSON ni dans le terminal.
+
+Publier deux fois le même intent est idempotent **sur octets identiques seulement**.
+Le même `attempt_id` avec une commande, un sport, un bookmaker, un tag ou un plafond
+différents est un refus typé **avant le réseau**, et une cible vide, tronquée, lien ou
+répertoire n'est jamais comptée comme une publication réussie.
+
+Un intent n'est résolu que par un reçu **durable, vérifié par l'audit contre le secret
+local, de schéma accepté**, portant le même identifiant, la même commande, le même
+sport, le même bookmaker, le même tag éventuel, un coût compatible avec son plafond, un
+couple réellement persistable du catalogue, aucune faute structurelle, aucune
+contradiction et la même lignée de versions. Un JSON seulement analysable, une signature
+d'une autre clé, un schéma inconnu, une commande inconnue ou une portée différente ne le
+résolvent **jamais** : la v6 les acceptait tous les treize.
 
 ### Reprendre après un reçu incomplet
 
@@ -446,6 +507,14 @@ Elle exige un **nom de base** du répertoire de reçus, jamais un chemin ; elle 
 tous les octets sous un nom hors de l'audit, ne remplace jamais une quarantaine
 existante, libère le nom d'origine, et refuse un reçu signé complet sans `--force`.
 Rejouez ensuite l'étape : le même reçu est republié à l'identique.
+
+**Son périmètre, depuis D-077 :** un nom de base finissant par `.json`, et rien d'autre.
+Le secret de signature, tout fichier `*.intent`, tout temporaire de publication et tout
+autre fichier régulier sont refusés **avec et sans `--force`**. La v6 ne l'imposait pas :
+`--name <identifiant>.intent` rendait 0 et faisait passer la porte de
+`EVIDENCE_CONFLICT` à `CRITERIA_MET_AWAITING_HUMAN_REVIEW` — un conflit supprimé sans
+qu'aucun reçu existe — et `--name signing-key.secret` rendait huit reçus vérifiés
+invérifiables. `--force` ne sert qu'à archiver un reçu signé complet.
 
 ### Une tentative dont la preuve n'a pas pu être écrite
 

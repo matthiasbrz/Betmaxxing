@@ -32,7 +32,6 @@ import pytest
 
 from betmaxxing.providers.the_odds_api import activation as act
 from betmaxxing.providers.the_odds_api import qualification as qual
-from betmaxxing.providers.the_odds_api import receipt_store as _store
 from helpers_activation import FAKE_RECEIPT_SECRET
 
 FOOTBALL = "soccer_france_ligue_one"
@@ -75,17 +74,23 @@ def _tag_with_secret(event_id: str) -> str:
 
 
 def _trusted(receipts: Any, unverifiable: int = 0) -> Any:
-    return _store.VerifiedReceiptBatch(
-        tuple(_store.trust(r, secret=_SIGNING) for r in receipts), unverifiable
-    )
+    """One real audit of a throwaway directory — see `helpers_receipt_boundary`.
+
+    D-077: the provenance type has no public constructor and no key-taking factory, so
+    a suite acquires evidence the way production does. Every assertion below is
+    unchanged; only this function is.
+    """
+    from helpers_receipt_boundary import audited
+
+    return audited(receipts, unverifiable, secret=_SIGNING)
 
 
 def _evaluate(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
-    return qual.evaluate(_trusted(receipts, unverifiable), unverifiable, **kw)
+    return qual.evaluate(_trusted(receipts, unverifiable), **kw)
 
 
 def _state(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
-    return act.build_activation_state(_trusted(receipts, unverifiable), unverifiable, **kw)
+    return act.build_activation_state(_trusted(receipts, unverifiable), **kw)
 
 
 def signed(**fields: Any) -> dict[str, Any]:
@@ -383,12 +388,12 @@ class TestEvidenceIsBoundToProtocolAndImplementation:
             receipt = signed()
             receipt[field] = 99
             assert _verify_with_secret(receipt) is False
-            # v6 moved this refusal upstream: the evaluator no longer verifies signatures,
-            # so an altered receipt cannot even be offered to it, and the population that
-            # counts it is the audit's own.
-            with pytest.raises(_store.UnverifiedProvenance):
-                _evaluate([receipt], 0)
-            document = _evaluate([], 1)
+            # v6 moved this refusal upstream to `audit_receipts`; D-077 made the audit the
+            # only way in, so the refusal is now a *count* rather than an exception. The
+            # property is unchanged and still checked on both halves: the altered receipt
+            # verifies as False, and it lands in the unverifiable population having
+            # supported nothing.
+            document = _evaluate([receipt], 0)
             assert document["qualification_unverifiable_receipts"] == 1
             assert document["qualification_admissible_receipts"] == 0
 
@@ -786,19 +791,24 @@ class TestTheHmacTagPolicy:
 class TestTheAuditCounterIsNotOverwritten:
     """`**qualification` used to spread a same-named key over the D-062 field."""
 
-    def test_the_two_counters_coexist_and_disagree_when_they_should(self) -> None:
+    def test_the_two_counters_coexist_and_now_read_one_audit(self) -> None:
         receipts = full_corpus() + full_corpus(schema_version=3, id_offset=0x1000)
         unknown = signed(receipt_id="ee" * 8, schema_version=99)
         document = _state([*receipts, unknown], unverifiable=4)
-        assert document["unverifiable_receipts"] == 4
-        assert document["verified_receipts"] == 17
-        # The two counters still coexist and still disagree, which is the property. What
-        # moved in v6: a receipt whose schema this installation cannot read is refused by
-        # `audit_receipts` and can no longer reach the evaluator, so the evaluator's
-        # unverifiable counter carries only what the caller hands it. The receipt with
-        # `schema_version=99` is therefore filed as non-qualifying history here.
-        assert document["qualification_unverifiable_receipts"] == 4
-        assert document["qualification_historical_nonqualifying_receipts"] == 9
+        # Both keys still exist and are both published, which is what this test was
+        # written to protect: a `**qualification` spread once overwrote the D-062 field
+        # with a same-named key of a different provenance.
+        #
+        # What changed at D-077, deliberately: there is now **one** audit, and both
+        # counters read it. They can no longer disagree, because the two provenances that
+        # let them disagree were the two ways of counting the same files — and having two
+        # was the defect, not the feature. The unreadable receipt (`schema_version=99`)
+        # is counted here as well, so the number is five, not four.
+        assert document["unverifiable_receipts"] == 5
+        assert document["qualification_unverifiable_receipts"] == 5
+        assert document["verified_receipts"] == 16
+        assert document["qualification_historical_nonqualifying_receipts"] == 8
+        assert document["qualification_historical_nonqualifying_receipts"] == 8
         assert document["qualification_admissible_receipts"] == 8
 
     def test_the_qualification_keys_are_all_prefixed(self) -> None:

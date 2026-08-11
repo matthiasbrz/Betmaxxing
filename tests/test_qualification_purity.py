@@ -93,39 +93,46 @@ class TestTheEvaluatorHasNoAmbientEffect:
     def test_it_reads_no_environment_no_file_and_signs_nothing(
         self, corpus_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        batch, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
         spy = Spy(monkeypatch)
-        document = qual.evaluate(batch, unverifiable)
+        document = qual.evaluate(_audit)
         assert spy.offenders == {}, f"evaluate is not pure: {spy.offenders}"
         assert document["qualification_usable_receipts"] >= 1
 
     def test_it_creates_no_secret_when_the_secret_is_gone(self, corpus_dir: Path) -> None:
-        batch, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
         (corpus_dir / act.SECRET_FILENAME).unlink()
-        qual.evaluate(batch, unverifiable)
+        qual.evaluate(_audit)
         assert not (corpus_dir / act.SECRET_FILENAME).exists()
 
     def test_its_verdict_does_not_depend_on_the_ambient_secret(
         self, corpus_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        batch, unverifiable = act.audit_receipts()
-        first = qual.evaluate(batch, unverifiable)
+        _audit = act.audit_receipts()
+        first = qual.evaluate(_audit)
         monkeypatch.setenv(act.SECRET_VARIABLE, OTHER)
         monkeypatch.chdir(corpus_dir.parent)
-        assert qual.evaluate(batch, unverifiable) == first
+        assert qual.evaluate(_audit) == first
 
     def test_it_does_not_mutate_its_input(self, corpus_dir: Path) -> None:
-        batch, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        batch = _audit.batch
         before = [dict(receipt) for receipt in batch]
-        qual.evaluate(batch, unverifiable)
+        qual.evaluate(_audit)
         assert [dict(receipt) for receipt in batch] == before
 
-    def test_it_is_independent_of_order(self, corpus_dir: Path) -> None:
-        batch, unverifiable = act.audit_receipts()
-        forward = qual.evaluate(batch, unverifiable)
-        backward = qual.evaluate(
-            store.VerifiedReceiptBatch(tuple(reversed(batch)), unverifiable), unverifiable
-        )
+    def test_it_is_independent_of_order(self, corpus_dir: Path, tmp_path: Path) -> None:
+        """Order comes from the directory listing now: reverse the *names*, not the batch.
+
+        D-077 removed the batch constructor, so a suite cannot hand the evaluator a
+        re-ordered collection. It can put the same receipts on disk under names that
+        sort the other way, which is the only ordering production ever sees.
+        """
+        from helpers_receipt_boundary import audited
+
+        forward = qual.evaluate(act.audit_receipts())
+        payloads = [receipt.to_builtin() for receipt in act.audit_receipts().batch]
+        backward = qual.evaluate(audited(list(reversed(payloads)), secret=SECRET))
         for key in (
             "qualification_state",
             "qualification_usable_receipts",
@@ -140,39 +147,52 @@ class TestProvenanceIsExplicit:
 
         raw = threshold_corpus(SECRET)
         with pytest.raises(store.UnverifiedProvenance):
-            qual.evaluate(raw, 0)
+            qual.evaluate(raw)  # type: ignore[arg-type]
         with pytest.raises(store.UnverifiedProvenance):
-            act.build_activation_state(raw, 0)  # type: ignore[arg-type]
+            act.build_activation_state(raw)  # type: ignore[arg-type]
 
     def test_a_batch_of_one_raw_mapping_among_verified_ones_is_refused(
         self, corpus_dir: Path
     ) -> None:
         from helpers_qualification_corpus import threshold_corpus
 
-        batch, _ = act.audit_receipts()
+        _audit = act.audit_receipts()
+        batch = _audit.batch
         mixed = [*list(batch), threshold_corpus(SECRET)[0]]
+        # D-077: a *sequence* is refused whatever it holds. v6 accepted any sequence
+        # whose members passed `isinstance`, which is how a list of hand-built objects
+        # reached the gate; the evaluator now takes an audit result and nothing else.
         with pytest.raises(store.UnverifiedProvenance):
-            qual.evaluate(mixed, 0)
+            qual.evaluate(mixed)  # type: ignore[arg-type]
+        with pytest.raises(store.UnverifiedProvenance):
+            qual.evaluate(list(batch))  # type: ignore[arg-type]
 
     def test_the_audit_is_what_mints_verified_receipts(self, corpus_dir: Path) -> None:
-        batch, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        batch, unverifiable = _audit.batch, _audit.unverifiable
         assert isinstance(batch, store.VerifiedReceiptBatch)
         assert batch.unverifiable == unverifiable
         assert all(isinstance(receipt, store.VerifiedReceipt) for receipt in batch)
 
-    def test_minting_one_by_hand_requires_a_valid_signature(self, corpus_dir: Path) -> None:
+    def test_minting_one_by_hand_is_no_longer_possible_at_all(self, corpus_dir: Path) -> None:
+        """The v6 answer was « a valid signature ». D-077's answer is « there is no by-hand ».
+
+        `trust(payload, secret=…)` took the caller's key, so it could mint provenance
+        from any payload the caller could sign — and `VerifiedReceipt(payload)` needed no
+        key whatsoever. Both are gone: authority comes from auditing a directory.
+        """
         from helpers_qualification_corpus import threshold_corpus
 
+        assert not hasattr(store, "trust")
         good = threshold_corpus(SECRET)[0]
-        assert isinstance(store.trust(good, secret=SECRET), store.VerifiedReceipt)
         with pytest.raises(store.UnverifiedProvenance):
-            store.trust(good, secret=OTHER)
-        forged = {**good, act.SIGNATURE_FIELD: "0" * 64}
+            store.VerifiedReceipt(good)
         with pytest.raises(store.UnverifiedProvenance):
-            store.trust(forged, secret=SECRET)
+            store.VerifiedReceiptBatch((), 0)  # type: ignore[arg-type]
 
     def test_a_verified_receipt_reads_like_the_mapping_it_wraps(self, corpus_dir: Path) -> None:
-        batch, _ = act.audit_receipts()
+        _audit = act.audit_receipts()
+        batch = _audit.batch
         one = batch[0]
         assert one["command"] in {"core", "additional"}
         assert dict(one)["status"] == one["status"]
@@ -180,7 +200,8 @@ class TestProvenanceIsExplicit:
         assert len(one) == len(dict(one))
 
     def test_a_verified_receipt_cannot_be_edited_after_verification(self, corpus_dir: Path) -> None:
-        batch, _ = act.audit_receipts()
+        _audit = act.audit_receipts()
+        batch = _audit.batch
         with pytest.raises(TypeError):
             batch[0]["status"] = "CORE_LIVE_VERIFIED"
 
@@ -189,7 +210,8 @@ class TestProvenanceIsExplicit:
             '{"schema_version": 4, "command": "core", "status": "CORE_LIVE_VERIFIED"}\n',
             encoding="utf-8",
         )
-        batch, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        batch, unverifiable = _audit.batch, _audit.unverifiable
         assert unverifiable == 1
         assert all(receipt.get(act.SIGNATURE_FIELD) for receipt in batch)
 
@@ -201,8 +223,8 @@ class TestStatusNeverCreatesASecret:
         directory = tmp_path / "receipts"
         monkeypatch.setenv(act.RECEIPT_DIR_VARIABLE, str(directory))
         monkeypatch.delenv(act.SECRET_VARIABLE, raising=False)
-        batch, unverifiable = act.audit_receipts()
-        state = act.build_activation_state(batch, unverifiable)
+        _audit = act.audit_receipts()
+        state = act.build_activation_state(_audit)
         assert state["verified_receipts"] == 0
         assert state["unverifiable_receipts"] == 0
         assert not directory.exists() or list(directory.iterdir()) == []
@@ -211,10 +233,11 @@ class TestStatusNeverCreatesASecret:
         self, corpus_dir: Path
     ) -> None:
         (corpus_dir / act.SECRET_FILENAME).unlink()
-        batch, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        batch, unverifiable = _audit.batch, _audit.unverifiable
         assert len(batch) == 0
         assert unverifiable == 8
-        state = act.build_activation_state(batch, unverifiable)
+        state = act.build_activation_state(_audit)
         assert state["eligible_for_human_promotion_review"] is False
         assert not (corpus_dir / act.SECRET_FILENAME).exists()
         reason = " ".join(str(value) for value in state.values())

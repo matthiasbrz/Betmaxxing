@@ -523,6 +523,9 @@ class TestAdditionalDemandsACoreReceipt:
                 f"{command} reaches for the audit scan instead of the named receipt"
             )
         authorise = inspect.getsource(activation.load_parent)
+        # The docstring recounts what earlier versions did and names `audit_receipts`
+        # while doing so; the property is about the code, so the prose is removed first.
+        authorise = authorise.split('"""', 2)[-1]
         assert "audit_receipts" not in authorise
         assert "glob(" not in authorise, "load_parent enumerates files instead of reading one"
 

@@ -391,8 +391,8 @@ class TestAnIntentExistsBeforeTheRequest:
         from helpers_qualification_corpus import write_threshold_corpus
 
         write_threshold_corpus(workspace, FAKE_RECEIPT_SECRET)
-        batch, unverifiable = act.audit_receipts()
-        clean = act.build_activation_state(batch, unverifiable)
+        _audit = act.audit_receipts()
+        clean = act.build_activation_state(_audit)
         assert clean["eligible_for_human_promotion_review"] is True
         assert clean["unresolved_attempt_intents"] == 0
 
@@ -406,7 +406,7 @@ class TestAnIntentExistsBeforeTheRequest:
                 now=act._clock(),
             )
         )
-        blocked = act.build_activation_state(*act.audit_receipts())
+        blocked = act.build_activation_state(act.audit_receipts())
         assert blocked["unresolved_attempt_intents"] == 1
         assert blocked["eligible_for_human_promotion_review"] is False
         assert any("intent" in conflict.lower() for conflict in blocked["evidence_conflicts"])
@@ -428,7 +428,7 @@ class TestAnIntentExistsBeforeTheRequest:
         act.resolve_intent(attempt.attempt_id)
         act.resolve_intent(attempt.attempt_id)
         assert act.unresolved_intents() == []
-        state = act.build_activation_state(*act.audit_receipts())
+        state = act.build_activation_state(act.audit_receipts())
         assert state["accounted_credits_total"] == 0
         assert state["unresolved_attempt_intents"] == 0
 
@@ -482,7 +482,7 @@ class TestAnIntentExistsBeforeTheRequest:
         reconciled = act.reconcile_intents()
         assert reconciled == 1
         assert act.unresolved_intents() == []
-        state = act.build_activation_state(*act.audit_receipts())
+        state = act.build_activation_state(act.audit_receipts())
         assert state["verified_receipts"] == 1
         assert state["accounted_credits_total"] == 0
         assert state["unresolved_attempt_intents"] == 0

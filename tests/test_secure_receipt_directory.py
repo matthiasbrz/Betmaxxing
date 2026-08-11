@@ -117,9 +117,10 @@ class TestTheDirectoryItselfIsNeverFollowed:
         link = tmp_path / "receipts-link"
         link.symlink_to(outside)
         monkeypatch.setenv(act.RECEIPT_DIR_VARIABLE, str(link))
-        batch, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        batch = _audit.batch
         assert len(batch) == 0, "outside content was read through a directory link"
-        state = act.build_activation_state(batch, unverifiable)
+        state = act.build_activation_state(_audit)
         only_the_configured_path(state)
         assert state["bookmaker_coverage_observations"] == []
 
@@ -129,9 +130,10 @@ class TestTheDirectoryItselfIsNeverFollowed:
         parent_link = tmp_path / "parent-link"
         parent_link.symlink_to(outside.parent)
         monkeypatch.setenv(act.RECEIPT_DIR_VARIABLE, str(parent_link / outside.name))
-        batch, count = act.audit_receipts()
+        _audit = act.audit_receipts()
+        batch = _audit.batch
         assert len(batch) == 0
-        only_the_configured_path(act.build_activation_state(batch, count))
+        only_the_configured_path(act.build_activation_state(_audit))
 
     def test_a_broken_link_is_refused(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -139,7 +141,8 @@ class TestTheDirectoryItselfIsNeverFollowed:
         link = tmp_path / "dangling"
         link.symlink_to(tmp_path / "nowhere-at-all")
         monkeypatch.setenv(act.RECEIPT_DIR_VARIABLE, str(link))
-        batch, _ = act.audit_receipts()
+        _audit = act.audit_receipts()
+        batch = _audit.batch
         assert len(batch) == 0
 
     def test_an_internal_link_to_a_sibling_directory_is_refused(
@@ -200,7 +203,8 @@ class TestOneDescriptorForTheWholeOperation:
             return names
 
         monkeypatch.setattr(store.SecureDirectory, "listdir", swapping_listdir)
-        batch, _ = act.audit_receipts()
+        _audit = act.audit_receipts()
+        batch = _audit.batch
         assert fired["n"] == 1
         assert len(batch) == 0
 
@@ -275,7 +279,8 @@ class TestFailClosedWithoutTheKernelGuarantees:
         monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
         with pytest.raises(store.DirectoryUnsafe), store.SecureDirectory.open(inside):
             pass
-        batch, _ = act.audit_receipts()
+        _audit = act.audit_receipts()
+        batch = _audit.batch
         assert len(batch) == 0
 
     def test_no_dir_fd_support_means_the_directory_is_not_read(
@@ -299,7 +304,7 @@ class TestTheOutsideIsNeverReflected:
                 holder.symlink_to(outside.parent)
                 target = holder / outside.name
             monkeypatch.setenv(act.RECEIPT_DIR_VARIABLE, str(target))
-            batch, unverifiable = act.audit_receipts()
-            state = act.build_activation_state(batch, unverifiable)
+            _audit = act.audit_receipts()
+            state = act.build_activation_state(_audit)
             only_the_configured_path(state)
             no_reflection("\n".join(act.status_lines(state)))

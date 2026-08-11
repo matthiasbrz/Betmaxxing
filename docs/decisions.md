@@ -1778,6 +1778,17 @@ supprimé.
 
 ### D-076 — La frontière de confiance est un descripteur, un format et un type
 
+> **Supersédée pour la provenance et le journal d'intents par D-077**, et seulement sur
+> les points que D-077 remplace : la constructibilité du type de provenance,
+> l'immutabilité d'un reçu admis, la frontière de `load_parent`, la distinction entre une
+> frontière absente et une frontière indisponible, le contrat et le rapprochement des
+> intents, le périmètre de la quarantaine, la classification des erreurs de stockage, la
+> politique de la variable de secret et les permissions du fichier, et la validation des
+> deux scalaires de `evaluate`. Tout le reste de D-076 — le format du secret, le
+> descripteur unique du répertoire, l'ordre de publication, le domaine fermé de
+> `CommandState`, les six populations de coût, l'exclusion des reçus rejetés des
+> compteurs sémantiques et le catalogue vérifié dans les deux sens — reste en vigueur.
+
 **Contexte.** Cinq réaudits indépendants en lecture seule ont chacun trouvé des défauts
 réels après une CI verte. Le cinquième, sur `e43851e`, a reproduit **un P1, cinq P2 et
 douze P3**, et tous portaient sur le même endroit : la frontière entre ce qui est sur le
@@ -1858,3 +1869,152 @@ zéro appel fournisseur, zéro endpoint, zéro tentative, zéro crédit, zéro r
 Un secret valide et une frontière tenue ne disent rien de la couverture d'un bookmaker ;
 ils disent seulement que ce que le programme affirme sur ses propres preuves peut être
 cru.
+
+### D-077 — Une provenance est une preuve, une frontière indisponible n'est pas une frontière vide
+
+**Contexte.** Six réaudits indépendants en lecture seule ont chacun trouvé des défauts
+réels après une CI verte. Le sixième, sur `9adfb8f`, a reproduit **quatre P1, huit P2 et
+onze P3**. Les quatre P1 disent la même chose sous quatre angles : la v6 a nommé la
+provenance sans l'imposer.
+
+`VerifiedReceipt` était un constructeur public qui ne vérifiait rien. Huit reçus dont la
+clé `signature` avait été *supprimée*, emballés à la main, atteignaient
+`CRITERIA_MET_AWAITING_HUMAN_REVIEW` avec `eligible_for_human_promotion_review` à vrai —
+par un lot, par une liste nue et par un tuple ; un corpus signé par une clé que
+l'installation ne possède pas faisait de même. `require_verified` interrogeait
+`isinstance` ; rien n'interrogeait le HMAC.
+
+Le type n'était gelé qu'au premier niveau. `__init__` faisait `dict(payload)`, donc
+chaque dictionnaire et chaque liste imbriqués restaient partagés avec ceux de
+l'appelant, et `__getitem__` rendait l'objet vivant. Une seule écriture par l'API
+`Mapping` documentée — `reçu["freshness"][marché] = 300` — faisait passer un corpus de
+`INSUFFICIENT_EVIDENCE` à la porte de revue humaine, pendant que la signature du reçu ne
+vérifiait plus, et rien ne relisait le sceau.
+
+`reconcile_intents` construisait son ensemble d'identifiants publiés avec
+`_read_receipt_payloads`, qui analyse du JSON et ne vérifie **rien**. Un fichier de deux
+clés suffisait à effacer un intent et à rouvrir la porte, et treize formes forgées —
+non signée, clé étrangère, schéma inconnu, commande inconnue, sport, bookmaker, tag,
+coût, protocole antérieur — résolvaient **toutes**.
+
+`receipts quarantine --name` n'avait aucun périmètre. `--name <id>.intent` rendait 0
+sans `--force` et faisait passer la porte de `EVIDENCE_CONFLICT` à
+`CRITERIA_MET_AWAITING_HUMAN_REVIEW` : un conflit supprimé sans qu'aucun reçu existe.
+`--name signing-key.secret` rendait 0 aussi, après quoi huit reçus vérifiés devenaient
+huit reçus invérifiables.
+
+Et `audit_receipts` terminait par `except StoreRefused: return lot((), 0), 0`, donc un
+répertoire de reçus atteint par un lien symbolique rapportait exactement ce que
+rapporte une installation vide, pendant que `load_parent` — entièrement par chemin, avec
+`resolve()` qui suit précisément les liens que le store refuse — lisait ce même
+répertoire et autorisait un appel payant.
+
+**Décision.** Protocole **7**, preuve adaptateur **1**, schéma de reçu **4**, instant
+d'effet unique et littéral `2026-08-11T14:20:00+00:00`. Les preuves de protocole 6
+deviennent historiques non qualifiantes. `TheOddsApiProvider` reste
+`IMPLEMENTED_UNVERIFIED` ; le plafond machine reste
+`CRITERIA_MET_AWAITING_HUMAN_REVIEW` ; aucun statut global de vérification n'est créé.
+Aucun critère, seuil, taxonomie de coût, règle de déduplication ni équation de
+population ne change.
+
+Neuf changements, numérotés.
+
+1. **La provenance n'est pas constructible.** `VerifiedReceipt`,
+   `VerifiedReceiptBatch` et `AuditResult` prennent un jeton privé en premier argument
+   positionnel : l'orthographe naturelle lève `UnverifiedProvenance`. `trust()` et
+   `require_verified()` sont **supprimés** — une fabrique qui prend la clé de
+   l'appelant est exactement le trou. Le seul chemin est
+   `receipt_store.audit_directory`, qui reçoit un répertoire déjà ouvert composant par
+   composant et fait lui-même la lecture, le contrôle de schéma et le HMAC contre le
+   secret de l'installation. La revendication est étroite et testable : **aucun point
+   d'entrée exporté du dépôt ne produit une provenance admise sans vérification de
+   signature**. Du code déjà en cours d'exécution dans le processus peut atteindre un
+   nom privé ou réécrire du bytecode ; rien ici ne prétend l'empêcher.
+2. **Un reçu admis est une valeur gelée récursivement.** La première rédaction de ce
+   point écrivait les conteneurs scellés comme une sous-classe de `dict` et une
+   sous-classe de `list` redéfinissant chaque mutateur, pour que rien en aval ne change
+   de vocabulaire, et déclarait `dict.__setitem__(gelé, k, v)` comme une **limite
+   acceptée**. C'était une erreur de la même famille que le défaut corrigé : redéfinir
+   un mutateur ne le supprime pas, la méthode de la classe de base restant joignable par
+   l'objet classe. Mesuré sur un reçu réellement admis par l'audit, les **quinze** appels
+   `dict.__setitem__`, `dict.update`, `dict.pop`, `dict.setdefault`, `dict.clear`,
+   `dict.__ior__`, `list.__setitem__`, `list.append`, `list.extend`, `list.insert`,
+   `list.pop`, `list.clear`, `list.__iadd__`, `list.sort` et `list.reverse`
+   **réussissaient**, et le premier d'entre eux rouvrait la porte de revue humaine sur un
+   corpus périmé. La compatibilité nominale avec `dict` et `list` ne prévaut pas sur la
+   frontière de preuve. `FrozenMapping` implémente donc `Mapping` **sans hériter d'aucun
+   conteneur mutable**, les séquences deviennent des `tuple`, et les quinze appels lèvent.
+   Le prix est payé explicitement : les contrôles structurels qui demandaient
+   `isinstance(value, list)` demandent une `Sequence` non-`str`, et un reçu admis se
+   re-sérialise par `to_builtin()`. Reste `object.__setattr__` sur l'unique slot : l'audit
+   enregistre une empreinte sha256 non clée de chaque reçu admis et `require_audited` les
+   recalcule, donc un reçu substitué n'est pas lu. La limite, énoncée plutôt que
+   sous-entendue : réécrire **à la fois** le contenu et l'empreinte enregistrée défait ce
+   contrôle, parce que Python n'a pas de types intégrés scellés.
+3. **`load_parent` passe par le descripteur.** L'argument de la ligne de commande est
+   réduit **textuellement** à un nom de base du répertoire autorisé — jamais par
+   `resolve`, `is_symlink` ou `is_file` — puis lu par le même `SecureDirectory` que
+   l'audit. Un lien dur vers un inode extérieur reste accepté si le fichier est
+   régulier, signé par le secret local et de portée exacte : la frontière garantit le
+   nom et l'inode ouverts dans ce répertoire, pas l'histoire de création de l'inode.
+4. **Trois états de frontière.** `ABSENT` (aucun répertoire), `AVAILABLE` (répertoire
+   sûr, les comptes valent quelque chose) et `UNAVAILABLE` (le répertoire existe et
+   n'est pas lisible sans ambiguïté). `UNAVAILABLE` est un conflit de preuve, bloque la
+   porte, et apparaît dans le JSON **et** le rendu humain sous une catégorie assainie
+   de `BOUNDARY_REASONS` — jamais un chemin.
+5. **Un intent a un contrat positif fermé.** Identifiant par `fullmatch` de 8 à 64
+   hexadécimaux minuscules ; corps aux neuf champs exacts, types et bornes vérifiés,
+   identifiant du corps égal au nom. Publication idempotente **sur octets identiques
+   seulement** : une portée divergente, une cible vide, tronquée, lien ou répertoire est
+   un refus typé **avant réseau**. Un intent invalide ou illisible reste bloquant et est
+   réduit à son nom local et à `UNREADABLE_OR_INVALID` : plus rien de son contenu
+   n'est réfléchi.
+6. **Le rapprochement exige un reçu réel.** Les candidats viennent de
+   `audit_receipts` — lus par le descripteur, de schéma accepté, vérifiés contre le
+   secret local — et doivent porter le même identifiant, la même commande, le même
+   sport, le même bookmaker, le même tag éventuel, un coût compatible avec le plafond de
+   l'intent, un couple réellement persistable du catalogue, aucune faute structurelle,
+   aucune contradiction et la **même lignée** de versions.
+
+   Deux questions distinctes, jamais déduites l'une de l'autre. La **résolution
+   comptable** demande si un reçu durable et vérifié consigne l'issue de cette
+   tentative : elle exige la même lignée — schéma, protocole, preuve adaptateur —
+   **non** l'instant d'effet. L'**admissibilité à la qualification** demande si ce reçu
+   soutient un critère préenregistré : elle exige en plus l'instant, et un reçu
+   antérieur reste historique non qualifiant.
+
+   Exiger l'instant des deux côtés ferait qu'un changement de protocole orpheline les
+   intents en vol — un intent qu'aucun reçu ne peut plus résoudre bloque la porte pour
+   toujours, ce qui transformerait une correction en déni durable. Conséquence voulue :
+   un reçu de la bonne lignée peut résoudre son intent **sans contribuer à aucun
+   critère**. Le compteur d'intents non résolus retombe, celui des historiques non
+   qualifiants monte, et les deux faits sont publiés séparément.
+7. **La quarantaine est une commande de reçu.** Seul un nom de base finissant par
+   `.json` est accepté. Le secret, tout `*.intent`, tout temporaire et tout autre
+   fichier sont refusés, **avec ou sans `--force`** ; `--force` ne sert qu'à archiver un
+   reçu signé complet.
+8. **Toute erreur de stockage a une catégorie.** Une signature mal formée rend le reçu
+   invérifiable au lieu de faire lever `hmac.compare_digest` ; de l'UTF-8 invalide
+   devient `ContentUndecodable`, et `SecretInvalid` pour le secret ; `exists` ne traite
+   plus que `ENOENT` comme « absent » ; l'échec de création du temporaire devient une
+   erreur de durabilité ; et les cinq sites de publication capturent le graphe réel des
+   exceptions, non seulement `PersistenceFailed`.
+9. **La politique du secret et les deux scalaires.** Une variable **présente mais vide**
+   est une valeur invalide, plus une absence ; seule l'absence réelle autorise le
+   fichier ou la création. Sur POSIX, un secret non régulier, d'un autre UID ou
+   accordant un droit au groupe ou à tous est refusé — attendu `0600` — et la limite de
+   plateforme est écrite. `unverifiable` et `unresolved_intents` sont des entiers Python
+   exacts, non booléens, positifs ou nuls : `None` et `False` ne valent jamais zéro
+   implicitement.
+
+**Conséquences.** Toute preuve antérieure au protocole 7 est historique. Les suites de
+qualification n'obtiennent plus leur provenance par un raccourci : elles écrivent des
+reçus signés dans un répertoire jetable et appellent le vrai audit, comme la production.
+`audit_receipts` rend un `AuditResult` qui ne se déballe pas en deux valeurs, parce que
+le déballer est précisément ce qui a fait perdre l'état de frontière. Les deux compteurs
+de fichiers invérifiables lisent désormais **un seul** audit et ne peuvent plus
+divergerement : avoir deux provenances pour un même nombre était le défaut, non la
+fonctionnalité.
+
+**Ce que cette décision n'autorise pas.** Aucun appel fournisseur, aucune activation,
+aucune promotion d'adaptateur ou de modèle, aucun changement de critère ou de seuil.

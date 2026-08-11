@@ -48,9 +48,9 @@ FOOTBALL_2 = "soccer_epl"
 TENNIS = "tennis_atp_paris"
 TENNIS_2 = "tennis_wta_madrid"
 BOOK = "unibet"
-D1 = datetime(2026, 8, 11, 12, tzinfo=UTC)
-D2 = datetime(2026, 8, 12, 12, tzinfo=UTC)
-D3 = datetime(2026, 8, 13, 12, tzinfo=UTC)
+D1 = datetime(2026, 8, 13, 12, tzinfo=UTC)
+D2 = datetime(2026, 8, 14, 12, tzinfo=UTC)
+D3 = datetime(2026, 8, 15, 12, tzinfo=UTC)
 MARKETS = list(act.ADDITIONAL_MARKETS)
 WINDOW = (D1, D1 + timedelta(hours=24))
 SCRUB_SECRET = "ab" * 32
@@ -85,17 +85,23 @@ def _tag_with_secret(event_id: str) -> str:
 
 
 def _trusted(receipts: Any, unverifiable: int = 0) -> Any:
-    return _store.VerifiedReceiptBatch(
-        tuple(_store.trust(r, secret=_SIGNING) for r in receipts), unverifiable
-    )
+    """One real audit of a throwaway directory — see `helpers_receipt_boundary`.
+
+    D-077: the provenance type has no public constructor and no key-taking factory, so
+    a suite acquires evidence the way production does. Every assertion below is
+    unchanged; only this function is.
+    """
+    from helpers_receipt_boundary import audited
+
+    return audited(receipts, unverifiable, secret=_SIGNING)
 
 
 def _evaluate(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
-    return qual.evaluate(_trusted(receipts, unverifiable), unverifiable, **kw)
+    return qual.evaluate(_trusted(receipts, unverifiable), **kw)
 
 
 def _state(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
-    return act.build_activation_state(_trusted(receipts, unverifiable), unverifiable, **kw)
+    return act.build_activation_state(_trusted(receipts, unverifiable), **kw)
 
 
 @pytest.fixture(autouse=True)
@@ -368,7 +374,8 @@ class TestPositiveProofRequiresAnEstablishedReach:
         self, workspace: Path, value: Any
     ) -> None:
         write_all(workspace, [with_flag(core, "may_have_reached_provider", value)])
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         document = _state(receipts, unverifiable)
         assert document["bookmaker_coverage_observations"] == []
         assert document["mapping_freshness_proof"] == str(act.MappingProof.NOT_OBTAINED_LIVE)
@@ -398,7 +405,8 @@ class TestPositiveProofRequiresAnEstablishedReach:
             ):
                 assert entry(document, criterion.criterion_id)["observed"]["events"] == 0
         write_all(workspace, corpus)
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         state = _state(receipts, unverifiable)
         assert state["eligible_for_human_promotion_review"] is False
         assert state["mapping_freshness_proof"] == str(act.MappingProof.NOT_OBTAINED_LIVE)
@@ -456,7 +464,8 @@ class TestTheAttemptStateHasThreeValues:
         self, workspace: Path, value: Any
     ) -> None:
         write_all(workspace, [with_flag(core, "network_attempted", value)])
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         document = _state(receipts, unverifiable)
         assert document["execution_state"] == str(
             act.ExecutionState.NETWORK_ATTEMPT_STATE_UNESTABLISHED
@@ -471,7 +480,8 @@ class TestTheAttemptStateHasThreeValues:
 
     def test_the_published_population_never_says_a_real_attempt(self, workspace: Path) -> None:
         write_all(workspace, [core()])
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         document = _state(receipts, unverifiable)
         label = document["paid_call_cost_census_population"]
         assert "réelle" not in label and "reelle" not in label
@@ -658,7 +668,8 @@ class TestThePaidStateIsSymmetric:
     ) -> None:
         over = dict(next(o for name, o in paid_state_rows(command) if name == label))
         write_all(workspace, [core(**over)])
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         document = _state(receipts, unverifiable)
         observed = document["paid_activation_state"]
         expected = EXPECTED_PAID_STATE[label]
@@ -679,7 +690,8 @@ class TestThePaidStateIsSymmetric:
         """v4 reported ADDITIONAL_EXECUTED for an `additional/AUTH_FAILED` receipt."""
         over = dict(next(o for name, o in paid_state_rows("additional") if name == "AUTH_FAILED"))
         write_all(workspace, [core(**over)])
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         document = _state(receipts, unverifiable)
         assert document["paid_activation_state"] == str(
             act.PaidActivationState.PAID_ATTEMPT_INCONCLUSIVE
@@ -690,7 +702,8 @@ class TestThePaidStateIsSymmetric:
             next(o for name, o in paid_state_rows("additional") if name == "COST_MISMATCH")
         )
         write_all(workspace, [core(receipt_id="d1" * 8, **inconclusive)])
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         assert _state(receipts, unverifiable)["paid_activation_state"] != str(
             act.PaidActivationState.ADDITIONAL_EXECUTED
         )
@@ -824,7 +837,8 @@ class TestExactCopiesChangeNothingSemantic:
                 [make() for _ in range(count)],
                 names=[f"copy-{i:02d}.json" for i in range(count)],
             )
-            receipts, unverifiable = act.audit_receipts()
+            _audit = act.audit_receipts()
+            receipts, unverifiable = _audit.batch, _audit.unverifiable
             document = _state(receipts, unverifiable)
             snapshots.append(
                 {
@@ -846,7 +860,8 @@ class TestExactCopiesChangeNothingSemantic:
                 [make() for _ in range(count)],
                 names=[f"copy-{i:02d}.json" for i in range(count)],
             )
-            receipts, unverifiable = act.audit_receipts()
+            _audit = act.audit_receipts()
+            receipts, unverifiable = _audit.batch, _audit.unverifiable
             document = _state(receipts, unverifiable)
             seen.append(
                 (
@@ -859,7 +874,8 @@ class TestExactCopiesChangeNothingSemantic:
     def test_copies_never_reach_a_threshold(self, workspace: Path) -> None:
         one = core(receipt_id="cc" * 8)
         write_all(workspace, [dict(one) for _ in range(9)], names=[f"c-{i}.json" for i in range(9)])
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         document = _state(receipts, unverifiable)
         assert entry(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 1
         assert cost_of(document)["observed"]["provider_reached_conforming_cost"] == 1
@@ -1143,7 +1159,7 @@ class TestPublicationIsAtomic:
         assert (workspace / quarantined).exists()
         again = act.write_receipt(dict(payload))
         assert again.stat().st_size > 0
-        assert act.audit_receipts()[0][0]["receipt_id"] == "d5" * 8
+        assert act.audit_receipts().batch[0]["receipt_id"] == "d5" * 8
 
 
 # ---------------------------------------------------------------------------
@@ -1163,7 +1179,8 @@ SENTINEL = "V5_FOREIGN_SENTINEL_e17b"
 class TestNoLinkIsFollowedAtOpenTime:
     def test_a_regular_internal_file_is_read(self, workspace: Path) -> None:
         write_all(workspace, [core()])
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         assert len(receipts) == 1 and unverifiable == 0
 
     @pytest.mark.parametrize("kind", ["internal", "external", "broken"])
@@ -1178,7 +1195,8 @@ class TestNoLinkIsFollowedAtOpenTime:
         else:
             target = workspace / "nothing-here.json"
         os.symlink(target, workspace / "link.json")
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         assert len(receipts) == 1
         assert unverifiable == 1
         assert SENTINEL not in jsonlib.dumps(receipts, default=str)
@@ -1212,7 +1230,8 @@ class TestNoLinkIsFollowedAtOpenTime:
             return handle
 
         monkeypatch.setattr(os, "open", racing_open)
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         monkeypatch.undo()
         assert fired["n"] == 1
         assert target.is_symlink()
@@ -1222,7 +1241,8 @@ class TestNoLinkIsFollowedAtOpenTime:
 
     def test_a_directory_named_json_is_counted(self, workspace: Path) -> None:
         (workspace / "folder.json").mkdir(parents=True, exist_ok=True)
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         assert list(receipts) == [] and unverifiable == 1
 
     def test_write_refuses_a_symbolic_target_without_reading_it(self, workspace: Path) -> None:
@@ -1545,14 +1565,16 @@ class TestMalformedReceiptsFeedNoSemanticCounter:
                 core(receipt_id="22" * 8, event_tag="b" * 32, accounted_credits=2),
             ],
         )
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         document = _state(receipts, unverifiable)
         assert document["accounted_credits_total"] == 2
         assert document["rejected_receipt_credits_not_counted"] == 7
 
     def test_the_two_credit_fields_are_named_apart(self, workspace: Path) -> None:
         write_all(workspace, [core()])
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         document = _state(receipts, unverifiable)
         assert "rejected" in "rejected_receipt_credits_not_counted"
         assert document["accounted_credits_total"] == 1
@@ -1561,7 +1583,8 @@ class TestMalformedReceiptsFeedNoSemanticCounter:
     @pytest.mark.parametrize("value", [True, "7", -5, 1.5, None])
     def test_a_mistyped_credit_is_never_summed(self, workspace: Path, value: Any) -> None:
         write_all(workspace, [core(accounted_credits=value)])
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         document = _state(receipts, unverifiable)
         assert document["accounted_credits_total"] == 0
 

@@ -195,7 +195,8 @@ class TestItNeverReplaces:
         act.quarantine_incomplete_receipt(name)
         again = act.write_receipt(dict(document))
         assert again.name == name
-        batch, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        batch, unverifiable = _audit.batch, _audit.unverifiable
         assert len(batch) == 1
         assert unverifiable == 0
 

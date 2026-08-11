@@ -31,7 +31,6 @@ import pytest
 
 from betmaxxing.providers.the_odds_api import activation as act
 from betmaxxing.providers.the_odds_api import qualification as qual
-from betmaxxing.providers.the_odds_api import receipt_store as _store
 from helpers_activation import FAKE_RECEIPT_SECRET
 
 #: The instant D-073 published, kept as the historical literal it is. This module
@@ -46,9 +45,9 @@ FOOTBALL_2 = "soccer_epl"
 TENNIS = "tennis_atp_paris"
 TENNIS_2 = "tennis_wta_madrid"
 BOOK = "unibet"
-D1 = datetime(2026, 8, 11, 12, tzinfo=UTC)
-D2 = datetime(2026, 8, 12, 12, tzinfo=UTC)
-D3 = datetime(2026, 8, 13, 12, tzinfo=UTC)
+D1 = datetime(2026, 8, 13, 12, tzinfo=UTC)
+D2 = datetime(2026, 8, 14, 12, tzinfo=UTC)
+D3 = datetime(2026, 8, 15, 12, tzinfo=UTC)
 MARKETS = list(act.ADDITIONAL_MARKETS)
 
 
@@ -74,17 +73,23 @@ def _tag_with_secret(event_id: str) -> str:
 
 
 def _trusted(receipts: Any, unverifiable: int = 0) -> Any:
-    return _store.VerifiedReceiptBatch(
-        tuple(_store.trust(r, secret=_SIGNING) for r in receipts), unverifiable
-    )
+    """One real audit of a throwaway directory — see `helpers_receipt_boundary`.
+
+    D-077: the provenance type has no public constructor and no key-taking factory, so
+    a suite acquires evidence the way production does. Every assertion below is
+    unchanged; only this function is.
+    """
+    from helpers_receipt_boundary import audited
+
+    return audited(receipts, unverifiable, secret=_SIGNING)
 
 
 def _evaluate(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
-    return qual.evaluate(_trusted(receipts, unverifiable), unverifiable, **kw)
+    return qual.evaluate(_trusted(receipts, unverifiable), **kw)
 
 
 def _state(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
-    return act.build_activation_state(_trusted(receipts, unverifiable), unverifiable, **kw)
+    return act.build_activation_state(_trusted(receipts, unverifiable), **kw)
 
 
 def core(**over: Any) -> dict[str, Any]:
@@ -576,7 +581,8 @@ class TestNoUnexpectedJsonCanCrashTheAudit:
         (workspace / "odd.json").write_text(
             jsonlib.dumps({"schema_version": value}), encoding="utf-8"
         )
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         assert list(receipts) == []
         assert unverifiable == 1
 

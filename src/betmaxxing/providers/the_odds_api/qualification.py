@@ -5,21 +5,31 @@ advance, how much live evidence would justify asking a human to promote the
 adapter. Without that, any result can be read as encouraging: two `core` calls
 that found no coverage were once summarised as an activation that "worked".
 
-Protocol **v6**. Each version closed defects an independent read-only audit
+Protocol **v7**. Each version closed defects an independent read-only audit
 reproduced on the previous one. v2 fixed three false claims in D-071; v3 closed the
 type coercions that let a signed receipt manufacture positive proof; v4 fixed what v3
 got wrong in the other direction, strictness applied without asking what the producer
-writes; v5 made a proof of a response require a response. v6 closes the boundary
-itself: the secret is a validated format, the receipt directory is a descriptor rather
-than a path, an attempt leaves a durable trace *before* the wire, the command is a
-closed domain, and this module is finally pure because verification happens upstream.
+writes; v5 made a proof of a response require a response. v6 moved the boundary
+between disk and belief into one place: the secret became a validated format, the
+receipt directory a descriptor rather than a path, an attempt left a durable trace
+*before* the wire, and the command became a closed domain.
 
-**Pure, and now provably so.** :func:`evaluate` reads no environment, no clock and no
-file, writes nothing, and computes no HMAC. It accepts only receipts whose provenance
-is a type — :class:`~.receipt_store.VerifiedReceipt`, minted by
+v7 finishes what v6 named. The sixth audit built eight receipts with the ``signature``
+key *deleted*, wrapped them in the provenance type by hand, and reached the human-review
+gate — so provenance is now **unconstructible**, obtainable only by auditing a real
+directory. It also wrote ``receipt["freshness"][market] = 300`` through the documented
+Mapping API and moved a corpus from ``INSUFFICIENT_EVIDENCE`` to that same gate *after*
+verification — so an admitted receipt is a recursively frozen value. And a receipt
+directory that could not be read safely used to report exactly what an empty one
+reports, so the boundary now has three states and the unreadable one blocks.
+
+**Pure, and provably so.** :func:`evaluate` reads no environment, no clock and no
+file, writes nothing, and computes no HMAC. It accepts only the result of a real audit —
+:class:`~.receipt_store.AuditResult`, produced by
 :func:`~.activation.audit_receipts` — because until v6 its call graph reached
-``verify_receipt``, and through it the environment and a key file it created. A list of
-plain mappings is refused rather than verified here.
+``verify_receipt``, and through it the environment and a key file it created, and until
+v7 the type it required could be manufactured by any caller. A list, a tuple and a
+hand-built batch are all refused.
 
 **A closed command domain.** :class:`CommandState` reads ``command`` as strictly as
 :class:`AttemptState` reads ``network_attempted``. v5 fell through to
@@ -138,13 +148,13 @@ from .activation import (
     BookmakerState,
     MarketState,
 )
-from .receipt_store import require_verified
+from .receipt_store import AuditResult, BoundaryState, CountInvalid, require_audited
 
 #: Bump this when a threshold, a scope, an admissibility rule or the effective
 #: instant changes. Results computed under one version are not comparable with
 #: another, which is the whole reason the number exists: a criterion quietly
 #: relaxed after the fact is not a criterion.
-PROVIDER_VALIDATION_PROTOCOL_VERSION = 6
+PROVIDER_VALIDATION_PROTOCOL_VERSION = 7
 
 #: Bump this when the parser, the mapping, the freshness reading or the cost
 #: logic changes in a way that invalidates an earlier proof. A receipt stamped
@@ -160,10 +170,10 @@ PROVIDER_ADAPTER_EVIDENCE_VERSION = 1
 PROTOCOL_MAX_ODDS_AGE_SECONDS = 900
 
 #: The instant this protocol took effect, chosen once and written identically in
-#: D-075 and `docs/provider-validation-protocol.md`. Evidence recorded before it
+#: D-077 and `docs/provider-validation-protocol.md`. Evidence recorded before it
 #: is history, never qualification. Never recomputed at runtime, never read from
 #: the environment: a date that moves is not an effective date.
-QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC = "2026-08-11T04:50:40+00:00"
+QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC = "2026-08-11T14:20:00+00:00"
 
 #: Only v4 receipts carry the two version stamps, so only v4 can qualify. v2 and
 #: v3 stay readable, honoured as authority for chaining, and reported in the
@@ -732,12 +742,16 @@ def _text(value: object) -> str | None:
 
 
 def _market_list(value: object) -> list[str] | None:
-    """A duplicate-free list of non-empty strings, or ``None``.
+    """A duplicate-free sequence of non-empty strings, or ``None``.
 
     Not a string — iterating one yields characters, which is how a mistyped
-    ``markets_mapped`` used to sneak past a set comparison.
+    ``markets_mapped`` used to sneak past a set comparison. A *sequence* rather than a
+    ``list`` since protocol 7: an admitted receipt holds tuples, because the frozen
+    containers that were ``list`` subclasses could still be written through
+    ``list.append``. ``json.loads`` produces lists and never tuples, so nothing a file
+    can carry is accepted here that was not accepted before.
     """
-    if not isinstance(value, list):
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
         return None
     out: list[str] = []
     for item in value:
@@ -964,7 +978,11 @@ def _phase_faults(receipt: Mapping[str, Any], phase: ReceiptPhase) -> list[str]:
 
     require(_text(receipt.get("bookmaker")) is not None, "bookmaker")
     require(str(receipt.get("bookmaker_state")) in KNOWN_BOOKMAKER_STATES, "bookmaker_state")
-    require(isinstance(receipt.get("mapping_rejections"), list), "mapping_rejections")
+    rejections = receipt.get("mapping_rejections")
+    require(
+        not isinstance(rejections, (str, bytes, bytearray)) and isinstance(rejections, Sequence),
+        "mapping_rejections",
+    )
     require(_market_list(receipt.get("markets_requested")) is not None, "markets_requested")
 
     if phase is ReceiptPhase.PLANNED:
@@ -1607,32 +1625,52 @@ def semantic_receipts(receipts: Sequence[Mapping[str, Any]]) -> list[Mapping[str
     return [r for r in receipts if not rejection_reason(r, divergent=divergent)]
 
 
+class QualificationInputInvalid(CountInvalid):
+    """A scalar handed to :func:`evaluate` is not the count it claims to be."""
+
+
+def _exact_qualification_count(value: object, field: str) -> int:
+    """An exact, non-negative count, or a refusal naming the field and not the value."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise QualificationInputInvalid(
+            f"{field} est un compte : un entier Python exact, positif ou nul. Ni "
+            "booléen, ni flottant, ni chaîne, ni None — « je ne sais pas combien » ne "
+            "vaut pas « il n'y en a pas »."
+        )
+    return value
+
+
 def evaluate(
-    receipts: Sequence[Mapping[str, Any]],
-    unverifiable: int,
+    audit: AuditResult,
     *,
     unresolved_intents: int = 0,
 ) -> dict[str, Any]:
-    """Judge a list of receipts against the pre-registered criteria. Pure.
+    """Judge one audit of the receipt directory against the pre-registered criteria. Pure.
 
-    ``unverifiable`` is passed in rather than recomputed: the caller already
-    counted the files that failed signature or schema verification, and those must
-    appear in the report without ever being read as evidence. It is reported under
-    a ``qualification_``-prefixed name so it can never overwrite the D-062 audit
-    counter of the same meaning but different provenance.
+    The argument is the **result of an audit**, not a list. v6 took a batch and a
+    number, and both were forgeable: ``[VerifiedReceipt(payload) for payload in
+    forged]`` satisfied its ``isinstance`` check and reached
+    ``CRITERIA_MET_AWAITING_HUMAN_REVIEW``, and the number could be anything at all.
+    An :class:`~.receipt_store.AuditResult` cannot be constructed, so the only way to
+    reach this function is to have had a real directory read.
+
+    That result also carries the **boundary state**, which v6 dropped on the floor. An
+    ``UNAVAILABLE`` boundary is an evidence conflict here: the counts it came with are
+    not established, so nothing may be concluded from them in either direction.
 
     ``unresolved_intents`` is the number of attempts whose local intent — written and
     ``fsync``-ed *before* the request — has not been resolved by the durable
     publication of its receipt. Each one means a request may have left and may have
     been billed without leaving a proof, so each one is an evidence conflict. It is
-    passed in for the same reason as ``unverifiable``: this function does not read the
-    filesystem, and v6 is the version where that is finally true.
+    an exact, non-negative Python integer: ``True`` is not one, ``None`` and ``False``
+    are not zero, and a string is not a count. « I do not know how many » must never
+    read as « there are none » for a blocker.
 
-    Pure, and now provably so: no environment, no clock, no file, no HMAC. The input
-    must already carry its provenance — a plain list of mappings is refused rather
-    than verified here, which is what used to drag the secret into this module.
+    Pure, and provably so: no environment, no clock, no file, no HMAC, no network.
     """
-    receipts = require_verified(receipts)
+    receipts = require_audited(audit)
+    unverifiable = _exact_qualification_count(audit.unverifiable, "unverifiable")
+    unresolved_intents = _exact_qualification_count(unresolved_intents, "unresolved_intents")
     reasons = dict.fromkeys(QUALIFICATION_REASONS, 0)
     current: list[Mapping[str, Any]] = []
     usable: list[Mapping[str, Any]] = []
@@ -1707,6 +1745,12 @@ def evaluate(
         conflicts.append(
             f"{len(divergent)} identifiant(s) de reçu portent des contenus signés différents ; "
             "tous les reçus concernés sont écartés des critères"
+        )
+    if audit.boundary is BoundaryState.UNAVAILABLE:
+        conflicts.append(
+            "La frontière du répertoire de reçus n'a pas pu être lue sans ambiguïté "
+            f"(catégorie : {audit.reason}) : aucun compte de reçus n'est établi, donc "
+            "aucune conclusion — ni positive ni négative — n'est tirée de cette lecture."
         )
     if unresolved_intents:
         conflicts.append(

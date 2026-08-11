@@ -88,7 +88,7 @@ def write(directory: Path, documents: list[dict[str, Any]]) -> None:
 
 
 def state(directory: Path) -> dict[str, Any]:
-    return act.build_activation_state(*act.audit_receipts())
+    return act.build_activation_state(act.audit_receipts())
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +99,7 @@ class TestTheEvaluatorTouchesNothingAmbient:
         self, workspace: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         corpus(workspace)
-        verified, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
         # From here on the evaluator must be inert.
         monkeypatch.delenv(act.SECRET_VARIABLE, raising=False)
         (workspace / act.SECRET_FILENAME).unlink(missing_ok=True)
@@ -112,7 +112,7 @@ class TestTheEvaluatorTouchesNothingAmbient:
             return real_get(key, default)
 
         monkeypatch.setattr(os.environ, "get", counting_get)
-        qual.evaluate(verified, unverifiable)
+        qual.evaluate(_audit)
         monkeypatch.setattr(os.environ, "get", real_get)
         assert reads["n"] == 0, "evaluate read the configuration"
         assert not (workspace / act.SECRET_FILENAME).exists(), "evaluate created a secret"
@@ -121,10 +121,10 @@ class TestTheEvaluatorTouchesNothingAmbient:
         self, workspace: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         corpus(workspace)
-        verified, unverifiable = act.audit_receipts()
-        first = qual.evaluate(verified, unverifiable)
+        _audit = act.audit_receipts()
+        first = qual.evaluate(_audit)
         monkeypatch.setenv(act.SECRET_VARIABLE, "fedcba9876543210" * 4)
-        assert qual.evaluate(verified, unverifiable) == first
+        assert qual.evaluate(_audit) == first
 
 
 # ---------------------------------------------------------------------------
@@ -145,11 +145,10 @@ class TestNothingOutsideTheDirectoryIsEverRead:
         link = tmp_path / "receipts-link"
         link.symlink_to(outside)
         monkeypatch.setenv(act.RECEIPT_DIR_VARIABLE, str(link))
-        verified, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        verified = _audit.batch
         assert len(verified) == 0
-        rendered = json.dumps(
-            act.build_activation_state(verified, unverifiable), ensure_ascii=False
-        )
+        rendered = json.dumps(act.build_activation_state(_audit), ensure_ascii=False)
         assert CONTENT_SENTINEL not in rendered
         assert PATH_SENTINEL not in rendered
 
@@ -159,7 +158,8 @@ class TestNothingOutsideTheDirectoryIsEverRead:
         holder = tmp_path / "holder-link"
         holder.symlink_to(outside.parent)
         monkeypatch.setenv(act.RECEIPT_DIR_VARIABLE, str(holder / outside.name))
-        verified, _ = act.audit_receipts()
+        _audit = act.audit_receipts()
+        verified = _audit.batch
         assert len(verified) == 0
 
     def test_a_directory_swapped_after_the_listing_yields_nothing(
@@ -180,7 +180,8 @@ class TestNothingOutsideTheDirectoryIsEverRead:
             return iter(names)
 
         monkeypatch.setattr(Path, "glob", swapping_glob)
-        verified, _ = act.audit_receipts()
+        _audit = act.audit_receipts()
+        verified = _audit.batch
         monkeypatch.setattr(Path, "glob", real_glob)
         for document in verified:
             assert document.get("sport_key") != CONTENT_SENTINEL

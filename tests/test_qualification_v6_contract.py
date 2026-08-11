@@ -42,7 +42,6 @@ import pytest
 
 from betmaxxing.providers.the_odds_api import activation as act
 from betmaxxing.providers.the_odds_api import qualification as qual
-from betmaxxing.providers.the_odds_api import receipt_store as store
 from helpers_activation import (
     ADDITIONAL_MARKET_KEYS,
     FAKE_RECEIPT_SECRET,
@@ -60,18 +59,23 @@ from helpers_activation import (
     sports_payload,
 )
 
-EFFECTIVE_INSTANT = "2026-08-11T04:50:40+00:00"
+EFFECTIVE_INSTANT = "2026-08-11T14:20:00+00:00"
 FREE = {"x-requests-last": "0", "x-requests-remaining": "487"}
 PAID = {"x-requests-last": "1", "x-requests-remaining": "486"}
 FIVE = {"x-requests-last": "5", "x-requests-remaining": "482"}
 NO_HEADER: dict[str, str] = {}
 
 
-def trusted(payloads: list[dict[str, Any]], unverifiable: int = 0) -> store.VerifiedReceiptBatch:
-    """The provenance the evaluator requires, minted the way the audit mints it."""
-    return store.VerifiedReceiptBatch(
-        tuple(store.trust(p, secret=FAKE_RECEIPT_SECRET) for p in payloads), unverifiable
-    )
+def trusted(payloads: list[dict[str, Any]], unverifiable: int = 0) -> Any:
+    """The provenance the evaluator requires, obtained the way production obtains it.
+
+    D-077: there is no constructor and no key-taking factory left to mint it with, so
+    the receipts are written into a throwaway directory and audited. Same evidence,
+    same assertions — a real boundary instead of a shortcut through it.
+    """
+    from helpers_receipt_boundary import audited
+
+    return audited(payloads, unverifiable, secret=FAKE_RECEIPT_SECRET)
 
 
 def receipt(**over: Any) -> dict[str, Any]:
@@ -100,7 +104,7 @@ def receipt(**over: Any) -> dict[str, Any]:
 
 
 def state_of(payloads: list[dict[str, Any]], unverifiable: int = 0) -> dict[str, Any]:
-    return act.build_activation_state(trusted(payloads, unverifiable), unverifiable)
+    return act.build_activation_state(trusted(payloads, unverifiable))
 
 
 UNCLASSIFIED: dict[str, Any] = {
@@ -153,9 +157,9 @@ NEVER_SENT = {
 # ---------------------------------------------------------------------------
 # D1 — the protocol this suite pins
 # ---------------------------------------------------------------------------
-class TestTheProtocolIsVersionSix:
+class TestTheProtocolIsVersionSeven:
     def test_the_three_version_numbers(self) -> None:
-        assert qual.PROVIDER_VALIDATION_PROTOCOL_VERSION == 6
+        assert qual.PROVIDER_VALIDATION_PROTOCOL_VERSION == 7
         assert qual.PROVIDER_ADAPTER_EVIDENCE_VERSION == 1
         assert qual.QUALIFYING_SCHEMA_VERSION == 4
         assert act.RECEIPT_SCHEMA_VERSION == 4
@@ -165,6 +169,7 @@ class TestTheProtocolIsVersionSix:
         source = Path(qual.__file__).read_text(encoding="utf-8")
         assert source.count(EFFECTIVE_INSTANT) == 1
         for stale in (
+            "2026-08-11T04:50:40+00:00",
             "2026-08-10T14:00:37+00:00",
             "2026-08-10T09:11:48+00:00",
             "2026-08-10T07:19:48+00:00",
@@ -853,18 +858,18 @@ class TestTheDocumentsPublishOneNorm:
     def _read(self, name: str) -> str:
         return (self.ROOT / "docs" / name).read_text(encoding="utf-8")
 
-    def test_the_protocol_document_is_version_six(self) -> None:
+    def test_the_protocol_document_is_version_seven(self) -> None:
         text = self._read("provider-validation-protocol.md")
-        assert "PROVIDER_VALIDATION_PROTOCOL_VERSION = 6" in text.splitlines()[0]
-        assert "PROVIDER_VALIDATION_PROTOCOL_VERSION = 5" not in text.splitlines()[0]
+        assert "PROVIDER_VALIDATION_PROTOCOL_VERSION = 7" in text.splitlines()[0]
+        assert "PROVIDER_VALIDATION_PROTOCOL_VERSION = 6" not in text.splitlines()[0]
         assert EFFECTIVE_INSTANT in text
-        assert "2026-08-10T14:00:37+00:00" not in text, "the retired instant is history, not norm"
+        assert "2026-08-11T04:50:40+00:00" not in text, "the retired instant is history, not norm"
 
-    def test_the_decision_d076_exists_and_supersedes_only_what_it_replaces(self) -> None:
+    def test_the_decision_d077_exists_and_supersedes_only_what_it_replaces(self) -> None:
         text = self._read("decisions.md")
+        assert "D-077" in text
         assert "D-076" in text
-        assert "D-075" in text
-        head = text[text.index("D-075") : text.index("D-076")]
+        head = text[text.index("D-076") : text.index("D-077")]
         assert "supersédée" in head.lower() or "supersedee" in head.lower()
 
     @pytest.mark.parametrize(
@@ -917,7 +922,7 @@ class TestTheDocumentsPublishOneNorm:
         docstring = source[: source.index('"""', 3) + 3]
         # The history may name v4; the module may not still *be* v4.
         assert "Protocol **v4**" not in docstring
-        assert "Protocol **v6**" in docstring
+        assert "Protocol **v7**" in docstring
         # The purity claim is now true, and it says why.
         assert "no HMAC" in docstring or "aucun HMAC" in docstring or "VerifiedReceipt" in docstring
 

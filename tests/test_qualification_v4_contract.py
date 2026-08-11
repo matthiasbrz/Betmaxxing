@@ -33,7 +33,6 @@ import pytest
 
 from betmaxxing.providers.the_odds_api import activation as act
 from betmaxxing.providers.the_odds_api import qualification as qual
-from betmaxxing.providers.the_odds_api import receipt_store as _store
 
 #: The instant D-074 published, kept as the historical literal it is. This module
 #: guards the v4 closures, which are unchanged; the *current* effective instant is
@@ -45,9 +44,9 @@ FOOTBALL_2 = "soccer_epl"
 TENNIS = "tennis_atp_paris"
 TENNIS_2 = "tennis_wta_madrid"
 BOOK = "unibet"
-D1 = datetime(2026, 8, 11, 12, tzinfo=UTC)
-D2 = datetime(2026, 8, 12, 12, tzinfo=UTC)
-D3 = datetime(2026, 8, 13, 12, tzinfo=UTC)
+D1 = datetime(2026, 8, 13, 12, tzinfo=UTC)
+D2 = datetime(2026, 8, 14, 12, tzinfo=UTC)
+D3 = datetime(2026, 8, 15, 12, tzinfo=UTC)
 MARKETS = list(act.ADDITIONAL_MARKETS)
 WINDOW = (D1, D1 + timedelta(hours=24))
 SECRET = "ab" * 32
@@ -81,17 +80,23 @@ def _tag_with_secret(event_id: str) -> str:
 
 
 def _trusted(receipts: Any, unverifiable: int = 0) -> Any:
-    return _store.VerifiedReceiptBatch(
-        tuple(_store.trust(r, secret=_SIGNING) for r in receipts), unverifiable
-    )
+    """One real audit of a throwaway directory — see `helpers_receipt_boundary`.
+
+    D-077: the provenance type has no public constructor and no key-taking factory, so
+    a suite acquires evidence the way production does. Every assertion below is
+    unchanged; only this function is.
+    """
+    from helpers_receipt_boundary import audited
+
+    return audited(receipts, unverifiable, secret=_SIGNING)
 
 
 def _evaluate(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
-    return qual.evaluate(_trusted(receipts, unverifiable), unverifiable, **kw)
+    return qual.evaluate(_trusted(receipts, unverifiable), **kw)
 
 
 def _state(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
-    return act.build_activation_state(_trusted(receipts, unverifiable), unverifiable, **kw)
+    return act.build_activation_state(_trusted(receipts, unverifiable), **kw)
 
 
 def core(**over: Any) -> dict[str, Any]:
@@ -1041,21 +1046,24 @@ class TestTheAuditNeverLeavesItsDirectory:
 
     def test_a_regular_file_is_read(self, workspace: Path) -> None:
         write_all(workspace, [core()])
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         assert len(receipts) == 1
         assert unverifiable == 0
 
     def test_an_internal_symlink_is_not_followed(self, workspace: Path) -> None:
         write_all(workspace, [core()])
         os.symlink(workspace / "probe-001.json", workspace / "link.json")
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         assert len(receipts) == 1
         assert unverifiable == 1
 
     def test_an_external_symlink_contributes_nothing(self, workspace: Path) -> None:
         workspace.mkdir(parents=True, exist_ok=True)
         os.symlink(self._outside(workspace), workspace / "link.json")
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         assert list(receipts) == []
         assert unverifiable == 1
         document = _state(receipts, unverifiable)
@@ -1064,13 +1072,15 @@ class TestTheAuditNeverLeavesItsDirectory:
     def test_a_broken_symlink_is_counted_not_opened(self, workspace: Path) -> None:
         workspace.mkdir(parents=True, exist_ok=True)
         os.symlink(workspace / "nothing-here.json", workspace / "broken.json")
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         assert list(receipts) == []
         assert unverifiable == 1
 
     def test_a_directory_named_json_is_counted(self, workspace: Path) -> None:
         (workspace / "folder.json").mkdir(parents=True, exist_ok=True)
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         assert list(receipts) == []
         assert unverifiable == 1
 

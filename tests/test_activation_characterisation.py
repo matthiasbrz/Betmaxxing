@@ -173,7 +173,7 @@ class TestD061ADiscoverySaysWhichOfThreeThingsHappened:
 
 class TestD062FiveProofDimensionsReadByStatus:
     def test_the_state_document_separates_the_five(self, workspace: Path) -> None:
-        document = act.build_activation_state([], 0)
+        document = act.build_activation_state(act.audit_receipts())
         for field in (
             "adapter_state",
             "execution_state",
@@ -184,16 +184,18 @@ class TestD062FiveProofDimensionsReadByStatus:
             assert field in document
 
     def test_an_empty_directory_is_an_empty_state_not_an_error(self, workspace: Path) -> None:
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         assert (list(receipts), unverifiable) == ([], 0)
-        document = act.build_activation_state(receipts, unverifiable)
+        document = act.build_activation_state(_audit)
         assert document["execution_state"] == str(act.ExecutionState.NO_NETWORK_ATTEMPTED)
         assert document["mapping_freshness_proof"] == str(act.MappingProof.NOT_OBTAINED_LIVE)
 
     def test_an_unverifiable_file_is_counted_and_never_read(self, workspace: Path) -> None:
         workspace.mkdir(parents=True, exist_ok=True)
         (workspace / "broken.json").write_text("{not json", encoding="utf-8")
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         assert list(receipts) == []
         assert unverifiable == 1
 
@@ -217,7 +219,8 @@ class TestD063ReceiptsAreV4AndOlderSchemasStayReadable:
         document = _signed(receipt_id="beef0000beef0004", schema_version=3)
         path = _write(workspace, document)
         before = path.read_text(encoding="utf-8")
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         assert unverifiable == 0
         assert [r["schema_version"] for r in receipts] == [3]
         assert path.read_text(encoding="utf-8") == before
@@ -226,7 +229,8 @@ class TestD063ReceiptsAreV4AndOlderSchemasStayReadable:
         document = _signed(receipt_id="beef0000beef0001", schema_version=2)
         path = _write(workspace, document)
         before = path.read_text(encoding="utf-8")
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         assert unverifiable == 0
         assert [r["schema_version"] for r in receipts] == [2]
         assert path.read_text(encoding="utf-8") == before
@@ -234,7 +238,8 @@ class TestD063ReceiptsAreV4AndOlderSchemasStayReadable:
     def test_a_v1_receipt_is_refused_rather_than_upgraded(self, workspace: Path) -> None:
         document = _signed(receipt_id="beef0000beef0002", schema_version=1)
         _write(workspace, document)
-        receipts, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        receipts, unverifiable = _audit.batch, _audit.unverifiable
         assert list(receipts) == []
         assert unverifiable == 1
 
@@ -248,14 +253,14 @@ class TestD064AFixtureNeverEarnsALiveStatus:
         """`build_activation_state` derives the live proof from mapped selections only."""
         document = _signed(receipt_id="beef0000beef0003", selections_mapped=0)
         _write(workspace, document)
-        receipts, unverifiable = act.audit_receipts()
-        state = act.build_activation_state(receipts, unverifiable)
+        _audit = act.audit_receipts()
+        state = act.build_activation_state(_audit)
         assert state["mapping_freshness_proof"] == str(act.MappingProof.NOT_OBTAINED_LIVE)
 
     def test_a_single_live_observation_does_not_promote_the_adapter(self, workspace: Path) -> None:
         _write(workspace, _signed(receipt_id="beef0000beef0004"))
-        receipts, unverifiable = act.audit_receipts()
-        state = act.build_activation_state(receipts, unverifiable)
+        _audit = act.audit_receipts()
+        state = act.build_activation_state(_audit)
         assert state["mapping_freshness_proof"] == str(act.MappingProof.OBTAINED_LIVE)
         # …and the adapter is still exactly where it was.
         assert state["adapter_state"] == "IMPLEMENTED_UNVERIFIED"

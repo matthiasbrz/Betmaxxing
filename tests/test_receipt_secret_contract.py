@@ -367,10 +367,11 @@ class TestAKnownOrTrivialKeyCannotOpenTheGate:
         # The corpus is signed with the literal bytes an attacker would use.
         self._corpus(store, body)
         _write_secret(store, body)
-        batch, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        batch, unverifiable = _audit.batch, _audit.unverifiable
         assert len(batch) == 0, "no receipt may be verified under an invalid key"
         assert unverifiable >= 1
-        state = act.build_activation_state(batch, unverifiable)
+        state = act.build_activation_state(_audit)
         assert state["eligible_for_human_promotion_review"] is False
         assert state["qualification_state"] != str(
             qual.QualificationState.CRITERIA_MET_AWAITING_HUMAN_REVIEW
@@ -381,13 +382,15 @@ class TestAKnownOrTrivialKeyCannotOpenTheGate:
         """The control: the refusal above is about the key, not about the corpus."""
         self._corpus(store, VALID)
         _write_secret(store, VALID)
-        batch, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        batch, unverifiable = _audit.batch, _audit.unverifiable
         assert len(batch) >= 1
         assert unverifiable == 0
 
     def test_a_receipt_signed_with_another_valid_key_is_unverifiable(self, store: Path) -> None:
         self._corpus(store, OTHER_VALID)
         _write_secret(store, VALID)
-        batch, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        batch, unverifiable = _audit.batch, _audit.unverifiable
         assert len(batch) == 0
         assert unverifiable >= 1

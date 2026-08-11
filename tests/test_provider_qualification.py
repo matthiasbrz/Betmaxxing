@@ -22,7 +22,6 @@ import pytest
 
 from betmaxxing.providers.the_odds_api import activation as act
 from betmaxxing.providers.the_odds_api import qualification as qual
-from betmaxxing.providers.the_odds_api import receipt_store as _store
 from helpers_activation import FAKE_RECEIPT_SECRET
 
 FOOTBALL = "soccer_france_ligue_one"
@@ -62,17 +61,23 @@ def _tag_with_secret(event_id: str) -> str:
 
 
 def _trusted(receipts: Any, unverifiable: int = 0) -> Any:
-    return _store.VerifiedReceiptBatch(
-        tuple(_store.trust(r, secret=_SIGNING) for r in receipts), unverifiable
-    )
+    """One real audit of a throwaway directory — see `helpers_receipt_boundary`.
+
+    D-077: the provenance type has no public constructor and no key-taking factory, so
+    a suite acquires evidence the way production does. Every assertion below is
+    unchanged; only this function is.
+    """
+    from helpers_receipt_boundary import audited
+
+    return audited(receipts, unverifiable, secret=_SIGNING)
 
 
 def _evaluate(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
-    return qual.evaluate(_trusted(receipts, unverifiable), unverifiable, **kw)
+    return qual.evaluate(_trusted(receipts, unverifiable), **kw)
 
 
 def _state(receipts: Any, unverifiable: int = 0, **kw: Any) -> Any:
-    return act.build_activation_state(_trusted(receipts, unverifiable), unverifiable, **kw)
+    return act.build_activation_state(_trusted(receipts, unverifiable), **kw)
 
 
 def signed(**fields: Any) -> dict[str, Any]:
@@ -437,8 +442,20 @@ class TestProvenance:
         # refuses the provenance, and a *correctly signed* receipt of the wrong schema
         # still contributes nothing.
         tampered = [dict(r, schema_version=version) for r in football_core_passing()]
-        with pytest.raises(_store.UnverifiedProvenance):
-            _evaluate(tampered, 0)
+        # D-077: the refusal is a *count*, not an exception. A suite obtains evidence by
+        # auditing a directory now, so a receipt whose signature no longer matches — or
+        # whose schema this installation does not read — is filed as unverifiable instead
+        # of being rejected at a constructor the caller no longer has. Same property,
+        # same direction: it is never evidence.
+        audited_tampered = _trusted(tampered)
+        assert list(audited_tampered.batch) == []
+        assert audited_tampered.unverifiable == len(tampered)
+        assert (
+            result_for(qual.evaluate(audited_tampered), "CORE_MAPPING_FOOTBALL")["observed"][
+                "events"
+            ]
+            == 0
+        )
         resigned = []
         for receipt in tampered:
             body = {k: v for k, v in receipt.items() if k != act.SIGNATURE_FIELD}
@@ -449,17 +466,20 @@ class TestProvenance:
     def test_an_invalid_signature_is_unverifiable_and_never_evidence(self, workspace: Path) -> None:
         """Since v6 this is enforced at the door, and the door is `audit_receipts`."""
         tampered = [dict(r, signature="00" * 32) for r in football_core_passing()]
-        with pytest.raises(_store.UnverifiedProvenance):
-            _evaluate(tampered, 0)
+        # As above: an invalid signature is counted at the door, never raised past it.
+        audited_tampered = _trusted(tampered)
+        assert list(audited_tampered.batch) == []
+        assert audited_tampered.unverifiable == len(tampered)
         workspace.mkdir(parents=True, exist_ok=True)
         for index, receipt in enumerate(tampered):
             (workspace / f"20260901T12000{index}-core-bad{index:013d}.json").write_text(
                 json.dumps(receipt, indent=2, sort_keys=True), encoding="utf-8"
             )
-        verified, unverifiable = act.audit_receipts()
+        _audit = act.audit_receipts()
+        verified, unverifiable = _audit.batch, _audit.unverifiable
         assert list(verified) == []
         assert unverifiable == len(tampered)
-        document = qual.evaluate(verified, unverifiable)
+        document = qual.evaluate(_audit)
         assert result_for(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 0
         assert document["qualification_unverifiable_receipts"] == len(tampered)
 
