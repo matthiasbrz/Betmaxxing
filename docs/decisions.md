@@ -2018,3 +2018,94 @@ fonctionnalité.
 
 **Ce que cette décision n'autorise pas.** Aucun appel fournisseur, aucune activation,
 aucune promotion d'adaptateur ou de modèle, aucun changement de critère ou de seuil.
+
+### D-078 — Le modèle de menace de la provenance des reçus, énoncé normativement
+
+**Statut.** Adoptée. Clarifie le modèle de menace de D-077 **sans** modifier
+l'admissibilité des preuves : protocole **7**, schéma de reçu **4**, preuve adaptateur
+**1** et instant d'effet `2026-08-11T14:20:00+00:00` sont **inchangés**. Il n'y a ni
+protocole 8 ni nouvel instant.
+
+**Pourquoi cette décision existe.** Sept tranches de suite, un audit indépendant a trouvé
+que la formulation dépassait le code. La dernière l'a mesuré : sur `4408e70`, quatre voies
+ordinaires — le jeton `_PROVENANCE_TOKEN` lu au niveau module, `object.__new__`, une
+sous-classe dont `__init__` n'appelle pas `super()`, et la réécriture simultanée du contenu
+et de son empreinte — amenaient huit reçus **dont la clé `signature` avait été supprimée**
+à `CRITERIA_MET_AWAITING_HUMAN_REVIEW` avec `eligible = true`. La frontière elle-même était
+saine : `audit_directory` refusait les huit et les comptait invérifiables. Ce qui était faux,
+c'était la phrase « la provenance n'est plus constructible ».
+
+Le défaut n'était donc pas dans l'audit, il était dans la promesse. On ne le corrige pas en
+cachant mieux un jeton : on le corrige en disant ce qui est garanti.
+
+**La propriété garantie, littéralement.**
+
+> Dans le pipeline applicatif supporté, seuls les reçus dont le HMAC a été vérifié par
+> `audit_directory` sont transmis à l'évaluation. L'objet de provenance est un marqueur
+> interne et un contrôle contre les erreurs d'utilisation ; il ne constitue pas une sandbox
+> contre du code Python arbitraire exécuté dans le même processus.
+
+**Dans le périmètre de sécurité.** Fichiers de reçus, intents et payloads fournisseur
+hostiles ou malformés ; reçus sans signature ou signés avec une autre clé ; écritures
+interrompues et erreurs de stockage ; liens symboliques, substitutions de chemins et courses
+de système de fichiers ; appelant utilisant les API publiques et documentées ; erreurs
+accidentelles du code applicatif ; processus extérieur ne possédant ni le secret HMAC ni la
+capacité d'exécuter du code dans le processus Betmaxxing.
+
+**Hors du périmètre de sécurité.** Exécution arbitraire de Python dans le processus
+Betmaxxing ; accès réflexif aux attributs privés ; `object.__new__`,
+`object.__setattr__`, monkeypatching, modification du bytecode ou des modules ;
+modification du code source exécuté ; debugger ou processus compromis sous l'identité de
+l'application ; accès direct au secret HMAC.
+
+**Justification normative.** Un acteur capable d'exécuter arbitrairement du Python dans le
+même interpréteur peut remplacer `evaluate`, neutraliser le vérificateur ou lire le secret.
+Aucun constructeur privé, jeton, type ou somme de contrôle exprimable en Python ne peut
+former une frontière cryptographique contre cet acteur. Exiger le contraire, c'est exiger
+une isolation par processus ou par service — hors périmètre de 03C-1.
+
+**Vocabulaire retiré.** « Non-forgeable », « non constructible », « impossible à
+fabriquer », « aucun objet mutable » et « preuve cryptographique portée par le type » ne
+sont plus employés comme garanties. L'authenticité vient du **HMAC vérifié à l'ingestion**.
+Le type et la somme de contrôle ne font que **préserver** cet invariant dans le pipeline de
+confiance ; ils ne le rétablissent pas. Le sujet du septième commit —
+« Make receipt provenance and intents non-forgeable » — est une formulation historique trop
+forte : le message d'un commit est immuable et n'est pas réécrit, il est **supersédé** par
+la présente décision.
+
+**Durcissement effectivement livré**, en défense en profondeur et sans prétention
+anti-réflexion :
+
+1. `_PROVENANCE_TOKEN` **supprimé** ; il n'existe plus aucune valeur de jeton accessible au
+   niveau module, et il n'en est pas introduit de « mieux cachée » ;
+2. les trois constructeurs de provenance refusent **inconditionnellement** ; la création
+   passe par des fonctions privées du module, appelées uniquement par l'audit ;
+3. `FrozenMapping`, `VerifiedReceipt`, `VerifiedReceiptBatch` et `AuditResult` **refusent le
+   sous-classement** ;
+4. les frontières internes comparent une **identité de type exacte** (`type(x) is …`) au lieu
+   d'un `isinstance` qu'un sosie satisfait ;
+5. `audit_directory` reste la seule fabrique utilisée par le graphe applicatif, et un test
+   lit les sources pour le vérifier : un seul site de frappe, situé après le contrôle HMAC ;
+6. `fingerprint` devient **`content_checksum`** et `AuditResult.seals` devient
+   **`AuditResult.checksums`** : ce sont des contrôles d'intégrité contre une mutation
+   accidentelle, pas des preuves d'origine.
+
+**Ce qui est documenté comme limite, non comme garantie.** `FrozenMapping` n'expose aucun
+mutateur **public** ; les séquences sont des `tuple` ; la somme de contrôle détecte une
+mutation accidentelle survenue après l'audit ; une réécriture réflexive simultanée du
+contenu **et** de la somme de contrôle est hors modèle de menace ; l'origine authentique
+reste établie uniquement par le HMAC au moment de l'audit. Le docstring qui affirmait que les
+conteneurs scellés étaient bâtis « only from objects that have no mutating API at all » est
+corrigé : la garantie porte sur l'API publique ordinaire, pas sur les primitives réflexives.
+
+**Traitement des constats du réaudit quattuordecies.** P1-F1 : observation **confirmée**,
+reclassée **hors modèle** pour les voies exigeant l'exécution arbitraire dans le processus ;
+les deux voies simples — jeton exporté et sous-classement — sont néanmoins **fermées**.
+P2-F2 : la somme de contrôle non secrète n'est plus présentée comme une authentification.
+P3-F3 : documentation corrigée sur la mutabilité réflexive du dictionnaire privé. P3-F4 :
+les affirmations absolues sont supprimées ou supersédées. P3-F5 : l'incident des deux
+écritures du corps de PR devient une trace permanente dans la PR.
+
+**Ce que cette décision n'autorise pas.** Aucun appel fournisseur, aucune activation, aucune
+promotion d'adaptateur ou de modèle, aucun changement de critère, de seuil, de protocole, de
+schéma ou d'instant d'effet.

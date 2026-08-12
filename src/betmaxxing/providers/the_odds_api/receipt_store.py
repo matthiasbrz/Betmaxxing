@@ -34,28 +34,60 @@ nothing is read at all.
 down below and performed in that order, the progress loop cannot spin, and a failed
 ``fsync`` is reported rather than suppressed.
 
-**Provenance is a proof, not a type name.** v6 made ``VerifiedReceipt`` a distinct
-class and thought that settled it. The sixth audit called ``VerifiedReceipt(payload)``
-— a public constructor that checked nothing — on eight receipts whose ``signature``
-key had been deleted, and reached the human-review gate; a corpus signed with a
-foreign key did the same. So the type is unconstructible from outside now, and there
-is no longer any function that mints authority from a payload plus a caller's key:
-that function *was* the hole. The only route in is :func:`audit_directory`, which
-takes a directory this module has already opened safely and does the reading, the
-schema check and the HMAC itself, against the secret of the installation.
+**Provenance is a decision recorded at ingestion, not a property of a type name.** v6
+made ``VerifiedReceipt`` a distinct class and thought that settled it. The sixth audit
+called ``VerifiedReceipt(payload)`` — a public constructor that checked nothing — on
+eight receipts whose ``signature`` key had been deleted, and reached the human-review
+gate; a corpus signed with a foreign key did the same. So the constructors refuse
+unconditionally, the types refuse subclassing, no function mints authority from a
+payload plus a caller's key, and the one route the application graph uses is
+:func:`audit_directory`, which takes a directory this module has already opened safely
+and does the reading, the schema check and the HMAC itself against the secret of the
+installation.
 
-The claim is deliberately narrow and testable: **no exported entry point of this
-repository produces admitted provenance without a signature check against the
-installation's own secret**. Code already executing in this process can reach a
-private name or rewrite bytecode; nothing here pretends otherwise.
+v7 guarded those constructors with a module-level token instead. That was weaker than it
+read: a module-level sentinel is one attribute access away from anyone who can ``import``
+the module, so the seventh audit reached the gate with the same eight unsigned receipts
+in three lines. The token is gone — not replaced by a better-hidden one, because there is
+no such thing here (D-078).
+
+**The threat model, normatively (D-078).** This is the property this module claims, and
+the only one:
+
+    In the supported application pipeline, only receipts whose HMAC has been verified by
+    ``audit_directory`` are passed to evaluation. The provenance object is an internal
+    marker and a guard against misuse; it is not a sandbox against arbitrary Python code
+    executed in the same process.
+
+In scope: hostile or malformed receipt files, intents and provider payloads; receipts
+with no signature or signed with another key; interrupted writes and storage errors;
+symbolic links, path substitutions and filesystem races; a caller using the public,
+documented API; accidental mistakes in application code; and any outside process that
+holds neither the HMAC secret nor the ability to execute code in this interpreter.
+
+Out of scope: arbitrary Python executed in this process; reflexive access to private
+attributes; ``object.__new__``, ``object.__setattr__``, monkeypatching, bytecode or
+module rewriting; editing the source that runs; a debugger or a process compromised
+under the application's identity; and direct access to the HMAC secret.
+
+The reason is not resignation, it is arithmetic: an actor who can run arbitrary Python
+in this interpreter can replace :func:`audit_directory`, neutralise the verifier, or read
+the secret outright. No private constructor, token, type or checksum expressible in
+Python can be a cryptographic boundary against that actor. Wanting one means wanting
+process or service isolation, which is outside 03C-1.
+
+So the words « non-forgeable », « unconstructible », « impossible to fabricate » and
+« cryptographic proof carried by the type » are **not** used here as guarantees.
+Authenticity comes from the HMAC verified at ingestion. The type and the checksum keep
+that decision intact across the pipeline; they do not re-establish it.
 
 **An admitted receipt is a frozen value.** v6 copied one level deep, so every
 nested dictionary and list stayed shared with the caller's, and ``__getitem__``
 handed the live object back: one write through the ordinary Mapping API —
 ``receipt["freshness"][market] = 300`` — turned a refusal into
 ``CRITERIA_MET_AWAITING_HUMAN_REVIEW`` while the receipt's own signature stopped
-verifying, and nothing re-read the seal. Payloads are frozen recursively on the way
-in.
+verifying, and nothing re-checked the content. Payloads are frozen recursively on the
+way in.
 
 The first attempt at that freeze deserves to stay written down, because it was the
 same defect one level lower. The sealed containers were a ``dict`` subclass and a
@@ -73,12 +105,16 @@ cost is paid in the open: the structural checks that asked ``isinstance(value, l
 ask for a non-``str`` :class:`~collections.abc.Sequence`, and re-serialising an
 admitted receipt goes through ``to_builtin()`` rather than ``dict()``.
 
-What stays reachable is ``object.__setattr__`` on the single slot. :func:`audit_directory`
-therefore records a non-keyed sha256 of every admitted receipt in its result, and
-:func:`require_audited` recomputes them before anything reads the batch: a receipt
-that changed after the audit admitted it is no longer the evidence that was verified,
-and it is not read. Rewriting *both* the payload and its recorded digest still defeats
-this. That is a limit, stated as one — not a guarantee.
+**The checksum is an integrity control, not an authenticator.**
+:func:`audit_directory` records a non-keyed sha256 of every admitted receipt under
+``AuditResult.checksums``, and :func:`require_audited` recomputes them before anything
+reads the batch. That catches what it is for: a receipt whose content changed between
+the audit and the evaluation — an aliased container, a helper that edited what it was
+handed, a refactor that reused an object it should have copied. It does **not**
+authenticate anything, because no secret is involved and :func:`content_checksum` is
+public. Rewriting the content and the recorded checksum together is out of scope by
+D-078, not defended against here. The names say so now: it was ``fingerprint`` recorded
+under ``seals``, and both words claimed more than a keyless digest can carry.
 
 **A boundary that cannot be read is not an empty boundary.** ``StoreRefused`` used
 to collapse into « zero receipts, zero unverifiable » — the same answer a clean,
@@ -300,14 +336,18 @@ def verify(payload: Mapping[str, Any], *, secret: str, signature_field: str) -> 
 #: never exported, never accepted as a parameter of anything public. Every
 #: constructor below takes it as its **first positional argument**, so the natural
 #: spelling — ``VerifiedReceipt(payload)`` — raises instead of minting authority.
-_PROVENANCE_TOKEN: Any = object()
-
-
 def _refuse_minting(what: str) -> UnverifiedProvenance:
     return UnverifiedProvenance(
         f"Un {what} ne se construit pas : il s'obtient en auditant un répertoire de "
         "reçus sûr, dont les fichiers sont signés par le secret de cette installation. "
-        "Aucun appelant ne peut frapper une provenance sans vérification."
+        "Dans le pipeline applicatif supporté, seul `audit_directory` en produit."
+    )
+
+
+def _refuse_subclassing(what: str) -> TypeError:
+    return TypeError(
+        f"Un {what} ne se sous-classe pas : une sous-classe satisferait les contrôles "
+        "de type sans être passée par l'audit."
     )
 
 
@@ -315,6 +355,28 @@ def _frozen_error(what: str) -> TypeError:
     return TypeError(
         f"Ce {what} appartient à un reçu vérifié : il est scellé et ne se modifie pas."
     )
+
+
+def _sealed(cls: type, **slots: Any) -> Any:
+    """Create one provenance object — from inside this module, and nowhere else.
+
+    The provenance types have **no usable constructor at all**: their ``__init__``
+    refuses unconditionally, so ``VerifiedReceipt(payload)`` — the spelling the sixth
+    audit walked straight through — cannot be written. There is no token either: v7
+    guarded the constructors with a module-level sentinel, and a module-level sentinel
+    is one attribute access away for anyone who can ``import`` the module, so it bought
+    nothing and suggested more than it delivered.
+
+    What this is, per **D-078**: an internal factory, and a guard against ordinary
+    misuse. What it is *not*: a sandbox. A caller who can execute arbitrary Python in
+    this interpreter can call this function, replace :func:`audit_directory`, or read
+    the secret — and that is explicitly outside the threat model. Authenticity comes
+    from the HMAC verified at ingestion, not from the type.
+    """
+    instance: Any = object.__new__(cls)
+    for name, value in slots.items():
+        object.__setattr__(instance, name, value)
+    return instance
 
 
 class FrozenMapping(Mapping[str, Any]):
@@ -340,16 +402,26 @@ class FrozenMapping(Mapping[str, Any]):
     :class:`~collections.abc.Mapping` — and the two structural checks that asked for a
     ``list`` now ask for a sequence that is not a string, which rejects exactly what
     they rejected before: ``json.loads`` never produces a tuple.
+
+    **What this guarantees, exactly (D-078).** No *public* mutating API exists: there is
+    no ``__setitem__`` that works, no ``append`` to reach, and no mutable base class
+    whose methods can be addressed directly. The private dictionary this object holds
+    can still be reached and written through Python's reflexive primitives —
+    ``object.__getattribute__``, ``object.__setattr__`` — and that is outside the threat
+    model rather than prevented here. An earlier version of this docstring said the
+    sealed containers were built « only from objects that have no mutating API at all »,
+    which was stronger than the truth.
     """
 
     __slots__ = ("_data",)
 
     _data: dict[str, Any]
 
-    def __init__(self, token: Any = None, data: Mapping[str, Any] | None = None) -> None:
-        if token is not _PROVENANCE_TOKEN or data is None:
-            raise _refuse_minting("contenu scellé")
-        object.__setattr__(self, "_data", dict(data))
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        raise _refuse_subclassing("contenu scellé")
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise _refuse_minting("contenu scellé")
 
     def __getitem__(self, key: str) -> Any:
         return self._data[key]
@@ -411,7 +483,7 @@ class FrozenMapping(Mapping[str, Any]):
 def _freeze(value: Any) -> Any:
     """The same data, with nothing mutable left anywhere inside it.
 
-    Recursive, and built only from objects that have no mutating API at all: a
+    Recursive, and built only from objects with **no public mutating API**: a
     :class:`FrozenMapping` wrapper, a ``tuple``, a ``frozenset``, or an immutable
     scalar. ``dict(payload)`` froze the top level and shared every nested container,
     which is how ``receipt["freshness"][market] = 300`` — no private attribute, no
@@ -419,11 +491,14 @@ def _freeze(value: Any) -> Any:
     ``INSUFFICIENT_EVIDENCE`` to the human-review gate after its signature had been
     checked and while that signature no longer verified. Subclassing ``dict`` and
     ``list`` did not fix it either: the base classes' methods stayed reachable.
+
+    « No public mutating API » is the exact claim. Python's reflexive primitives reach
+    the private dictionary underneath, and D-078 puts that outside the threat model.
     """
-    if isinstance(value, FrozenMapping):
+    if type(value) is FrozenMapping:
         return value
     if isinstance(value, Mapping):
-        return FrozenMapping(_PROVENANCE_TOKEN, {key: _freeze(item) for key, item in value.items()})
+        return _sealed(FrozenMapping, _data={key: _freeze(item) for key, item in value.items()})
     if isinstance(value, (str, bytes, bytearray)):
         return value
     if isinstance(value, (set, frozenset)):
@@ -449,19 +524,27 @@ class VerifiedReceipt(Mapping[str, Any]):
     """A receipt this installation read safely, checked and verified.
 
     A read-only :class:`~collections.abc.Mapping`, so every reader that used to take
-    a ``dict`` still works. Two things changed at protocol 7: it cannot be
-    constructed (the first argument is a private token), and what it holds is frozen
-    all the way down, so nothing handed out through ``__getitem__`` is writable.
+    a ``dict`` still works. It has no usable constructor, it cannot be subclassed, and
+    what it holds is frozen all the way down, so nothing handed out through
+    ``__getitem__`` is writable through any public API.
+
+    **It is a marker, not a proof (D-078).** Holding one means « the audit of this
+    installation verified the HMAC of these bytes and admitted them ». That statement is
+    true of every receipt the supported pipeline produces, and the type is what keeps the
+    invariant from being lost by accident between the audit and the evaluation. It is not
+    a cryptographic capability: authenticity was established by
+    :func:`audit_directory`, once, at ingestion.
     """
 
     __slots__ = ("_frozen",)
 
     _frozen: FrozenMapping
 
-    def __init__(self, token: Any = None, payload: Mapping[str, Any] | None = None) -> None:
-        if token is not _PROVENANCE_TOKEN or payload is None:
-            raise _refuse_minting("reçu vérifié")
-        object.__setattr__(self, "_frozen", _freeze(dict(payload)))
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        raise _refuse_subclassing("reçu vérifié")
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise _refuse_minting("reçu vérifié")
 
     def __getitem__(self, key: str) -> Any:
         return self._frozen[key]
@@ -505,19 +588,11 @@ class VerifiedReceiptBatch(Sequence[VerifiedReceipt]):
     _receipts: tuple[VerifiedReceipt, ...]
     unverifiable: int
 
-    def __init__(
-        self,
-        token: Any = None,
-        receipts: Sequence[VerifiedReceipt] | None = None,
-        unverifiable: int = 0,
-    ) -> None:
-        if token is not _PROVENANCE_TOKEN or receipts is None:
-            raise _refuse_minting("lot de reçus vérifiés")
-        for receipt in receipts:
-            if not isinstance(receipt, VerifiedReceipt):
-                raise _refuse_minting("lot de reçus vérifiés")
-        object.__setattr__(self, "_receipts", tuple(receipts))
-        object.__setattr__(self, "unverifiable", _exact_count(unverifiable, "unverifiable"))
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        raise _refuse_subclassing("lot de reçus vérifiés")
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise _refuse_minting("lot de reçus vérifiés")
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise TypeError("Un lot de reçus vérifiés ne se modifie pas.")
@@ -542,32 +617,19 @@ class AuditResult:
     that lost the boundary state, so it does not unpack.
     """
 
-    __slots__ = ("batch", "boundary", "reason", "seals", "unverifiable")
+    __slots__ = ("batch", "boundary", "checksums", "reason", "unverifiable")
 
     batch: VerifiedReceiptBatch
     unverifiable: int
     boundary: BoundaryState
     reason: str
-    seals: tuple[str, ...]
+    checksums: tuple[str, ...]
 
-    def __init__(
-        self,
-        token: Any = None,
-        batch: VerifiedReceiptBatch | None = None,
-        boundary: BoundaryState | None = None,
-        reason: str = "",
-    ) -> None:
-        if token is not _PROVENANCE_TOKEN:
-            raise _refuse_minting("résultat d'audit")
-        if not isinstance(batch, VerifiedReceiptBatch):
-            raise _refuse_minting("résultat d'audit")
-        if not isinstance(boundary, BoundaryState) or reason not in BOUNDARY_REASONS:
-            raise _refuse_minting("résultat d'audit")
-        object.__setattr__(self, "batch", batch)
-        object.__setattr__(self, "unverifiable", batch.unverifiable)
-        object.__setattr__(self, "boundary", boundary)
-        object.__setattr__(self, "reason", reason)
-        object.__setattr__(self, "seals", tuple(fingerprint(one) for one in batch))
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        raise _refuse_subclassing("résultat d'audit")
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise _refuse_minting("résultat d'audit")
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise TypeError("Un résultat d'audit ne se modifie pas.")
@@ -602,19 +664,23 @@ def _exact_count(value: object, field: str) -> int:
     return value
 
 
-def fingerprint(payload: Mapping[str, Any]) -> str:
-    """A non-keyed digest of the sealed content, for detecting tampering after minting.
+def content_checksum(payload: Mapping[str, Any]) -> str:
+    """A non-keyed checksum of sealed content — an **integrity** control, not a signature.
 
-    Deliberately **not** an HMAC: no secret is involved, so computing one here keeps the
-    evaluator pure — no environment, no file, no key, no clock. It is not a signature and
-    proves nothing about origin; its only job is to notice that the bytes admitted by the
-    audit are not the bytes being read now.
+    What it is for: noticing that the bytes the audit admitted are not the bytes being
+    read now. That happens through ordinary bugs — an aliased container, a helper that
+    edits what it was handed, a refactor that reuses an object it should have copied —
+    and this catches those.
 
-    Why it exists: ``__slots__`` leaves exactly one attribute name on a verified receipt,
-    and ``object.__setattr__`` can replace it. That primitive cannot be taken away from
-    code running in this process — but a one-line substitution can be made to fail, and
-    that is worth doing. Someone who also replaces the recorded digests defeats this, and
-    that limit is written down rather than argued away.
+    What it is **not**: evidence of origin. No secret is involved, and the function is
+    public, so anyone able to call it can also compute a matching value for content of
+    their choosing. It authenticates nothing. Authenticity is established once, by
+    :func:`audit_directory`, with the HMAC of the installation's own secret; this
+    checksum only preserves that decision across the pipeline.
+
+    The name says so on purpose: it was called ``fingerprint`` and recorded under
+    ``seals``, and both words suggested a proof of origin that a keyless digest cannot
+    give (D-078).
     """
     body = jsonlib.dumps(
         _to_builtin(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -623,33 +689,39 @@ def fingerprint(payload: Mapping[str, Any]) -> str:
 
 
 def require_audited(result: object) -> tuple[VerifiedReceipt, ...]:
-    """The receipts of a real audit, unchanged since it admitted them, or a refusal.
+    """The receipts of a real audit, with their integrity control intact, or a refusal.
 
-    Only an :class:`AuditResult` is accepted. Lists, tuples and bare batches are not:
-    each of them was a way of assembling evidence by hand, and one of them —
-    ``[VerifiedReceipt(payload) for payload in forged]`` — reached the gate.
+    Two checks, and it is worth being exact about what each one is worth:
 
-    Each receipt is then checked against the fingerprint recorded when it was minted, so
-    a payload swapped in afterwards — by any means, including ``object.__setattr__`` on
-    the single remaining slot — is refused instead of read.
+    * the argument must be **exactly** an :class:`AuditResult` — not a list, not a tuple,
+      not a bare batch, and not a subclass. Each of those was a way of assembling
+      evidence by hand, and one of them reached the gate in v6. This is a guard against
+      ordinary misuse by application code, which is what it is for;
+    * each receipt must still match the checksum recorded when the audit admitted it, so
+      an accidental mutation between the audit and the evaluation is refused rather than
+      evaluated.
+
+    Neither check is a cryptographic boundary, and D-078 says so: a caller who executes
+    arbitrary Python in this process can produce an object that passes both. What makes a
+    receipt authentic is the HMAC :func:`audit_directory` verified at ingestion.
     """
-    if not isinstance(result, AuditResult):
+    if type(result) is not AuditResult:
         raise UnverifiedProvenance(
             "Une évaluation prend le résultat d'un audit du répertoire de reçus, pas "
             "une liste, un tuple ni un lot assemblé à la main."
         )
     receipts = tuple(result.batch)
-    seals = result.seals
-    if len(seals) != len(receipts):
+    checksums = result.checksums
+    if len(checksums) != len(receipts):
         raise UnverifiedProvenance(
-            "Le lot audité et ses empreintes ne correspondent plus : le résultat d'audit "
-            "a été altéré après sa production."
+            "Le lot audité et ses sommes de contrôle ne correspondent plus : le résultat "
+            "d'audit a été altéré après sa production."
         )
-    for receipt, seal in zip(receipts, seals, strict=True):
-        if fingerprint(receipt) != seal:
+    for receipt, checksum in zip(receipts, checksums, strict=True):
+        if content_checksum(receipt) != checksum:
             raise UnverifiedProvenance(
-                "Un reçu a changé depuis que l'audit l'a admis : il n'est plus la preuve "
-                "qui a été vérifiée, et il n'est pas lu."
+                "Un reçu a changé depuis que l'audit l'a admis : il n'est plus le contenu "
+                "qui a été vérifié, et il n'est pas lu."
             )
     return receipts
 
@@ -1364,7 +1436,7 @@ def audit_directory(
         if not verify(payload, secret=secret, signature_field=signature_field):
             unverifiable += 1
             continue
-        verified.append(VerifiedReceipt(_PROVENANCE_TOKEN, payload))
+        verified.append(_mint_receipt(payload))
     return _mint_result(_mint_batch(tuple(verified), unverifiable), BoundaryState.AVAILABLE)
 
 
@@ -1408,11 +1480,34 @@ def _parse_receipts(directory: SecureDirectory) -> tuple[list[dict[str, Any]], i
     return out, unreadable
 
 
+def _mint_receipt(payload: Mapping[str, Any]) -> VerifiedReceipt:
+    """Seal one payload the audit has just verified. Called from `audit_directory` only."""
+    return _sealed(VerifiedReceipt, _frozen=_freeze(dict(payload)))
+
+
 def _mint_batch(receipts: Sequence[VerifiedReceipt], unverifiable: int) -> VerifiedReceiptBatch:
-    return VerifiedReceiptBatch(_PROVENANCE_TOKEN, receipts, unverifiable)
+    for receipt in receipts:
+        if type(receipt) is not VerifiedReceipt:
+            raise _refuse_minting("lot de reçus vérifiés")
+    return _sealed(
+        VerifiedReceiptBatch,
+        _receipts=tuple(receipts),
+        unverifiable=_exact_count(unverifiable, "unverifiable"),
+    )
 
 
 def _mint_result(
     batch: VerifiedReceiptBatch, boundary: BoundaryState, reason: str = ""
 ) -> AuditResult:
-    return AuditResult(_PROVENANCE_TOKEN, batch, boundary, reason)
+    if type(batch) is not VerifiedReceiptBatch:
+        raise _refuse_minting("résultat d'audit")
+    if not isinstance(boundary, BoundaryState) or reason not in BOUNDARY_REASONS:
+        raise _refuse_minting("résultat d'audit")
+    return _sealed(
+        AuditResult,
+        batch=batch,
+        unverifiable=batch.unverifiable,
+        boundary=boundary,
+        reason=reason,
+        checksums=tuple(content_checksum(one) for one in batch),
+    )

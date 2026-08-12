@@ -1,4 +1,4 @@
-"""Provenance is a proof, and the proof is a frozen value — D-077, §3.2 and §3.3.
+"""Provenance is the audit's decision, kept intact — D-077, and D-078 for its limits.
 
 Why this suite exists
 ---------------------
@@ -17,18 +17,30 @@ every nested dictionary and list stayed shared with the caller's, and
 ``__getitem__`` handed the live object back. One write through the ordinary
 Mapping API — ``receipt["freshness"][market] = 300`` — turned
 ``INSUFFICIENT_EVIDENCE`` into ``CRITERIA_MET_AWAITING_HUMAN_REVIEW`` while the
-receipt's own signature stopped verifying. Nothing re-read the seal.
+receipt's own signature stopped verifying. Nothing re-checked the content.
 
 So this suite asks two questions the previous one could not: can a caller mint
 authority without the local secret, and can anyone change a receipt after it has
 been admitted. Its positive control is the real audit reading real files, because
-that is now the only way in.
+that is the only route the supported pipeline has.
 
-The threat model, stated exactly: this defends the *public Python API of the
-repository*. Code that already runs in the process can reach a private attribute
-or rewrite bytecode, and no design here prevents that. The claim is narrower and
-testable — no documented, exported or re-exported entry point mints provenance
-without a signature check against the secret the audit loaded.
+**What these tests are worth, and what they are not (D-078).** The property under test
+is this one, and no larger:
+
+    In the supported application pipeline, only receipts whose HMAC has been verified by
+    ``audit_directory`` are passed to evaluation. The provenance object is an internal
+    marker and a guard against misuse; it is not a sandbox against arbitrary Python code
+    executed in the same process.
+
+So this file tests the public API: constructors, re-exports, subclassing, lookalikes,
+mutation through documented calls, and the checksum that catches an accidental change
+between the audit and the evaluation. It deliberately does **not** test resistance to
+``object.__new__``, ``object.__setattr__``, reflexive reads of private attributes,
+monkeypatching, or rewriting content and checksum together: those all presuppose
+arbitrary code in this interpreter, which can equally replace ``evaluate`` or read the
+secret, and the owner has placed them out of scope rather than pretend a Python-level
+control could stop them. Earlier versions of this suite asserted some of them, which
+made the guarantee look bigger than it is.
 """
 
 from __future__ import annotations
@@ -105,12 +117,12 @@ class TestOnlyTheAuditMintsAuthority:
 
     def test_the_batch_type_has_no_public_constructor(self, local_audit: Any) -> None:
         with pytest.raises(store.UnverifiedProvenance):
-            store.VerifiedReceiptBatch(tuple(local_audit.batch), 0)  # type: ignore[arg-type]
+            store.VerifiedReceiptBatch(tuple(local_audit.batch), 0)
 
     def test_the_audit_result_type_has_no_public_constructor(self, local_audit: Any) -> None:
         result = getattr(store, "AuditResult", None) or act.AuditResult
         with pytest.raises(store.UnverifiedProvenance):
-            result(local_audit.batch, 0, "AVAILABLE", "")  # type: ignore[arg-type]
+            result(local_audit.batch, 0, "AVAILABLE", "")
 
     def test_no_public_factory_takes_an_arbitrary_key(self) -> None:
         """`trust(payload, secret=…)` was exactly such a factory."""
@@ -160,11 +172,37 @@ class TestOnlyTheAuditMintsAuthority:
         assert audit.unverifiable == 8
         assert _gate(_evaluate(audit))["eligible"] is False
 
-    def test_the_audit_is_the_only_construction_site_in_the_sources(self) -> None:
+    def test_no_module_level_minting_token_exists(self) -> None:
+        """D-078 retired it: a module global is one attribute access from `import`.
+
+        v7 guarded the three constructors with ``_PROVENANCE_TOKEN``, and the seventh
+        audit reached the human-review gate with eight unsigned receipts in three lines by
+        reading that global. The replacement is not a better-hidden token — there is no
+        such thing in this language — it is constructors that refuse unconditionally and
+        creation confined to private functions of the module.
+        """
+        for name in dir(store):
+            if "TOKEN" in name.upper():
+                raise AssertionError(f"receipt_store.{name} is a module-level token again")
+        assert not hasattr(store, "_PROVENANCE_TOKEN")
+
+    def test_only_the_audit_path_creates_provenance_in_the_sources(self) -> None:
+        """The supported graph mints only after the HMAC check, and nowhere else."""
         source = Path(store.__file__).read_text(encoding="utf-8")
-        assert "_PROVENANCE" in source or "_MINT" in source, (
-            "the module must carry an explicit, private minting token"
-        )
+        assert "def _mint_receipt(" in source
+        callers = [
+            line.strip()
+            for line in source.splitlines()
+            if "_mint_receipt(" in line and "def _mint_receipt(" not in line
+        ]
+        assert len(callers) == 1, f"a receipt is minted at {len(callers)} sites: {callers}"
+        audit_body = source.split("def audit_directory(", 1)[1].split("\ndef ", 1)[0]
+        assert "_mint_receipt(" in audit_body, "the one site must be inside audit_directory"
+        assert "verify(payload" in audit_body, "and it must follow the HMAC check"
+        for module in (act, qual):
+            other = Path(str(module.__file__)).read_text(encoding="utf-8")
+            for spelling in ("_mint_receipt(", "_mint_batch(", "_mint_result(", "_sealed("):
+                assert spelling not in other, f"{module.__name__} mints provenance itself"
 
 
 class TestTheAdmittedReceiptIsAFrozenValue:
@@ -261,8 +299,8 @@ class TestTheAdmittedReceiptIsAFrozenValue:
         assert list(receipt["markets_requested"]) == ["h2h"] or receipt["command"] == "additional"
 
 
-class TestNoBaseClassCallCanBypassTheSeal:
-    """The rectificatif's blocking check — and the reason the first design failed.
+class TestNoPublicMutatorReachesASealedContainer:
+    """Every mutating call the public API offers, refused — and nothing more claimed.
 
     Protocol 7's first attempt froze payloads into ``dict`` and ``list`` *subclasses*
     with every mutator overridden, so that ``isinstance(value, dict)`` kept working
@@ -275,6 +313,14 @@ class TestNoBaseClassCallCanBypassTheSeal:
     :class:`~receipt_store.FrozenMapping` wrapper and plain tuples. These tests assert
     both halves — the nested objects are not instances of the mutable builtins at all,
     and every base-class call fails.
+
+    **Scope, per D-078.** These are ordinary public calls on public builtins, which is why
+    they are tested. What is *not* tested here, because the owner has put it outside the
+    threat model: ``object.__new__``, ``object.__setattr__``,
+    ``object.__getattribute__`` on the private dictionary, monkeypatching, and rewriting
+    content together with its checksum. Those reach the data, and the class name no longer
+    pretends otherwise — it used to be « NoBaseClassCallCanBypassTheSeal », which read as a
+    security boundary rather than a guard against misuse.
     """
 
     @pytest.fixture
@@ -363,34 +409,6 @@ class TestNoBaseClassCallCanBypassTheSeal:
         receipt = stale.batch[0]
         assert type(receipt).__slots__ == ("_frozen",)
         assert not hasattr(receipt, "__dict__")
-        with pytest.raises(AttributeError):
-            object.__setattr__(receipt, "_payload", {})
-
-    def test_a_payload_swapped_through_object_setattr_is_refused_not_read(
-        self, stale: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The one primitive Python cannot take away — met with a recorded fingerprint.
-
-        `object.__setattr__` bypasses `__setattr__` by definition, so the single slot a
-        verified receipt owns can be replaced by code running in this process. What the
-        audit records at mint time is a non-keyed digest of the sealed content, re-checked
-        at the door of every semantic read: the substitution is detected and refused
-        rather than evaluated. Someone who replaces the recorded digests too defeats this,
-        and that limit is stated in the module and in D-077 rather than argued away.
-        """
-        qualifying = audited_corpus(
-            tmp_path / "fresh", threshold_corpus(LOCAL), secret=LOCAL, monkeypatch=monkeypatch
-        )
-        assert _gate(_evaluate(qualifying))["eligible"] is True
-        fresh_payload = qualifying.batch[0].to_builtin()
-
-        receipt = stale.batch[0]
-        object.__setattr__(receipt, "_frozen", store._freeze(fresh_payload))
-        assert receipt["freshness"]["h2h"] == 300, "the swap did happen"
-        with pytest.raises(store.UnverifiedProvenance):
-            _evaluate(stale)
-        with pytest.raises(store.UnverifiedProvenance):
-            _state(stale)
 
     def test_the_stale_corpus_survives_every_attempt_at_once(self, stale: Any) -> None:
         before = _gate(_evaluate(stale))
@@ -461,3 +479,177 @@ class TestNoBaseClassCallCanBypassTheSeal:
         import json as jsonlib
 
         jsonlib.dumps(plain)  # a builtin copy is what serialisation is for
+
+
+class TestTheSupportedPropertyAndItsBoundaries:
+    """D-078 as executable statements: what is claimed, and where it stops."""
+
+    def test_a_raw_mapping_is_refused_by_the_evaluator(self) -> None:
+        """The narrowest form of the sixth audit's P1: one unsigned dict."""
+        unsigned = {k: v for k, v in threshold_corpus(LOCAL)[0].items() if k != act.SIGNATURE_FIELD}
+        for candidate in (unsigned, [unsigned], (unsigned,), {}, None, 0):
+            with pytest.raises((store.UnverifiedProvenance, TypeError)):
+                qual.evaluate(candidate)  # type: ignore[arg-type]
+
+    def test_no_public_or_reexported_name_constructs_a_provenance(self) -> None:
+        payload = threshold_corpus(LOCAL)[0]
+        for module in (store, act, qual):
+            for name in dir(module):
+                if name.startswith("_"):
+                    continue
+                candidate = getattr(module, name)
+                if not isinstance(candidate, type):
+                    continue
+                if candidate not in (
+                    store.VerifiedReceipt,
+                    store.VerifiedReceiptBatch,
+                    store.AuditResult,
+                    store.FrozenMapping,
+                ):
+                    continue
+                with pytest.raises((store.UnverifiedProvenance, TypeError)):
+                    candidate(payload)
+
+    @pytest.mark.parametrize(
+        "name", ["VerifiedReceipt", "VerifiedReceiptBatch", "AuditResult", "FrozenMapping"]
+    )
+    def test_the_provenance_types_refuse_subclassing(self, name: str) -> None:
+        parent = getattr(store, name)
+        with pytest.raises(TypeError):
+            type(f"Fake{name}", (parent,), {})
+
+    def test_a_lookalike_is_not_accepted_by_the_evaluator(self, local_audit: Any) -> None:
+        """Exact type identity, not `isinstance`: a subclass would have satisfied that."""
+
+        class Lookalike:
+            """Duck-types AuditResult without being one."""
+
+            batch = local_audit.batch
+            unverifiable = 0
+            boundary = store.BoundaryState.AVAILABLE
+            reason = ""
+            checksums = local_audit.checksums
+            readable = True
+
+        with pytest.raises(store.UnverifiedProvenance):
+            qual.evaluate(Lookalike())  # type: ignore[arg-type]
+        with pytest.raises(store.UnverifiedProvenance):
+            store.require_audited(Lookalike())
+
+    def test_an_absent_receipt_directory_admits_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(act.RECEIPT_DIR_VARIABLE, str(tmp_path / "never"))
+        monkeypatch.delenv(act.SECRET_VARIABLE, raising=False)
+        audit = act.audit_receipts()
+        assert len(audit.batch) == 0
+        assert audit.boundary is store.BoundaryState.ABSENT
+        assert _gate(_evaluate(audit))["eligible"] is False
+
+    @pytest.mark.parametrize("flavour", ["unsigned", "foreign-key", "mangled-signature"])
+    def test_a_receipt_the_hmac_refuses_stays_unverifiable(
+        self, flavour: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        corpus = []
+        for document in threshold_corpus(LOCAL):
+            candidate = dict(document)
+            if flavour == "unsigned":
+                candidate.pop(act.SIGNATURE_FIELD, None)
+            elif flavour == "foreign-key":
+                candidate[act.SIGNATURE_FIELD] = "b" * 64
+            else:
+                candidate[act.SIGNATURE_FIELD] = "not a signature"
+            corpus.append(candidate)
+        audit = audited_corpus(tmp_path / "receipts", corpus, secret=LOCAL, monkeypatch=monkeypatch)
+        assert len(audit.batch) == 0
+        assert audit.unverifiable == len(corpus)
+        assert _gate(_evaluate(audit))["eligible"] is False
+
+    def test_the_checksum_is_an_integrity_control_and_says_so(self) -> None:
+        first = {"receipt_id": "aa11bb22", "status": "CORE_LIVE_VERIFIED"}
+        second = {"receipt_id": "aa11bb22", "status": "COVERAGE_MISSING"}
+        assert store.content_checksum(first) == store.content_checksum(dict(first))
+        assert store.content_checksum(first) != store.content_checksum(second)
+        # Order must not matter: it is the content that is checked, not the layout.
+        assert store.content_checksum(first) == store.content_checksum(
+            {"status": "CORE_LIVE_VERIFIED", "receipt_id": "aa11bb22"}
+        )
+        signature = str(store.content_checksum.__doc__)
+        assert "not a signature" in signature
+        assert "authenticates nothing" in signature
+        assert not hasattr(store, "fingerprint"), "the misleading name is retired"
+
+    def test_a_result_whose_counts_disagree_with_its_checksums_is_refused(
+        self, local_audit: Any
+    ) -> None:
+        """`require_audited` compares lengths before reading anything."""
+        assert len(local_audit.checksums) == len(local_audit.batch)
+        assert store.require_audited(local_audit) == tuple(local_audit.batch)
+
+    def test_the_audit_result_publishes_checksums_not_seals(self, local_audit: Any) -> None:
+        assert hasattr(local_audit, "checksums")
+        assert not hasattr(local_audit, "seals"), "the misleading name is retired"
+        assert "checksums" in type(local_audit).__slots__
+
+
+class TestTheDocumentsPublishOneThreatModel:
+    """D-078 must read the same in the code, the protocol, the runbook and the decision."""
+
+    ROOT = Path(store.__file__).resolve().parents[4]
+
+    @pytest.mark.parametrize(
+        "relative",
+        [
+            "docs/decisions.md",
+            "docs/provider-validation-protocol.md",
+            "docs/provider-activation.md",
+            "docs/data-dictionary.md",
+            "docs/roadmap.md",
+        ],
+    )
+    def test_every_document_names_the_decision(self, relative: str) -> None:
+        text = (self.ROOT / relative).read_text(encoding="utf-8")
+        assert "D-078" in text, f"{relative} does not name the threat-model decision"
+
+    @pytest.mark.parametrize(
+        "relative",
+        [
+            "docs/decisions.md",
+            "docs/provider-validation-protocol.md",
+            "docs/provider-activation.md",
+        ],
+    )
+    def test_the_in_scope_and_out_of_scope_lists_are_published(self, relative: str) -> None:
+        text = (self.ROOT / relative).read_text(encoding="utf-8")
+        assert "object.__setattr__" in text, "the out-of-scope primitives must be named"
+        assert "hors périmètre" in text or "hors du périmètre" in text
+
+    def test_the_module_states_the_property_and_disclaims_the_absolutes(self) -> None:
+        """The words may appear — but only in the sentence that refuses them.
+
+        A substring ban would be the wrong test: the honest way to retire « non-forgeable »
+        is to name it and say it is not claimed, which is what the module does. So the
+        assertion is on the disclaimer and on the supported property.
+        """
+        source = Path(store.__file__).read_text(encoding="utf-8")
+        docstring = source.split('"""', 2)[1]
+        assert "are **not** used here as guarantees" in docstring
+        assert "only receipts whose HMAC has been verified by" in docstring
+        assert "not a sandbox against arbitrary Python code" in docstring
+        assert "Out of scope:" in docstring
+        assert "In scope:" in docstring
+        # The absolutes must never be *asserted*. They may be quoted in the sentence that
+        # retires them, which is why the forbidden forms are the affirmative ones.
+        for forbidden in (
+            "is non-forgeable",
+            "is unconstructible",
+            "cannot be forged",
+            "is impossible to fabricate",
+        ):
+            assert forbidden not in source, f"{forbidden!r} is claimed again"
+
+    def test_the_protocol_keeps_version_seven_and_its_instant(self) -> None:
+        assert qual.PROVIDER_VALIDATION_PROTOCOL_VERSION == 7
+        assert qual.PROVIDER_ADAPTER_EVIDENCE_VERSION == 1
+        assert qual.QUALIFYING_SCHEMA_VERSION == 4
+        assert qual.QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC == "2026-08-11T14:20:00+00:00"

@@ -188,7 +188,7 @@ class TestProvenanceIsExplicit:
         with pytest.raises(store.UnverifiedProvenance):
             store.VerifiedReceipt(good)
         with pytest.raises(store.UnverifiedProvenance):
-            store.VerifiedReceiptBatch((), 0)  # type: ignore[arg-type]
+            store.VerifiedReceiptBatch((), 0)
 
     def test_a_verified_receipt_reads_like_the_mapping_it_wraps(self, corpus_dir: Path) -> None:
         _audit = act.audit_receipts()

@@ -1010,17 +1010,51 @@ séquences sont des `tuple`, et les quinze appels lèvent. Le prix est explicite
 contrôles structurels qui demandaient `isinstance(value, list)` demandent une `Sequence`
 non-`str`, et un reçu admis se re-sérialise par `to_builtin()` plutôt que par `dict()`.
 
-`object.__setattr__` sur l'unique slot reste joignable. L'audit enregistre donc une
-empreinte sha256 **non clée** de chaque reçu admis dans son résultat, et `require_audited`
-les recalcule avant toute lecture du lot : un reçu qui a changé depuis son admission n'est
-plus la preuve vérifiée, et il n'est pas lu.
+L'audit enregistre une **somme de contrôle** sha256 non clée de chaque reçu admis sous
+`AuditResult.checksums`, et `require_audited` les recalcule avant toute lecture du lot. Ce
+contrôle attrape ce pour quoi il est fait : un contenu qui a changé entre l'audit et
+l'évaluation — un conteneur partagé par erreur, un helper qui modifie ce qu'on lui a passé,
+un refactor qui réutilise un objet qu'il aurait dû copier. Il **n'authentifie rien** :
+aucun secret n'intervient et `content_checksum` est publique. Les noms le disent depuis
+D-078 — c'était `fingerprint` enregistré sous `seals`, et les deux mots promettaient une
+preuve d'origine qu'un condensé sans clé ne peut pas porter.
 
-La revendication est étroite et testable : **aucun point d'entrée exporté du dépôt ne
-produit une provenance admise sans vérification de signature**, et aucun reçu admis ne se
-modifie par cette API ni par un appel direct aux mutateurs de `dict` ou de `list`. Du code
-déjà en cours d'exécution dans le processus peut encore atteindre un nom privé, réécrire du
-bytecode, ou réécrire **à la fois** un reçu et son empreinte enregistrée ; Python n'a pas
-de types intégrés scellés, et rien ici ne prétend l'empêcher.
+### Modèle de menace (D-078), normatif
+
+La propriété garantie, littéralement :
+
+> Dans le pipeline applicatif supporté, seuls les reçus dont le HMAC a été vérifié par
+> `audit_directory` sont transmis à l'évaluation. L'objet de provenance est un marqueur
+> interne et un contrôle contre les erreurs d'utilisation ; il ne constitue pas une sandbox
+> contre du code Python arbitraire exécuté dans le même processus.
+
+| Dans le périmètre | Hors du périmètre |
+| --- | --- |
+| fichiers de reçus, intents et payloads fournisseur hostiles ou malformés | exécution arbitraire de Python dans le processus Betmaxxing |
+| reçus sans signature ou signés avec une autre clé | accès réflexif aux attributs privés |
+| écritures interrompues et erreurs de stockage | `object.__new__`, `object.__setattr__`, monkeypatching |
+| liens symboliques, substitutions de chemins, courses de système de fichiers | modification du bytecode, des modules ou du code source exécuté |
+| appelant utilisant les API publiques et documentées | debugger ou processus compromis sous l'identité de l'application |
+| erreurs accidentelles du code applicatif | accès direct au secret HMAC |
+| processus extérieur sans le secret et sans exécution dans le processus | — |
+
+**Justification.** Un acteur capable d'exécuter arbitrairement du Python dans le même
+interpréteur peut remplacer `evaluate`, neutraliser le vérificateur ou lire le secret. Aucun
+constructeur privé, jeton, type ou somme de contrôle exprimable en Python ne forme une
+frontière cryptographique contre lui ; il faudrait une isolation par processus ou service,
+hors périmètre de 03C-1.
+
+Par conséquent « non-forgeable », « non constructible », « impossible à fabriquer », « aucun
+objet mutable » et « preuve cryptographique portée par le type » ne sont **pas** employés
+comme garanties. L'authenticité vient du HMAC vérifié à l'ingestion ; le type et la somme de
+contrôle **préservent** cette décision, ils ne la rétablissent pas.
+
+**Durcissement livré**, en défense en profondeur : plus aucun jeton au niveau module ;
+constructeurs de provenance refusant inconditionnellement ; sous-classement refusé sur les
+quatre types ; identité de type exacte (`type(x) is …`) aux frontières internes ;
+`audit_directory` seule fabrique du graphe applicatif, vérifié par un test qui lit les
+sources. `FrozenMapping` n'expose aucun mutateur **public** — son dictionnaire privé reste
+joignable par les primitives réflexives, et c'est une limite écrite, pas une garantie.
 
 **Scalaires (v7).** `unverifiable` et `unresolved_intents` sont des entiers Python
 exacts, non booléens, positifs ou nuls. `None` et `False` ne valent jamais zéro

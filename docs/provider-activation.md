@@ -40,6 +40,42 @@ qu'elle prouvera — et surtout ce qu'elle ne prouvera pas. Il ne l'exécute pas
 
 ---
 
+## Ce que la frontière des reçus garantit, et ce qu'elle ne garantit pas (D-078)
+
+Cette section existe parce que sept tranches de suite, la formulation a dépassé le code.
+Lisez-la avant de citer une garantie.
+
+**La propriété garantie, littéralement :**
+
+> Dans le pipeline applicatif supporté, seuls les reçus dont le HMAC a été vérifié par
+> `audit_directory` sont transmis à l'évaluation. L'objet de provenance est un marqueur
+> interne et un contrôle contre les erreurs d'utilisation ; il ne constitue pas une sandbox
+> contre du code Python arbitraire exécuté dans le même processus.
+
+**Dans le périmètre de sécurité.** Fichiers de reçus, intents et payloads fournisseur
+hostiles ou malformés ; reçus sans signature ou signés avec une autre clé ; écritures
+interrompues et erreurs de stockage ; liens symboliques, substitutions de chemins et courses
+de système de fichiers ; appelant utilisant les API publiques et documentées ; erreurs
+accidentelles du code applicatif ; processus extérieur ne possédant ni le secret HMAC ni la
+capacité d'exécuter du code dans le processus Betmaxxing.
+
+**Hors du périmètre de sécurité.** Exécution arbitraire de Python dans le processus
+Betmaxxing ; accès réflexif aux attributs privés ; `object.__new__`, `object.__setattr__`,
+monkeypatching, modification du bytecode ou des modules ; modification du code source
+exécuté ; debugger ou processus compromis sous l'identité de l'application ; accès direct au
+secret HMAC.
+
+Un acteur capable d'exécuter arbitrairement du Python ici peut remplacer `evaluate`,
+neutraliser le vérificateur ou lire le secret. Se protéger de lui demanderait une isolation
+par processus ou service, hors périmètre de 03C-1. Donc : **l'authenticité vient du HMAC
+vérifié à l'ingestion**, une fois. Le type de provenance et la somme de contrôle
+`content_checksum` ne font que préserver cette décision jusqu'à l'évaluation — la somme de
+contrôle attrape une mutation accidentelle, elle n'authentifie rien.
+
+Ce que cela change pour vous, concrètement : si vous devez répondre « qu'est-ce qui prouve
+que ce reçu est authentique ? », la réponse est « le HMAC du secret de cette installation,
+vérifié par l'audit au moment de la lecture » — jamais « son type Python ».
+
 ## Pourquoi l'ancien script ne devait pas être lancé
 
 `scripts/smoke_the_odds_api.py`, dans sa forme précédente, demandait un booléen
