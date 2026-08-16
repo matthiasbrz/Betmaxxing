@@ -44,13 +44,28 @@ additional  yes      1 request, 1 event, 5 markets  5
 
 Evidence, not habit
 -------------------
-Each step is authorised by the previous step's **receipt**, passed explicitly by
-path — never discovered by scanning a directory, which would be the program
-choosing its own proof. Receipts are v2: signed with a local HMAC secret over
-their canonical JSON, carrying HMAC-tagged event ids rather than clear ones,
-expiring, and referencing their parent. A receipt that is unsigned, altered,
-expired, of the wrong schema, or about a different sport, bookmaker or event is
-refused before the network.
+Each step is authorised by the previous step's **receipt**, **named** by the
+operator — never discovered by scanning a directory, which would be the program
+choosing its own proof. Receipts are signed with a local HMAC secret over their
+canonical JSON, carry HMAC-tagged event ids rather than clear ones, expire, and
+reference their parent. A receipt that is unsigned, altered, expired, of the wrong
+schema, or about a different sport, bookmaker or event is refused before the
+network.
+
+Since protocol 7, that name is reduced **textually** to a base name of the
+authorised receipt directory and read through the same descriptor as the audit.
+Until then :func:`load_parent` — the gate in front of both paid commands — took
+every one of its decisions through ``pathlib``, including a ``resolve()`` that
+follows the very symbolic links the store refuses: with the receipt directory a
+link, :func:`audit_receipts` reported an empty installation while this function
+authorised a paid call out of the link's target. One reader being safe proved
+nothing about the other.
+
+:func:`audit_receipts` returns an :class:`~.receipt_store.AuditResult`, and it
+does not unpack into two values. It carries the boundary state as well as the
+counts, because ``except StoreRefused: return (), 0`` gave an unreadable receipt
+directory the same answer as a clean empty one — and ``UNAVAILABLE`` has to reach
+the operator, not be rounded off to « nothing here ».
 
 Every network attempt writes a receipt, whatever its terminal status — a call
 that was billed and then failed validation is exactly the one an audit needs. A
@@ -71,12 +86,14 @@ event, this market, this instant. The adapter's global status stays
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json as jsonlib
 import os
 import secrets
-from collections.abc import Mapping
+import stat as statmodule
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -91,6 +108,7 @@ from betmaxxing.domain.enums import Sport
 from betmaxxing.domain.timeutil import ensure_utc, utc_now
 from betmaxxing.providers.base import CollectionBatch, ProviderError, QuotaInfo
 from betmaxxing.providers.budget import ProviderBudgetLedger
+from betmaxxing.providers.the_odds_api import receipt_store
 from betmaxxing.providers.the_odds_api.client import (
     HEADER_LAST,
     TheOddsApiAuthError,
@@ -117,11 +135,16 @@ from betmaxxing.providers.the_odds_api.provider import (
 DEFAULT_RECEIPT_DIR = ".activation-receipts"
 RECEIPT_DIR_VARIABLE = "BETMAXXING_ACTIVATION_RECEIPTS"
 
+#: The command that performs the documented recovery. Named here so the refusal
+#: message and the CLI cannot drift apart: v5 told the operator to call a function
+#: no command exposed, which made the only documented way out unrunnable.
+QUARANTINE_COMMAND = "python -m betmaxxing.providers.the_odds_api.activation receipts quarantine"
+
 #: The local signing secret. Generated on first network need, never printed,
 #: never committed. Overridable by environment so tests are deterministic and no
 #: test ever leaves a real secret on disk.
 SECRET_FILENAME = "signing-key.secret"
-SECRET_VARIABLE = "BETMAXXING_ACTIVATION_RECEIPT_SECRET"
+SECRET_VARIABLE = receipt_store.SECRET_ENVIRONMENT_VARIABLE
 
 #: Injected by the test suite. Production leaves it ``None`` so httpx builds its
 #: own transport; there is no other way to reach this module's network calls.
@@ -165,18 +188,69 @@ MAX_WINDOW_HOURS = 24
 #: ``NOT_EVALUATED_BOOKMAKER_ABSENT``. A reader that applied v3's invariants to a
 #: v2 file would draw a wrong conclusion, which is exactly what a version number
 #: is for.
-RECEIPT_SCHEMA_VERSION = 3
+#:
+#: v4 adds ``qualification_protocol_version`` and
+#: ``provider_adapter_evidence_version``, both covered by the signature. It is a
+#: new version rather than v3 with extra fields because their *absence* is
+#: meaningful: a v3 receipt cannot say which protocol judged it or which parser
+#: produced it, so it cannot be current qualification evidence. See D-072.
+RECEIPT_SCHEMA_VERSION = 4
 
-#: v2 receipts already on an operator's disk stay usable as authority. Every
-#: field the chain actually depends on — ``event_tags``, ``event_tag``,
+#: v2 and v3 receipts already on an operator's disk stay usable as authority.
+#: Every field the chain actually depends on — ``event_tags``, ``event_tag``,
 #: ``observed_credits``, ``accounted_credits``, ``selections_mapped``,
-#: ``parent_receipt_id``, ``expires_at`` — has the same meaning in both versions;
-#: only ``market_states`` and its projections changed, and those are not
-#: preconditions. So a valid v2 receipt is read, verified and honoured, never
-#: rewritten and never re-signed. Anything outside this set is refused.
-SUPPORTED_SCHEMA_VERSIONS = frozenset({2, RECEIPT_SCHEMA_VERSION})
+#: ``parent_receipt_id``, ``expires_at`` — has the same meaning in all three
+#: versions; only ``market_states`` and its projections changed at v3, and only
+#: the two version stamps arrived at v4. None of those are preconditions, so a
+#: valid v2 or v3 receipt is read, verified and honoured for chaining, never
+#: rewritten and never re-signed. Whether it *qualifies* anything is a different
+#: question, answered by the protocol and not here. Anything outside this set is
+#: refused.
+SUPPORTED_SCHEMA_VERSIONS = frozenset({2, 3, RECEIPT_SCHEMA_VERSION})
 
 SIGNATURE_FIELD = "signature"
+
+
+def _reported_int(value: object) -> int:
+    """A signed receipt's field read as an integer for **reporting**, or zero.
+
+    The audit block summarises whatever is on disk, including a receipt whose
+    signature is ours but whose types are not what we write. `int()` on such a
+    field raised out of `status`; a report that cannot be produced is worse than a
+    report that says zero, and the qualification block — which decides things —
+    reads the same fields strictly and refuses them.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return value
+
+
+def _counted_credits(value: object) -> int:
+    """A credit count that really is one, else zero — for totalling only.
+
+    Distinct from :func:`_reported_int`, which is about not crashing on a mistyped
+    field. This one is about not *adding* a mistyped field: a boolean, a numeric
+    string and a negative number are all refused rather than coerced, because the
+    sum is a spend figure an operator reads before deciding to spend more.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _schema_version_of(payload: Mapping[str, Any]) -> int | None:
+    """The receipt's schema version when it is one we read, else ``None``.
+
+    A JSON file can carry anything under ``schema_version`` — a mapping, a list, a
+    boolean, a float, a string. Testing such a value for membership in a frozenset
+    hashes it, and an unhashable one raised ``TypeError`` out of the audit and out
+    of `status`. A version is a real integer or it is not a version.
+    """
+    version = payload.get("schema_version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        return None
+    return version if version in SUPPORTED_SCHEMA_VERSIONS else None
+
 
 #: How long a receipt may authorise the next step. Short on purpose: yesterday's
 #: discovery says nothing about today's fixtures, and a proof that never expires
@@ -251,28 +325,68 @@ class MarketState(StrEnum):
 
 
 class ExecutionState(StrEnum):
-    """How far the activation has actually gone, on this installation."""
+    """How far the activation has actually gone, on this installation.
+
+    ``NETWORK_ATTEMPT_STATE_UNESTABLISHED`` is what the enum was missing. A receipt
+    whose ``network_attempted`` is absent or mistyped establishes neither that a
+    request was issued nor that none was, and v4 reported ``CORE_ATTEMPTED`` for it —
+    an affirmative fact read off a field that said nothing (D-075).
+    """
 
     NO_NETWORK_ATTEMPTED = "NO_NETWORK_ATTEMPTED"
+    NETWORK_ATTEMPT_STATE_UNESTABLISHED = "NETWORK_ATTEMPT_STATE_UNESTABLISHED"
     DISCOVERY_ATTEMPTED = "DISCOVERY_ATTEMPTED"
     CORE_ATTEMPTED = "CORE_ATTEMPTED"
     ADDITIONAL_ATTEMPTED = "ADDITIONAL_ATTEMPTED"
 
 
 class PaidActivationState(StrEnum):
-    """The paid dimension only. Separate from coverage and from mapping."""
+    """The paid dimension only. Separate from coverage and from mapping.
 
+    ``PAID_ATTEMPT_INCONCLUSIVE`` is the state this enum was missing. A paid call
+    that really went out but established neither coverage nor mapping — because its
+    receipt is malformed, contradictory, or an error that never reached a market —
+    is not "executed with no coverage": that phrase claims we looked and the
+    bookmaker was absent. Rounding it down to the nearest existing label is how
+    ``selections_mapped = "3"`` came to read as an observed coverage.
+    """
+
+    #: No paid step was attempted, and every receipt says so exactly.
     PREPARED_NOT_EXECUTED = "PREPARED_NOT_EXECUTED"
+    #: A paid receipt exists whose attempt state cannot be established. Blocking, and
+    #: never described as executed.
+    PAID_ATTEMPT_STATE_UNESTABLISHED = "PAID_ATTEMPT_STATE_UNESTABLISHED"
+    #: A paid request was confirmed issued and established neither coverage nor mapping.
+    PAID_ATTEMPT_INCONCLUSIVE = "PAID_ATTEMPT_INCONCLUSIVE"
+    #: A `core` call answered the bookmaker question, and the answer was an absence.
     CORE_EXECUTED_NO_COVERAGE = "CORE_EXECUTED_NO_COVERAGE"
+    #: A `core` call produced a sound mapping observation.
     CORE_EXECUTED_COVERAGE_OBSERVED = "CORE_EXECUTED_COVERAGE_OBSERVED"
+    #: An `additional` call **established** coverage or mapping. Not "an additional
+    #: receipt exists": under v4 the mere presence of one forced this label, so an
+    #: `additional/AUTH_FAILED` reported an executed step (D-075).
     ADDITIONAL_EXECUTED = "ADDITIONAL_EXECUTED"
 
 
 class CostProof(StrEnum):
-    """Whether connectivity and billing have been exercised, and conformingly."""
+    """Whether connectivity and billing have been exercised, and conformingly.
+
+    ``EXERCISED_UNESTABLISHED`` is distinct from both ends on purpose. A paid call
+    whose cost cannot be established is not conforming — the whole point of the
+    ``COST_CONFORMITY`` criterion is that an unestablished cost fails it — and it is
+    not a mismatch either, because nothing was shown to disagree. Before v4 this
+    dimension had nowhere to put it and reported ``EXERCISED_CONFORMING`` while the
+    strict block counted the same call under
+    ``paid_calls_with_unestablished_cost``.
+
+    The precedence, applied over every real paid attempt::
+
+        NONCONFORMING > UNESTABLISHED > CONFORMING > NOT_EXERCISED
+    """
 
     NOT_EXERCISED = "NOT_EXERCISED"
     EXERCISED_CONFORMING = "EXERCISED_CONFORMING"
+    EXERCISED_UNESTABLISHED = "EXERCISED_UNESTABLISHED"
     EXERCISED_NONCONFORMING = "EXERCISED_NONCONFORMING"
 
 
@@ -343,45 +457,104 @@ def receipt_dir() -> Path:
     return Path(os.environ.get(RECEIPT_DIR_VARIABLE, "").strip() or DEFAULT_RECEIPT_DIR)
 
 
-def receipt_secret() -> str:
-    """The local HMAC secret, created on first need.
+# ---------------------------------------------------------------------------
+# The signing secret — one format, two verbs
+# ---------------------------------------------------------------------------
+#: Re-exported so callers keep one vocabulary for the boundary's refusals. The
+#: provenance *types* are re-exported too, deliberately: naming them is useful, and
+#: since protocol 7 naming them is all a caller can do — none of the three can be
+#: constructed, so an alias hands out nothing an audit did not produce.
+StoreRefused = receipt_store.StoreRefused
+SecretInvalid = receipt_store.SecretInvalid
+SecretMissing = receipt_store.SecretMissing
+DirectoryUnsafe = receipt_store.DirectoryUnsafe
+DirectoryAbsent = receipt_store.DirectoryAbsent
+ContentUndecodable = receipt_store.ContentUndecodable
+CountInvalid = receipt_store.CountInvalid
+IntentInvalid = receipt_store.IntentInvalid
+PersistenceFailed = receipt_store.PersistenceFailed
+UnverifiedProvenance = receipt_store.UnverifiedProvenance
+VerifiedReceipt = receipt_store.VerifiedReceipt
+VerifiedReceiptBatch = receipt_store.VerifiedReceiptBatch
+AuditResult = receipt_store.AuditResult
+BoundaryState = receipt_store.BoundaryState
+SECRET_HEX_LENGTH = receipt_store.SECRET_HEX_LENGTH
+INTENT_SUFFIX = receipt_store.INTENT_SUFFIX
+INTENT_INVALID_STATE = receipt_store.INTENT_INVALID_STATE
 
-    Created with ``O_CREAT | O_EXCL`` at mode ``0600`` so two processes racing
-    cannot end up with different secrets — the loser reads the winner's file.
-    It lives in the gitignored receipt directory, is never printed, never logged
-    and never committed. The environment variable exists so the test suite can
-    inject a deterministic value rather than depend on real randomness.
+validate_secret_text = receipt_store.validate_secret_text
+new_secret_text = receipt_store.new_secret_text
+
+
+@contextlib.contextmanager
+def receipt_directory(*, create: bool = False) -> Iterator[receipt_store.SecureDirectory]:
+    """The receipt directory, opened once, safely, for the whole operation.
+
+    Every read and every write of this module goes through here. ``create`` is the
+    only difference between a reporting path and a path that is about to sign
+    something: ``status`` must never bring a directory — or a secret — into
+    existence just by looking.
     """
-    injected = os.environ.get(SECRET_VARIABLE, "").strip()
-    if injected:
-        return injected
-
-    directory = receipt_dir()
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / SECRET_FILENAME
-    try:
-        handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return path.read_text(encoding="utf-8").strip()
-    value = secrets.token_hex(32)
-    with os.fdopen(handle, "w", encoding="utf-8") as stream:
-        stream.write(value)
-    # `os.open`'s mode is masked by the umask; state it outright.
-    os.chmod(path, 0o600)
-    return value
+    with receipt_store.SecureDirectory.open(receipt_dir(), create=create) as directory:
+        yield directory
 
 
-def event_tag(event_id: str) -> str:
+def load_receipt_secret() -> str:
+    """The local signing secret, strictly validated, never created.
+
+    One policy, implemented once, in :func:`receipt_store.installation_secret`: the
+    variable when it is **set at all**, otherwise the file. Protocol 7 closed the gap
+    v6 left here — ``BETMAXXING_ACTIVATION_RECEIPT_SECRET=""`` used to read as « not
+    configured » and fall through to the file, while ``"   "`` was refused, so two
+    spellings of nothing meant two different things and neither was written down. A
+    variable that is present is a configured value, and an invalid configured value is
+    a refusal.
+
+    Nothing here repairs, rotates or rewrites: an invalid secret already on disk fails
+    closed, because regenerating it would quietly turn every receipt signed with it
+    into noise.
+    """
+    configured = receipt_store.injected_secret()
+    if configured is not None:
+        return configured
+    with receipt_directory() as directory:
+        return receipt_store.load_secret(directory, SECRET_FILENAME)
+
+
+def ensure_receipt_secret() -> str:
+    """The local signing secret, created atomically if this installation has none.
+
+    Only ever called on a path that is about to *sign* something. Created bytes-first
+    then published under the final name, so no crash and no race can leave a name
+    that exists and is empty — which is exactly what an interrupted first run used to
+    leave, and what every later run then accepted as an empty key.
+    """
+    configured = receipt_store.injected_secret()
+    if configured is not None:
+        return configured
+    with receipt_directory(create=True) as directory:
+        return receipt_store.ensure_secret(directory, SECRET_FILENAME)
+
+
+#: The name the rest of the module used before the two verbs were separated. It
+#: means "make sure there is one, because I am about to sign".
+receipt_secret = ensure_receipt_secret
+
+
+def event_tag(event_id: str, secret: str) -> str:
     """Stable local tag for a provider event id.
 
     HMAC rather than a bare digest. A plain ``sha256(event_id)`` is computable by
-    anyone holding the provider's public fixture list, so it hid nothing; keyed
-    with a secret that never leaves this installation, it identifies the event to
-    *us* — enough for ``core`` to recognise ``discover``'s approval across
-    processes — without being reversible by a dictionary of public ids.
+    anyone holding the provider's public fixture list, so it hid nothing; keyed with a
+    secret that never leaves this installation, it identifies the event to *us* —
+    enough for ``core`` to recognise ``discover``'s approval across processes —
+    without being reversible by a dictionary of public ids.
+
+    The secret is a parameter. It used to be fetched from the ambient environment,
+    which is how a function documented as pure ended up creating a key file.
     """
     digest = hmac.new(
-        receipt_secret().encode("utf-8"), f"event:{event_id}".encode(), hashlib.sha256
+        validate_secret_text(secret).encode("utf-8"), f"event:{event_id}".encode(), hashlib.sha256
     )
     return digest.hexdigest()[:24]
 
@@ -429,52 +602,605 @@ def accounted_credits_of(*, estimated: int, observed: int | None) -> int:
 # Receipts
 # ---------------------------------------------------------------------------
 def canonical_bytes(payload: Mapping[str, Any]) -> bytes:
-    """The exact bytes a signature covers.
+    """The exact bytes a signature covers. See :mod:`receipt_store`."""
+    return receipt_store.canonical_bytes(payload, signature_field=SIGNATURE_FIELD)
 
-    Sorted keys and tight separators, so re-serialising a receipt — or reading it
-    back through a JSON library that reorders — cannot change the signature.
-    ``signature`` itself and any ``_``-prefixed scratch key are excluded.
+
+def sign_receipt(payload: Mapping[str, Any], secret: str) -> str:
+    """Sign with the secret the caller holds.
+
+    Explicit, since v6. While the secret was an implicit lookup, every reader of a
+    receipt — including the qualification evaluator, which documented itself as pure
+    — could reach the environment and create a key file just by checking a signature.
     """
-    body = {k: v for k, v in payload.items() if k != SIGNATURE_FIELD and not k.startswith("_")}
-    return jsonlib.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
-        "utf-8"
+    return receipt_store.sign(payload, secret=secret, signature_field=SIGNATURE_FIELD)
+
+
+def verify_receipt(payload: Mapping[str, Any], secret: str) -> bool:
+    """Constant-time signature check against an explicitly supplied secret."""
+    return receipt_store.verify(payload, secret=secret, signature_field=SIGNATURE_FIELD)
+
+
+def _name_component(value: object, field: str) -> str:
+    """One validated component of a receipt filename.
+
+    A filename is built from three pieces of a document, and a document is data. A
+    ``recorded_at`` of ``"../../2026-08-11T12:00:00+00:00"`` used to survive the
+    string slice below as ``"../../20260811T"`` and put the receipt two directories
+    above the one it belongs in. So each component is checked to be a plain name
+    before it is joined to anything.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{field} doit être une chaîne non vide pour nommer un reçu.",
+        )
+    if value in {".", ".."} or set(value) & {"/", "\\", "\0"}:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{field} contient un séparateur de chemin : un reçu est nommé, pas placé. "
+            "Aucun fichier n'est écrit hors du répertoire de reçus.",
+        )
+    return value
+
+
+QUARANTINE_SUFFIX = ".incomplete"
+#: How many suffixes a quarantine will try before giving up. Bounded on purpose: an
+#: unbounded retry is a spin, and a silent overwrite is what it replaces.
+QUARANTINE_ATTEMPTS = 8
+
+
+def _check_quarantine_scope(name: str) -> None:
+    """The recovery command touches receipts, and nothing else.
+
+    Four refusals, each naming what it protects: the root of trust, the journal of
+    attempts, a publication in progress, and anything that is not a receipt at all.
+    None of them is negotiable with ``--force``, which exists only to archive a
+    *complete signed receipt* the operator has decided to set aside.
+    """
+    checked = receipt_store._check_name(name)
+    if checked == SECRET_FILENAME:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            "Le secret de signature n'est pas un reçu et ne se met pas de côté : le "
+            "déplacer rendrait invérifiable chaque reçu déjà signé. Aucune option ne "
+            "l'autorise.",
+        )
+    if checked.endswith(receipt_store.INTENT_SUFFIX):
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            "Un intent n'est pas un reçu et ne se met pas de côté : il est la seule "
+            "trace qu'une requête a pu partir, et le faire disparaître supprimerait un "
+            "conflit sans le résoudre. Publiez le reçu correspondant, ou traitez le "
+            "conflit ; aucune option ne l'autorise.",
+        )
+    if checked.startswith(".") or checked.endswith(".tmp"):
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            "Un temporaire de publication n'est pas un reçu et ne se met pas de côté ; "
+            "il est nettoyé par la publication elle-même.",
+        )
+    if not checked.endswith(".json"):
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            "Cette commande met de côté un reçu `*.json` du répertoire de reçus, et rien d'autre.",
+        )
+
+
+def quarantine_in(
+    directory: receipt_store.SecureDirectory, name: str, *, force: bool = False
+) -> str:
+    """Move one **name** of this directory aside, keeping every byte.
+
+    The recovery path v4 had no answer for. An interruption after the exclusive create
+    left a zero-byte file, and the next attempt at the *same* receipt was refused for
+    ever under "already exists with different signed content" — which was false, and
+    which permanently made the proof of a real paid call unrecordable.
+
+    Three things changed in v6. It takes a name, not a path, so it can only ever act
+    inside the directory already opened safely — the previous version derived its
+    directory from its argument and would rename any file the process could reach,
+    including one outside the receipt directory and, under a substituted parent, a
+    foreign one. It never replaces: ``os.rename`` overwrites its target, and a forced
+    collision destroyed the bytes of the file quarantined first, against the
+    protocol's own promise to lose none. And a complete signed receipt is refused
+    unless the operator says otherwise, so the recovery cannot be used to make real
+    evidence disappear by accident.
+
+    Protocol 7 adds the one thing v6 left out: a **perimeter**. The command was
+    documented as a recovery for ``*.json`` receipts and enforced nothing, so
+    ``--name aa11bb22cc33dd44.intent`` returned 0 without ``--force`` and took the gate
+    from ``EVIDENCE_CONFLICT`` to ``CRITERIA_MET_AWAITING_HUMAN_REVIEW`` — a conflict
+    deleted with no receipt anywhere — and ``--name signing-key.secret`` turned eight
+    verified receipts into eight unverifiable ones. Neither the root of trust nor the
+    journal nor a publication temporary is a receipt, and none of them is reachable
+    from here, with or without ``--force``.
+    """
+    _check_quarantine_scope(name)
+    info = directory.stat(name)
+    if not statmodule.S_ISREG(info.st_mode):
+        # A boundary refusal, not a business one: a link, a directory or a device at
+        # that name is not a receipt this program is willing to touch at all.
+        raise receipt_store.DirectoryUnsafe(
+            f"{name} n'est pas un fichier régulier du répertoire de reçus ; rien n'est "
+            "mis de côté et aucun renvoi n'est suivi."
+        )
+    if not force and _looks_like_a_complete_receipt_text(directory, name):
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{name} est un reçu signé complet, pas un fichier incomplet. Utilisez "
+            "`--force` si vous voulez vraiment l'archiver, et conservez-le pour l'audit.",
+        )
+    stamp = utc_now().strftime("%Y%m%dT%H%M%S")
+    for _ in range(QUARANTINE_ATTEMPTS):
+        target = f"{name}{QUARANTINE_SUFFIX}-{stamp}-{secrets.token_hex(4)}"
+        try:
+            directory.rename(name, target)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise Refused(
+                ActivationStatus.PREPARED_NOT_EXECUTED,
+                f"{name} n'a pas pu être mis de côté ; il reste en place.",
+            ) from exc
+        directory.fsync()
+        return target
+    raise receipt_store.PersistenceFailed(
+        f"{name} n'a pas pu être mis de côté sous un nom libre après "
+        f"{QUARANTINE_ATTEMPTS} essais ; rien n'a été remplacé et le fichier reste en place."
     )
 
 
-def sign_receipt(payload: Mapping[str, Any]) -> str:
-    return hmac.new(
-        receipt_secret().encode("utf-8"), canonical_bytes(payload), hashlib.sha256
-    ).hexdigest()
+def quarantine_incomplete_receipt(name: str, *, force: bool = False) -> str:
+    """Quarantine one name of the receipt directory. Returns the new name."""
+    with receipt_directory() as directory:
+        return quarantine_in(directory, name, force=force)
 
 
-def verify_receipt(payload: Mapping[str, Any]) -> bool:
-    """Constant-time signature check. Everything downstream depends on it."""
-    given = payload.get(SIGNATURE_FIELD)
-    if not isinstance(given, str) or not given:
+def _looks_like_a_complete_receipt_text(
+    directory: receipt_store.SecureDirectory, name: str
+) -> bool:
+    try:
+        return _looks_like_a_complete_receipt(directory.read_text(name))
+    except (receipt_store.StoreRefused, OSError, ValueError):
         return False
-    return hmac.compare_digest(given, sign_receipt(payload))
+
+
+def _looks_like_a_complete_receipt(text: str) -> bool:
+    """Whether these bytes are a JSON object carrying a signature.
+
+    Only enough to tell "a receipt that disagrees with mine" from "not a receipt at
+    all". The two deserve different messages and different remedies, and conflating
+    them is what made an empty file look like a rival proof.
+    """
+    try:
+        payload = jsonlib.loads(text)
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and bool(payload.get(SIGNATURE_FIELD))
 
 
 def write_receipt(document: dict[str, Any]) -> Path:
-    """Sign and persist one receipt locally. Never committed, never uploaded."""
-    directory = receipt_dir()
-    directory.mkdir(parents=True, exist_ok=True)
+    """Sign and persist one receipt locally. Never committed, never uploaded.
+
+    Published **atomically**, in the order :meth:`receipt_store.SecureDirectory.publish_bytes`
+    documents, and never overwritten. An earlier version truncated the identifier to
+    eight characters and used ``Path.write_text``, so two receipts sharing a second, a
+    command and a prefix silently overwrote one another; the version after that created
+    the final name first, so an interruption left an empty file that blocked its own
+    receipt id for ever. Now the bytes exist in full before the name does, and the
+    directory is a descriptor rather than a path, so nothing can be substituted
+    underneath the operation.
+
+    Re-writing a byte-identical receipt is idempotent. A divergent *signed receipt*
+    under the same name is a collision and is refused. An incomplete or unreadable
+    file at that name is neither: it is reported as incomplete, with a command the
+    operator can actually run.
+    """
     signed = {k: v for k, v in document.items() if not k.startswith("_")}
-    signed[SIGNATURE_FIELD] = sign_receipt(signed)
-    stamp = str(signed["recorded_at"]).replace(":", "").replace("-", "")[:15]
-    path = directory / f"{stamp}-{signed['command']}-{str(signed['receipt_id'])[:8]}.json"
-    path.write_text(
-        jsonlib.dumps(signed, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    command = _name_component(signed.get("command"), "command")
+    receipt_id = _name_component(signed.get("receipt_id"), "receipt_id")
+    moment = _parse_instant(signed.get("recorded_at"))
+    if moment is None:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            "recorded_at n'est pas un instant ISO 8601 avec fuseau ; un reçu sans instant "
+            "lisible n'est pas nommable.",
+        )
+    stamp = moment.strftime("%Y%m%dT%H%M%S")
+    name = f"{stamp}-{command}-{receipt_id}.json"
+
+    # The same resolution order as every other reader and writer: an injected secret
+    # wins, a stored one is validated, and one is created only because this path is
+    # about to sign. Reading the file directly here signed receipts with a different
+    # key than `load_parent` verified them with.
+    secret = ensure_receipt_secret()
+    with receipt_directory(create=True) as directory:
+        signed[SIGNATURE_FIELD] = sign_receipt(signed, secret)
+        body = jsonlib.dumps(signed, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        published = directory.publish_bytes(name, body.encode("utf-8"))
+        if published.outcome == "exists":
+            try:
+                existing = directory.read_text(name)
+            except (receipt_store.StoreRefused, OSError) as exc:
+                raise Refused(
+                    ActivationStatus.PREPARED_NOT_EXECUTED,
+                    f"{name} existe déjà et n'est pas un fichier régulier lisible du "
+                    "répertoire de reçus. Rien n'est écrit et rien n'est remplacé.",
+                ) from exc
+            if existing != body:
+                if not _looks_like_a_complete_receipt(existing):
+                    raise Refused(
+                        ActivationStatus.PREPARED_NOT_EXECUTED,
+                        f"{name} existe déjà mais est incomplet ou illisible — ce n'est pas "
+                        "un reçu signé divergent. Mettez-le de côté avec "
+                        f"`{QUARANTINE_COMMAND} --name {name}` pour conserver ses octets, "
+                        "puis rejouez cette étape : le même reçu sera republié à l'identique.",
+                    )
+                raise Refused(
+                    ActivationStatus.PREPARED_NOT_EXECUTED,
+                    f"{name} existe déjà avec un contenu signé différent. Un reçu n'est "
+                    "jamais remplacé : renommez ou archivez l'ancien avant de rejouer cette "
+                    "étape, et conservez les deux pour l'audit.",
+                )
     document[SIGNATURE_FIELD] = signed[SIGNATURE_FIELD]
-    document["_path"] = str(path)
-    return path
+    document["_path"] = str(receipt_dir() / name)
+    return Path(document["_path"])
+
+
+# ---------------------------------------------------------------------------
+# Attempt intents — the trace that survives a failed publication
+# ---------------------------------------------------------------------------
+def _intent_of(attempt: Attempt) -> dict[str, Any]:
+    """What an intent may say: identity, scope, ceiling. Nothing else.
+
+    No key, no URL, no query string, no clear event id, no quote, no payload. The
+    event appears only as its HMAC tag, exactly as a receipt carries it.
+    """
+    return {
+        "intent_version": receipt_store.INTENT_VERSION,
+        "attempt_id": attempt.attempt_id,
+        "command": attempt.command,
+        "sport_key": attempt.sport,
+        "bookmaker": attempt.bookmaker,
+        "event_tag": (attempt.event_tags[0] if attempt.event_tags else ""),
+        "max_credits": attempt.ceiling,
+        "state": "PREPARED",
+        "prepared_at": attempt.now.isoformat(),
+    }
+
+
+def publish_intent(attempt: Attempt) -> str:
+    """Record durably, **before** the request, that one may be about to leave.
+
+    This is the answer to the failure mode the fifth audit reproduced: five credits
+    committed, the publication of the receipt failing, and no trace at all that
+    anything had been attempted. A receipt written after the fact cannot cover that
+    window; a file written and ``fsync``-ed before it can.
+    """
+    try:
+        with receipt_directory(create=True) as directory:
+            return receipt_store.publish_intent(directory, _intent_of(attempt))
+    except receipt_store.StoreRefused as exc:
+        # Refused *before* the wire, which is the whole point: if the trace of an
+        # attempt cannot be made durable, the attempt does not happen. Nothing has been
+        # requested and nothing has been billed, so this is an ordinary refusal. A
+        # divergent intent under an identifier already taken lands here too: two
+        # attempts do not share an identity, and the second one does not go out.
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"La trace locale de la tentative n'a pas pu être rendue durable ({exc}) ; "
+            "aucune requête n'est émise et aucun crédit n'est engagé.",
+        ) from exc
+
+
+def resolve_intent(attempt_id: str) -> bool:
+    """Forget one intent, once its receipt is durably published. Idempotent."""
+    try:
+        with receipt_directory() as directory:
+            return receipt_store.resolve_intent(directory, attempt_id)
+    except receipt_store.StoreRefused:
+        return False
+
+
+def unresolved_intents() -> list[dict[str, Any]]:
+    """Every intent still on disk, sanitised. Each one blocks the qualification gate.
+
+    The bodies come back from the store already checked against the intent contract:
+    a valid one as this program wrote it, an invalid or unreadable one reduced to its
+    local name and ``UNREADABLE_OR_INVALID``. v6 returned the parsed file verbatim,
+    and ``unresolved_attempt_intent_details`` published it — so a hostile ``command``
+    and a hostile ``max_credits`` were echoed into the operator's JSON and terminal.
+    """
+    try:
+        with receipt_directory() as directory:
+            return receipt_store.unresolved_intents(directory)
+    except receipt_store.StoreRefused:
+        # An unreadable boundary hides nothing: `audit_receipts` reports UNAVAILABLE
+        # for the same directory, and that alone closes the gate.
+        return []
+
+
+def _matches_intent(intent: Mapping[str, Any], receipt: Mapping[str, Any]) -> bool:
+    """Whether this verified receipt is the outcome of *this* intent.
+
+    Identifier **and** material scope. v6 compared identifiers only, against a set
+    built by parsing JSON without verifying anything, so a two-key file was enough to
+    delete an intent and reopen the gate; a receipt of another command, sport,
+    bookmaker, tag or cost did it just as well.
+    """
+    if str(receipt.get("receipt_id") or "") != str(intent.get("attempt_id") or ""):
+        return False
+    if str(receipt.get("command") or "") != str(intent.get("command") or ""):
+        return False
+    for receipt_field, intent_field in (
+        ("sport_key", "sport_key"),
+        ("bookmaker", "bookmaker"),
+    ):
+        if str(receipt.get(receipt_field) or "") != str(intent.get(intent_field) or ""):
+            return False
+    expected_tag = str(intent.get("event_tag") or "")
+    if expected_tag:
+        tags = {str(expected_tag)}
+        carried = receipt.get("event_tag")
+        listed = receipt.get("event_tags")
+        seen = {str(carried)} if isinstance(carried, str) else set()
+        if isinstance(listed, (list, tuple)):
+            seen |= {str(item) for item in listed}
+        if not (tags & seen):
+            return False
+    charged = _usable_cost(receipt.get("accounted_credits"))
+    ceiling = intent.get("max_credits")
+    if charged is None or not isinstance(ceiling, int) or charged > ceiling:
+        return False
+    # Imported here rather than at module scope: `qualification` imports *from* this
+    # module, so a top-level import would be a cycle. The catalogue is the single
+    # source of what a command can actually persist, and duplicating it here to avoid
+    # one deferred import is how two lists of couples drift apart.
+    from betmaxxing.providers.the_odds_api import qualification as qual
+
+    couple = (str(receipt.get("command") or ""), str(receipt.get("status") or ""))
+    if couple not in set(qual.PERSISTED_COUPLES):
+        return False
+    # Sound and current, judged by the contract itself rather than by a second copy of
+    # it here. A historical receipt, a malformed one and a self-contradictory one all
+    # kept the identifier and the scope intact, so scope alone let each of them delete
+    # an intent — and an intent deleted by a receipt the contract refuses to read is an
+    # intent deleted by nothing.
+    if qual.structural_faults(receipt) or qual.contradictions(receipt):
+        return False
+    # Two different questions, kept apart on purpose.
+    #
+    # *Accounting* — this function — asks « does a durable, verified receipt record the
+    # outcome of this attempt? ». It requires the same **lineage**: schema, protocol and
+    # adapter-evidence versions must be the current ones, so a receipt produced under an
+    # earlier protocol never closes an intent opened under this one.
+    #
+    # *Admissibility* — `qualification.evaluate` — asks « does this receipt support a
+    # pre-registered criterion? ». That is where the effective instant belongs, and a
+    # receipt recorded before it stays **historical and non-qualifying** however well it
+    # resolves an intent.
+    #
+    # Applying the instant rule here as well would make every protocol change orphan the
+    # intents in flight: an intent no receipt can ever resolve blocks the gate for ever,
+    # which turns a correction into a durable denial. So a receipt of the right lineage
+    # can close its intent *and* contribute nothing to the criteria — the two facts are
+    # reported separately and neither is inferred from the other.
+    return qual.currency_reason(receipt) not in {
+        "stale_schema",
+        "other_protocol_version",
+        "other_adapter_evidence_version",
+        "unusable_recorded_at",
+    }
+
+
+def reconcile_intents() -> int:
+    """Resolve intents whose receipt is already published and matching. Returns how many.
+
+    The idempotent half of the crash story: if the process died between publishing a
+    receipt and forgetting its intent, replaying finds the receipt, drops the intent
+    and counts nothing twice — the receipt was and remains the single record of the
+    cost.
+
+    Every candidate now comes from :func:`audit_receipts`, so it has been read through
+    the descriptor, matched against an accepted schema and verified against this
+    installation's secret; and it must satisfy :func:`_matches_intent`, so it is the
+    outcome of *that* attempt and not merely a file bearing the same identifier.
+    """
+    audit = audit_receipts()
+    if not audit.readable:
+        return 0
+    resolved = 0
+    try:
+        with receipt_directory() as directory:
+            for intent in receipt_store.unresolved_intents(directory):
+                if intent.get("state") == receipt_store.INTENT_INVALID_STATE:
+                    continue
+                identifier = str(intent.get("attempt_id") or "")
+                if not identifier:
+                    continue
+                if not any(_matches_intent(intent, receipt) for receipt in audit.batch):
+                    continue
+                if receipt_store.resolve_intent(directory, identifier):
+                    resolved += 1
+    except receipt_store.StoreRefused:
+        return 0
+    return resolved
+
+
+def _signing_secret() -> str:
+    """The receipt secret for a path that is about to sign, as a business refusal.
+
+    ``ensure`` rather than ``load``: these callers are the ones allowed to create a
+    secret, because they are the ones about to produce a receipt. A malformed secret
+    already on disk stops the step instead of being replaced — replacing it would make
+    every receipt already signed with it unverifiable.
+    """
+    try:
+        return ensure_receipt_secret()
+    except receipt_store.StoreRefused as exc:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"Le secret de signature local est inutilisable : {exc} Aucune étape n'est "
+            "engagée et aucun secret n'est remplacé.",
+        ) from exc
+
+
+def _persist_or_report(
+    document: dict[str, Any],
+    *,
+    attempt: Attempt | None,
+    as_json: bool,
+    secret: str,
+) -> None:
+    """Publish one receipt, or tell the operator plainly that it could not be.
+
+    The five call sites of :func:`write_receipt` sat outside every handler, and the
+    module installed no global one, so ``ENOSPC`` at the ``discover`` site exited with a
+    bare ``OSError``, printed **nothing**, and left no receipt: the operator learned
+    neither the outcome nor that a request had been attempted. At the ``additional``
+    site the same shape loses the only proof of a five-credit call. Every site goes
+    through here now, and the intent written before the wire is what survives.
+
+    Protocol 7 widened the net to the exception graph that actually exists. v6 caught
+    ``PersistenceFailed`` and nothing else, while ``write_receipt`` can also raise
+    ``Refused`` — a divergent signed receipt already at the name — and any
+    ``StoreRefused``: ``open_file`` converts *every* ``OSError`` into
+    ``DirectoryUnsafe``, so ``EACCES``, ``EROFS``, ``EPERM`` and ``ENOSPC`` at the
+    creation of the receipt's temporary went straight past the handler and out of the
+    command with **zero bytes** on stdout. The store now reports a failed temporary as
+    a durability failure, and this function catches the rest of the family too.
+    """
+    try:
+        write_receipt(document)
+    except receipt_store.PersistenceFailed as exc:
+        _fail_persistence(exc, attempt=attempt, document=document, as_json=as_json, secret=secret)
+        return
+    except Refused as exc:
+        _fail_persistence(
+            receipt_store.PersistenceFailed(exc.message, published=False),
+            attempt=attempt,
+            document=document,
+            as_json=as_json,
+            secret=secret,
+        )
+        return
+    except receipt_store.StoreRefused as exc:
+        _fail_persistence(
+            receipt_store.PersistenceFailed(str(exc), published=False),
+            attempt=attempt,
+            document=document,
+            as_json=as_json,
+            secret=secret,
+        )
+        return
+    except OSError as exc:
+        # Nothing in the store is meant to let a bare OSError through any more. If one
+        # ever does, the operator still gets a sentence and a non-zero exit rather than
+        # a traceback and an empty terminal.
+        _fail_persistence(
+            receipt_store.PersistenceFailed(
+                f"Erreur de stockage inattendue lors de la publication ({exc.errno}).",
+                published=False,
+            ),
+            attempt=attempt,
+            document=document,
+            as_json=as_json,
+            secret=secret,
+        )
+        return
+    resolve_intent(str(document.get("receipt_id") or ""))
+
+
+def _fail_persistence(
+    failure: receipt_store.PersistenceFailed,
+    *,
+    attempt: Attempt | None,
+    document: Mapping[str, Any],
+    as_json: bool,
+    secret: str,
+) -> None:
+    """Report a lost or unproven publication. Sanitised, non-empty, non-zero exit."""
+    identifier = str(document.get("receipt_id") or (attempt.attempt_id if attempt else ""))
+    payload: dict[str, Any] = {
+        "status": str(document.get("status") or ActivationStatus.PREPARED_NOT_EXECUTED),
+        "command": str(document.get("command") or (attempt.command if attempt else "")),
+        "attempt_id": identifier,
+        "may_have_reached_provider": document.get("may_have_reached_provider"),
+        "accounted_credits": _reported_int(document.get("accounted_credits")),
+        "persistence_failure": {
+            "detail": str(failure),
+            "receipt_published": bool(failure.published),
+            "cleanup_pending": bool(failure.cleanup_pending),
+        },
+        "unresolved_attempt_intents": len(unresolved_intents()),
+    }
+    lines = [
+        f"ÉCHEC DE PERSISTANCE : {failure}",
+        f"Commande            : {payload['command']}",
+        f"Tentative           : {identifier}",
+        f"Atteinte fournisseur: {payload['may_have_reached_provider']}",
+        f"Crédits comptés     : {payload['accounted_credits']}",
+        f"Reçu publié         : {payload['persistence_failure']['receipt_published']}",
+        f"Intents non résolus : {payload['unresolved_attempt_intents']}",
+        "",
+        "Une tentative a pu partir et sa preuve n'est pas durable. L'intent local "
+        "conservé ci-dessus est la trace qui reste ; il bloque la porte de "
+        "qualification jusqu'à résolution.",
+    ]
+    if as_json:
+        typer.echo(_scrub(jsonlib.dumps(payload, ensure_ascii=False, sort_keys=True), secret))
+    else:
+        typer.echo(_scrub("\n".join(lines), secret))
+    raise typer.Exit(1)
+
+
+def parent_name(raw_path: str) -> str:
+    """The base name of the authorised directory this argument denotes.
+
+    Textual, and only textual. The point of protocol 7's correction here is that no
+    security decision is taken by resolving anything: ``Path.resolve`` follows the
+    very symbolic links the store refuses, which is how a receipt directory that had
+    become a link authorised a paid call that the audit of the same directory refused
+    to read at all.
+
+    So an argument is accepted in exactly two shapes — a bare name of the receipt
+    directory, or the path this program itself printed, whose directory part equals
+    the configured one after ``normpath``. Everything else is refused, and the refusal
+    tells the operator to pass the name.
+    """
+    if not isinstance(raw_path, str) or not raw_path:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            "Aucun reçu parent n'est nommé. Attendu le nom d'un fichier du répertoire "
+            "de reçus autorisé.",
+        )
+    head, tail = os.path.split(raw_path)
+    if head and os.path.normpath(head) != os.path.normpath(str(receipt_dir())):
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            "Un reçu parent est désigné par son nom dans le répertoire de reçus "
+            "autorisé, ou par le chemin que cette commande a imprimé. Aucun autre "
+            "chemin n'est interprété et aucun renvoi n'est suivi.",
+        )
+    if not tail.endswith(".json"):
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            "Un reçu parent est un fichier `*.json` du répertoire de reçus autorisé.",
+        )
+    try:
+        return receipt_store._check_name(tail)
+    except receipt_store.DirectoryUnsafe as exc:
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            "Le nom du reçu parent n'est pas un nom simple du répertoire de reçus.",
+        ) from exc
 
 
 def load_parent(
     raw_path: str,
     *,
+    signing: str,
     command: str,
     status: ActivationStatus,
     sport: str,
@@ -483,38 +1209,49 @@ def load_parent(
 ) -> dict[str, Any]:
     """Read and fully validate the receipt that authorises this step.
 
-    Passed by path, deliberately. The previous version walked the receipt
-    directory looking for something that matched — choosing the operator's
-    evidence for them, from unauthenticated files, in a directory anything can
-    write to.
+    Named by the operator, deliberately: an earlier version walked the directory
+    looking for something that matched — choosing the operator's evidence for them,
+    from unauthenticated files, in a directory anything can write to.
+
+    Read through the **same descriptor as the audit**, since protocol 7. Until then
+    this function made every one of its decisions through ``pathlib`` —
+    ``receipt_dir().resolve()``, ``path.is_symlink()``, ``path.resolve()``,
+    ``resolved.read_text()`` — four separate lookups of one name, in front of the two
+    commands that spend money. With the receipt directory a symbolic link,
+    ``audit_receipts`` reported an empty installation and this function authorised a
+    paid call out of the link's target. One reader being safe proved nothing about
+    the other; now there is one boundary and both use it.
     """
-    directory = receipt_dir().resolve()
-    path = Path(raw_path)
-    if path.is_symlink():
+    name = parent_name(raw_path)
+    try:
+        with receipt_directory() as directory:
+            text = directory.read_text(name)
+    except receipt_store.DirectoryAbsent as exc:
         raise Refused(
             ActivationStatus.PREPARED_NOT_EXECUTED,
-            f"{raw_path} est un lien symbolique. Une preuve doit être un fichier réel "
-            "du répertoire de reçus, pas un renvoi vers ailleurs.",
-        )
-    resolved = path.resolve()
-    if not resolved.is_file() or resolved.parent != directory:
+            "Le répertoire de reçus autorisé n'existe pas ; aucune preuve ne peut en "
+            "venir et aucune requête n'est émise.",
+        ) from exc
+    except receipt_store.StoreRefused as exc:
         raise Refused(
             ActivationStatus.PREPARED_NOT_EXECUTED,
-            f"{raw_path} n'est pas un reçu de {directory}. Seul le répertoire de reçus "
-            "autorisé est lu ; aucun chemin ambigu n'est suivi.",
-        )
+            f"{name} n'est pas un fichier régulier lisible du répertoire de reçus "
+            "autorisé, ou ce répertoire lui-même n'est pas sûr. Aucun renvoi n'est "
+            "suivi et aucune requête n'est émise.",
+        ) from exc
 
     try:
-        payload = jsonlib.loads(resolved.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        payload = jsonlib.loads(text)
+    except ValueError as exc:
         raise Refused(
-            ActivationStatus.PREPARED_NOT_EXECUTED, f"{raw_path} est illisible ({exc})."
+            ActivationStatus.PREPARED_NOT_EXECUTED, f"{name} n'est pas un reçu lisible."
         ) from exc
     if not isinstance(payload, dict):
-        raise Refused(ActivationStatus.PREPARED_NOT_EXECUTED, f"{raw_path} n'est pas un reçu.")
+        raise Refused(ActivationStatus.PREPARED_NOT_EXECUTED, f"{name} n'est pas un reçu.")
+    raw_path = name
 
     version = payload.get("schema_version")
-    if version not in SUPPORTED_SCHEMA_VERSIONS:
+    if not _schema_version_of(payload):
         raise Refused(
             ActivationStatus.PREPARED_NOT_EXECUTED,
             f"{raw_path} porte le schéma {version!r} ; seuls "
@@ -522,7 +1259,7 @@ def load_parent(
             "chaîné : il ne prouve rien et n'est pas promu silencieusement. Relancez "
             "`discover` puis les étapes suivantes avec cette version.",
         )
-    if not verify_receipt(payload):
+    if not verify_receipt(payload, signing):
         raise Refused(
             ActivationStatus.PREPARED_NOT_EXECUTED,
             f"{raw_path} : signature absente ou invalide. Le reçu a été modifié, ou il "
@@ -607,6 +1344,10 @@ class Attempt:
     events_returned: int = 0
     events_in_window: int = 0
     events_admissible: int = 0
+    #: Minted **before** the first request, so the intent written ahead of the wire
+    #: and the receipt written after it carry the same identifier. v5 minted it
+    #: inside `build_receipt`, which is to say after the money had been spent.
+    attempt_id: str = field(default_factory=lambda: secrets.token_hex(8))
 
     def record(self, endpoint: str) -> None:
         self.attempts += 1
@@ -631,9 +1372,23 @@ def build_receipt(attempt: Attempt, status: ActivationStatus, secret: str) -> di
     in what state, how fresh they were, and whether our parser coped — the whole
     question an activation is meant to answer.
     """
+    # The single common path, so `discover`, `core` and `additional` all carry the
+    # two version stamps and all three are covered by the signature below.
+    # Imported here rather than at module level because `qualification` imports
+    # this module for its vocabularies.
+    from .qualification import (
+        PROVIDER_ADAPTER_EVIDENCE_VERSION,
+        PROVIDER_VALIDATION_PROTOCOL_VERSION,
+    )
+
     document: dict[str, Any] = {
         "schema_version": RECEIPT_SCHEMA_VERSION,
-        "receipt_id": secrets.token_hex(8),
+        # Which protocol would judge this receipt, and which parser produced it.
+        # Without them a proof cannot be told apart from a proof about code we
+        # have since changed — see D-072.
+        "qualification_protocol_version": PROVIDER_VALIDATION_PROTOCOL_VERSION,
+        "provider_adapter_evidence_version": PROVIDER_ADAPTER_EVIDENCE_VERSION,
+        "receipt_id": attempt.attempt_id,
         "command": attempt.command,
         "status": str(status),
         "recorded_at": attempt.now.isoformat(),
@@ -1252,7 +2007,7 @@ def plan(
 # discover — free endpoints only
 # ---------------------------------------------------------------------------
 def run_discovery(
-    attempt: Attempt, settings: Settings, secret: str
+    attempt: Attempt, settings: Settings, secret: str, signing: str
 ) -> tuple[dict[str, Any], ActivationStatus]:
     """The two documented-free endpoints, and nothing else."""
     client = _client(settings, secret, ledger=None)
@@ -1296,7 +2051,7 @@ def run_discovery(
         for item in _count_the_funnel(attempt, listing.payload)
     ]
     # Deduplicated: a provider repeating an event must not inflate the count.
-    attempt.event_tags = list(dict.fromkeys(event_tag(e["id"]) for e in attempt.events))
+    attempt.event_tags = list(dict.fromkeys(event_tag(e["id"], signing) for e in attempt.events))
     attempt.events_admissible = len(attempt.event_tags)
     if not attempt.events:
         raise Refused(
@@ -1365,6 +2120,7 @@ def discover(
         _require_network(allow_network)
         settings = get_settings()
         secret = _require_key(settings)
+        signing = _signing_secret()
 
         now = _clock()
         attempt = Attempt(
@@ -1375,14 +2131,15 @@ def discover(
             ceiling=STEP_CEILINGS["discover"],
             now=now,
         )
-        document, status = run_discovery(attempt, settings, secret)
+        publish_intent(attempt)
+        document, status = run_discovery(attempt, settings, secret, signing)
     except Refused as exc:
         _fail(
             exc.status,
             exc.message,
             as_json=json_output,
             secret=secret,
-            document=_record_failure(attempt, exc.status, secret),
+            document=_record_failure(attempt, exc.status, secret, as_json=json_output),
         )
         return
     except ProviderError as exc:
@@ -1394,11 +2151,11 @@ def discover(
             str(exc),
             as_json=json_output,
             secret=secret,
-            document=_record_failure(attempt, status, secret),
+            document=_record_failure(attempt, status, secret, as_json=json_output),
         )
         return
 
-    write_receipt(document)
+    _persist_or_report(document, attempt=attempt, as_json=json_output, secret=secret)
     document["events"] = attempt.events
     lines = [
         f"Statut          : {document['status']}",
@@ -1423,7 +2180,11 @@ def discover(
 
 
 def _record_failure(
-    attempt: Attempt | None, status: ActivationStatus, secret: str
+    attempt: Attempt | None,
+    status: ActivationStatus,
+    secret: str,
+    *,
+    as_json: bool = False,
 ) -> dict[str, Any] | None:
     """Write the audit trail for an attempt that reached the wire and then failed.
 
@@ -1434,7 +2195,9 @@ def _record_failure(
     if attempt is None or not attempt.network_attempted:
         return None
     document = build_receipt(attempt, status, secret)
-    write_receipt(document)
+    # The same reporting path as a successful step: losing the record of a call that
+    # *failed* after reaching the wire is exactly as bad as losing one that worked.
+    _persist_or_report(document, attempt=attempt, as_json=as_json, secret=secret)
     return document
 
 
@@ -1561,17 +2324,19 @@ def core(
         _require_network(allow_network)
         settings = get_settings()
         secret = _require_key(settings)
+        signing = _signing_secret()
 
         now = _clock()
         parent = load_parent(
             discovery_receipt,
+            signing=signing,
             command="discover",
             status=ActivationStatus.DISCOVERY_VERIFIED,
             sport=one_sport,
             bookmaker=one_book,
             now=now,
         )
-        _check_discovery(parent, one_event, discovery_receipt)
+        _check_discovery(parent, one_event, discovery_receipt, signing)
 
         attempt = Attempt(
             command="core",
@@ -1581,8 +2346,9 @@ def core(
             ceiling=ceiling,
             now=now,
             event_id=one_event,
-            event_tags=[event_tag(one_event)],
+            event_tags=[event_tag(one_event, signing)],
         )
+        publish_intent(attempt)
         document, status = run_core(attempt, settings, secret, parent)
     except Refused as exc:
         _fail(
@@ -1590,7 +2356,7 @@ def core(
             exc.message,
             as_json=json_output,
             secret=secret,
-            document=_record_failure(attempt, exc.status, secret),
+            document=_record_failure(attempt, exc.status, secret, as_json=json_output),
         )
         return
     except ProviderError as exc:
@@ -1602,11 +2368,11 @@ def core(
             str(exc),
             as_json=json_output,
             secret=secret,
-            document=_record_failure(attempt, status, secret),
+            document=_record_failure(attempt, status, secret, as_json=json_output),
         )
         return
 
-    write_receipt(document)
+    _persist_or_report(document, attempt=attempt, as_json=json_output, secret=secret)
     _finish(
         document,
         [
@@ -1621,10 +2387,10 @@ def core(
     )
 
 
-def _check_discovery(parent: dict[str, Any], event_id: str, label: str) -> None:
+def _check_discovery(parent: dict[str, Any], event_id: str, label: str, signing: str) -> None:
     """The discovery must actually have approved *this* event, at nil cost."""
     tags = parent.get("event_tags")
-    if not isinstance(tags, list) or event_tag(event_id) not in tags:
+    if not isinstance(tags, list) or event_tag(event_id, signing) not in tags:
         raise Refused(
             ActivationStatus.PREPARED_NOT_EXECUTED,
             f"{label} n'a pas retenu cet événement. `core` ne facture que ce qu'une "
@@ -1773,17 +2539,19 @@ def additional(
         _require_network(allow_network)
         settings = get_settings()
         secret = _require_key(settings)
+        signing = _signing_secret()
 
         now = _clock()
         parent = load_parent(
             core_receipt,
+            signing=signing,
             command="core",
             status=ActivationStatus.CORE_LIVE_VERIFIED,
             sport=one_sport,
             bookmaker=one_book,
             now=now,
         )
-        _check_core(parent, one_event, core_receipt)
+        _check_core(parent, one_event, core_receipt, signing)
 
         attempt = Attempt(
             command="additional",
@@ -1793,17 +2561,18 @@ def additional(
             ceiling=ceiling,
             now=now,
             event_id=one_event,
-            event_tags=[event_tag(one_event)],
+            event_tags=[event_tag(one_event, signing)],
         )
+        publish_intent(attempt)
         document, status = run_additional(attempt, settings, secret, parent)
     except Refused as exc:
         recorded = (
             exc.document
             if exc.document is not None
-            else _record_failure(attempt, exc.status, secret)
+            else _record_failure(attempt, exc.status, secret, as_json=json_output)
         )
         if exc.document is not None:
-            write_receipt(exc.document)
+            _persist_or_report(exc.document, attempt=attempt, as_json=json_output, secret=secret)
         _fail(exc.status, exc.message, as_json=json_output, secret=secret, document=recorded)
         return
     except ProviderError as exc:
@@ -1815,17 +2584,17 @@ def additional(
             str(exc),
             as_json=json_output,
             secret=secret,
-            document=_record_failure(attempt, status, secret),
+            document=_record_failure(attempt, status, secret, as_json=json_output),
         )
         return
 
-    write_receipt(document)
+    _persist_or_report(document, attempt=attempt, as_json=json_output, secret=secret)
     _finish(document, _summary(document), as_json=json_output, secret=secret, ok=True)
 
 
-def _check_core(parent: dict[str, Any], event_id: str, label: str) -> None:
+def _check_core(parent: dict[str, Any], event_id: str, label: str, signing: str) -> None:
     """Five credits are committed only on a proof that one already worked."""
-    if parent.get("event_tag") != event_tag(event_id):
+    if parent.get("event_tag") != event_tag(event_id, signing):
         raise Refused(
             ActivationStatus.PREPARED_NOT_EXECUTED,
             f"{label} porte sur un autre événement. Une preuve ne se transpose pas d'une "
@@ -1862,44 +2631,45 @@ def _check_core(parent: dict[str, Any], event_id: str, label: str) -> None:
 # ---------------------------------------------------------------------------
 # status — what has actually happened, in five separate dimensions
 # ---------------------------------------------------------------------------
-def audit_receipts() -> tuple[list[dict[str, Any]], int]:
-    """Every locally verifiable receipt, and how many failed verification.
+def audit_receipts() -> receipt_store.AuditResult:
+    """One look at the receipt directory: what is verified, and whether it could be read.
 
-    Read-only, and deliberately **not** a source of authority: nothing here is
-    ever passed to :func:`load_parent`. A step is authorised by a receipt the
-    operator names on the command line, never by one this function happened to
-    find. Reporting and authorising are different jobs, and conflating them is
-    what let ``additional`` pick its own proof out of a writable directory.
+    Read-only, and deliberately **not** a source of authority: nothing here is ever
+    passed to :func:`load_parent`. A step is authorised by a receipt the operator
+    names on the command line, never by one this function happened to find. Reporting
+    and authorising are different jobs, and conflating them is what let ``additional``
+    pick its own proof out of a writable directory.
 
-    A file that fails signature or schema verification is counted, not read: it
-    must neither become evidence nor vanish silently.
+    This is still the only path in production that yields provenance, and since
+    protocol 7 it is the only path at all: the reading, the schema check and the HMAC
+    all happen inside :func:`receipt_store.audit_directory`, which takes no payload and
+    no key. What comes back is an :class:`~receipt_store.AuditResult`, not a pair —
+    because v6 returned a pair, and the third fact fell off the end.
+
+    That third fact is the boundary. ``except StoreRefused: return (), 0`` gave a
+    symlinked receipt directory, a substituted parent and an unopenable directory the
+    same answer as a clean empty one, so ``status`` told an operator « 0 reçu » while
+    the paid commands were still reading that directory through another door. Now
+    ``ABSENT``, ``AVAILABLE`` and ``UNAVAILABLE`` are three different answers, and only
+    the middle one means the counts are worth anything.
     """
-    directory = receipt_dir()
-    if not directory.is_dir():
-        return [], 0
-    verified: list[dict[str, Any]] = []
-    unverifiable = 0
-    for path in sorted(directory.glob("*.json")):
-        try:
-            payload = jsonlib.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            unverifiable += 1
-            continue
-        if not isinstance(payload, dict):
-            unverifiable += 1
-            continue
-        if payload.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
-            unverifiable += 1
-            continue
-        if not verify_receipt(payload):
-            unverifiable += 1
-            continue
-        payload["_path"] = str(path)
-        verified.append(payload)
-    return verified, unverifiable
+    try:
+        with receipt_directory() as directory:
+            return receipt_store.audit_directory(
+                directory,
+                secret_name=SECRET_FILENAME,
+                signature_field=SIGNATURE_FIELD,
+                accepted_schema_versions=SUPPORTED_SCHEMA_VERSIONS,
+            )
+    except receipt_store.DirectoryAbsent:
+        return receipt_store.audit_absent()
+    except receipt_store.DirectoryUnsafe as exc:
+        return receipt_store.audit_unreadable(getattr(exc, "reason", "unreadable"))
+    except receipt_store.StoreRefused:
+        return receipt_store.audit_unreadable("unreadable")
 
 
-def build_activation_state(receipts: list[dict[str, Any]], unverifiable: int) -> dict[str, Any]:
+def build_activation_state(audit: receipt_store.AuditResult) -> dict[str, Any]:
     """Five dimensions, reported separately because they are separate facts.
 
     One label cannot carry them. Two real ``core`` calls proved connectivity,
@@ -1907,69 +2677,301 @@ def build_activation_state(receipts: list[dict[str, Any]], unverifiable: int) ->
     found no coverage on the two events they looked at. Condensing that into a
     single word loses whichever part the reader needed — and
     ``PREPARED_NOT_EXECUTED`` in particular became simply false.
+
+    Separate is not the same as lenient, which is what v4 corrects. Every dimension
+    below now reads its receipts through the same strict lens as the qualification
+    block: ``is True`` for a flag, a real non-negative integer for a count, and
+    :func:`~.qualification.mapping_observation_is_sound` for anything that claims
+    the parser read a live market. None of them can print a positive label about a
+    fact the sixth block rejects.
     """
-    attempted = [r for r in receipts if r.get("network_attempted")]
-    paid = [r for r in attempted if r.get("command") in ("core", "additional")]
-    statuses = {str(r.get("status")) for r in paid}
+    # Imported here rather than at module level because `qualification` imports this
+    # module for its vocabularies.
+    from .qualification import (
+        COST_BUCKETS,
+        AttemptState,
+        CommandState,
+        ReceiptPhase,
+        admissible_phases,
+        attempt_state,
+        canonical,
+        command_state,
+        cost_category,
+        is_paid_command,
+        mapping_observation_is_sound,
+        provider_was_reached,
+        semantic_receipts,
+        structural_faults,
+    )
+    from .qualification import (
+        contradictions as receipt_contradictions,
+    )
+    from .qualification import (
+        evaluate as evaluate_qualification,
+    )
 
+    # Every reading below runs over the canonical collection: one entry per distinct
+    # signed receipt. Physical file counts stay in `verified_receipts`,
+    # `unverifiable_receipts` and `qualification_exact_duplicate_copies`, which are the
+    # only three numbers here that answer "how many files", and none of them is evidence.
+    verified = receipt_store.require_audited(audit)
+    unverifiable = audit.unverifiable
+    distinct = canonical(verified)
+    # v6: a receipt the contract rejects — malformed, self-contradictory, of an unknown
+    # couple, or sharing an identifier with a different receipt — feeds the forensic
+    # counters, the reasons and `rejected_receipt_credits_not_counted`, and **nothing
+    # semantic**. Until v5 it still fed the cost census, the connectivity label,
+    # `execution_state` and `paid_activation_state`, which is exactly what the body of
+    # the pull request claimed it did not do.
+    sound = semantic_receipts(distinct)
+    rejected = [r for r in distinct if r not in sound]
+    rejected_paid = [r for r in rejected if is_paid_command(r)]
+    states = {id(r): attempt_state(r) for r in sound}
+    paid = [r for r in sound if is_paid_command(r)]
+    confirmed = [r for r in paid if states[id(r)] is AttemptState.CONFIRMED_ATTEMPT]
+    unestablished = [r for r in paid if states[id(r)] is AttemptState.ATTEMPT_STATE_UNESTABLISHED]
+    any_confirmed = [r for r in sound if states[id(r)] is AttemptState.CONFIRMED_ATTEMPT]
+    any_unestablished = [
+        r for r in sound if states[id(r)] is AttemptState.ATTEMPT_STATE_UNESTABLISHED
+    ]
+
+    # A receipt establishes a coverage answer when its phase actually asked the
+    # bookmaker question, its fields are readable, and the provider really was reached.
+    def answered_the_bookmaker(receipt: Mapping[str, Any]) -> bool:
+        if not provider_was_reached(receipt):
+            return False
+        if ReceiptPhase.CLASSIFIED not in admissible_phases(receipt):
+            return False
+        if structural_faults(receipt) or receipt_contradictions(receipt):
+            return False
+        market_states = receipt.get("market_states")
+        return isinstance(market_states, Mapping) and bool(market_states)
+
+    mapped = [r for r in sound if mapping_observation_is_sound(r)]
+    answered = [r for r in paid if answered_the_bookmaker(r)]
+    established = mapped + [r for r in answered if r not in mapped]
+
+    # `execution_state` reports how far the sequence went, and only a confirmed attempt
+    # is far. An unestablished attempt state is its own value rather than being rounded
+    # up to `*_ATTEMPTED`, which is what v4 did from an absent flag.
+    # v6: the command is read through `command_state`, a closed domain. v5 fell through
+    # to `DISCOVERY_ATTEMPTED` for *any* confirmed attempt that was not `core` or
+    # `additional` — including `plan`, an absent command, `sync`, `7`, `Core` and
+    # `" core "`. That is the same two-valued reading of an unset field D-075 removed
+    # from `network_attempted`, and it published a discovery nobody had made.
     execution = ExecutionState.NO_NETWORK_ATTEMPTED
-    if any(r.get("command") == "additional" for r in paid):
+    #: A receipt the contract rejects may feed no **positive** claim — but it cannot
+    #: certify a negative one either. `NO_NETWORK_ATTEMPTED` asserts that nothing was
+    #: attempted, which a document we refuse to read is in no position to establish, so
+    #: anything other than a clean "never attempted" leaves the state unestablished.
+    rejected_may_have_attempted = any(
+        attempt_state(r) is not AttemptState.NOT_ATTEMPTED for r in rejected
+    )
+    if any(command_state(r) is CommandState.ADDITIONAL for r in confirmed):
         execution = ExecutionState.ADDITIONAL_ATTEMPTED
-    elif any(r.get("command") == "core" for r in paid):
+    elif any(command_state(r) is CommandState.CORE for r in confirmed):
         execution = ExecutionState.CORE_ATTEMPTED
-    elif attempted:
+    elif any(command_state(r) is CommandState.DISCOVER for r in any_confirmed):
         execution = ExecutionState.DISCOVERY_ATTEMPTED
+    elif any_confirmed or any_unestablished or rejected_may_have_attempted:
+        execution = ExecutionState.NETWORK_ATTEMPT_STATE_UNESTABLISHED
 
-    if not attempted:
-        cost_proof = CostProof.NOT_EXERCISED
-    elif statuses & {
-        str(ActivationStatus.COST_MISMATCH),
-        str(ActivationStatus.COST_UNVERIFIED),
-    }:
-        cost_proof = CostProof.EXERCISED_NONCONFORMING
-    else:
-        cost_proof = CostProof.EXERCISED_CONFORMING
+    # One CostProof per paid step, then the declared precedence. The census it is
+    # derived from is published beside it, over the same canonical population.
+    # v6 splits v5's single "unestablished" bucket in two, because its name asserted
+    # what two of its three feeders denied: a reach that was never established is not a
+    # reach whose *cost* could not be established.
+    per_call = {
+        "provider_reached_nonconforming_cost": CostProof.EXERCISED_NONCONFORMING,
+        "provider_reached_cost_unestablished": CostProof.EXERCISED_UNESTABLISHED,
+        "provider_reach_unestablished": CostProof.EXERCISED_UNESTABLISHED,
+        "paid_attempt_state_unestablished": CostProof.EXERCISED_UNESTABLISHED,
+        "provider_reached_conforming_cost": CostProof.EXERCISED_CONFORMING,
+        # Confirmed issued, confirmed not served: it measured no tariff at all.
+        "confirmed_attempts_not_sent": CostProof.NOT_EXERCISED,
+    }
+    precedence = [
+        CostProof.EXERCISED_NONCONFORMING,
+        CostProof.EXERCISED_UNESTABLISHED,
+        CostProof.EXERCISED_CONFORMING,
+        CostProof.NOT_EXERCISED,
+    ]
+    census = dict.fromkeys(COST_BUCKETS, 0)
+    for receipt in paid:
+        if category := cost_category(receipt):
+            census[category] += 1
+    seen_proofs = {per_call[name] for name, count in census.items() if count}
+    cost_proof = next((p for p in precedence if p in seen_proofs), CostProof.NOT_EXERCISED)
 
-    mapped_live = any(int(r.get("selections_mapped") or 0) > 0 for r in paid)
-    mapping_proof = MappingProof.OBTAINED_LIVE if mapped_live else MappingProof.NOT_OBTAINED_LIVE
+    mapping_proof = MappingProof.OBTAINED_LIVE if mapped else MappingProof.NOT_OBTAINED_LIVE
 
-    if not paid:
+    # The cascade, evidence first and command name last. v4 tested
+    # `any(command == "additional")` before anything else, so the mere presence of an
+    # `additional` receipt reported `ADDITIONAL_EXECUTED` for an `AUTH_FAILED`.
+    rejected_paid_may_have_attempted = any(
+        attempt_state(r) is not AttemptState.NOT_ATTEMPTED for r in rejected_paid
+    )
+    if not confirmed and not unestablished and not rejected_paid_may_have_attempted:
+        # Every paid receipt says exactly "no request was issued", or there are none.
         paid_state = PaidActivationState.PREPARED_NOT_EXECUTED
-    elif any(r.get("command") == "additional" for r in paid):
+    elif not confirmed and not unestablished:
+        # Only rejected paid receipts, and none of them establishes that nothing was
+        # issued. Reporting `PREPARED_NOT_EXECUTED` here would be an affirmative claim
+        # drawn from a document the contract refuses to read.
+        paid_state = PaidActivationState.PAID_ATTEMPT_STATE_UNESTABLISHED
+    elif not confirmed:
+        paid_state = PaidActivationState.PAID_ATTEMPT_STATE_UNESTABLISHED
+    elif not established:
+        paid_state = PaidActivationState.PAID_ATTEMPT_INCONCLUSIVE
+    elif any(command_state(r) is CommandState.ADDITIONAL for r in established):
         paid_state = PaidActivationState.ADDITIONAL_EXECUTED
-    elif mapped_live:
+    elif mapped:
         paid_state = PaidActivationState.CORE_EXECUTED_COVERAGE_OBSERVED
     else:
         paid_state = PaidActivationState.CORE_EXECUTED_NO_COVERAGE
 
+    # Sixth block, added by 03C-1: the pre-registered qualification criteria,
+    # evaluated over the same receipts.
+    intents = unresolved_intents()
+    qualification = evaluate_qualification(audit, unresolved_intents=len(intents))
+
     return {
-        # 1. The adapter itself. A ponctual observation never promotes it.
+        # 1. The adapter itself. A ponctual observation never promotes it —
+        # including when every criterion below is satisfied.
         "adapter_state": "IMPLEMENTED_UNVERIFIED",
         # 2. How far the sequence has gone here.
         "execution_state": str(execution),
         # 3. Connectivity, authentication and billing.
         "connectivity_and_cost_proof": str(cost_proof),
-        # 4. Coverage — a list of scoped observations, never a verdict.
+        # The census the label above is derived from, over the population it speaks
+        # about: one entry per **distinct** paid step this installation can read —
+        # deduplicated by identifier and sealed fingerprint, earlier protocols included,
+        # receipts the contract rejects excluded. ``COST_CONFORMITY`` counts the same
+        # population restricted to the current protocol, so its numbers are narrower by
+        # design. The comment here used to say "no deduplication", which the code had
+        # never done since v5.
+        "paid_call_cost_census": dict(census),
+        # Rejected paid receipts are counted, never priced: their cost claim is made by
+        # a document the contract refuses to read.
+        "rejected_paid_receipts": len(rejected_paid),
+        # The same taxonomy, over the receipts the contract refuses to read. Published
+        # so the information is not lost with the receipt: two of the six populations —
+        # an unestablished reach and an unestablished attempt state — can only arise
+        # from a receipt whose flags are outside the structural contract, so they are
+        # always nought above and speak here instead.
+        "rejected_paid_cost_census": {
+            bucket: sum(1 for r in rejected_paid if cost_category(r) == bucket)
+            for bucket in COST_BUCKETS
+        },
+        "unresolved_attempt_intents": len(intents),
+        "unresolved_attempt_intent_details": [dict(intent) for intent in intents],
+        "unresolved_attempt_intent_scope": (
+            "toute tentative dont l'intent local, écrit et synchronisé avant la requête, "
+            "n'a pas été résolu par la publication durable de son reçu. Chacun bloque la "
+            "porte de qualification tant qu'il subsiste."
+        ),
+        "paid_call_cost_census_population": (
+            "tout pas payant distinct que le contrat accepte de lire — commande core ou "
+            "additional, dédupliqué par identifiant et empreinte scellée, protocoles "
+            "antérieurs compris, reçus rejetés exclus et recensés à part dans "
+            "rejected_paid_cost_census. Une tentative est dite confirmée seulement si "
+            "network_attempted vaut exactement True et attempts au moins 1 ; sinon son "
+            "état est non établi et publié comme tel. COST_CONFORMITY compte la même "
+            "population restreinte au protocole courant."
+        ),
+        # 4. Coverage — a list of scoped observations, never a verdict. Only
+        # receipts whose phase actually answered the bookmaker question and whose
+        # displayed fields are structurally valid appear here. A malformed receipt
+        # contributed one before v4, which both stated a coverage nobody had
+        # observed and echoed its own bad values into the report.
         "bookmaker_coverage_observations": [
             {
-                "sport_key": r.get("sport_key", ""),
-                "bookmaker": r.get("bookmaker", ""),
-                "event_tag": r.get("event_tag") or "",
-                "recorded_at": r.get("recorded_at", ""),
-                "bookmaker_state": r.get("bookmaker_state") or "UNKNOWN_SCHEMA_V2",
-                "market_states": r.get("market_states") or {},
+                "sport_key": str(r.get("sport_key", "")),
+                "bookmaker": str(r.get("bookmaker", "")),
+                "event_tag": str(r.get("event_tag") or ""),
+                "recorded_at": str(r.get("recorded_at", "")),
+                "bookmaker_state": str(r.get("bookmaker_state")),
+                "market_states": (
+                    dict(r["market_states"]) if isinstance(r.get("market_states"), Mapping) else {}
+                ),
                 "status": str(r.get("status")),
-                "schema_version": r.get("schema_version"),
+                "schema_version": _reported_int(r.get("schema_version")),
             }
-            for r in paid
+            for r in answered
         ],
+        "bookmaker_coverage_observation_scope": (
+            "un reçu par observation distincte, de phase classifiée, structurellement "
+            "valide, non contradictoire, et dont l'atteinte du fournisseur est établie"
+        ),
         # 5. Whether the parser and freshness path have been exercised for real.
         "mapping_freshness_proof": str(mapping_proof),
         "paid_activation_state": str(paid_state),
-        "accounted_credits_total": sum(int(r.get("accounted_credits") or 0) for r in receipts),
-        "verified_receipts": len(receipts),
+        # Real non-negative integers only. `True` is not one credit, `"7"` is not
+        # seven, and a negative count is not a count — each of those would move a
+        # spend total the operator reads to decide whether to keep going.
+        # Semantic: distinct receipts, structurally readable, real non-negative
+        # integers. Seven copies of one call are one credit, and a receipt we refuse to
+        # read is not a spend record we can add up.
+        "accounted_credits_total": sum(_counted_credits(r.get("accounted_credits")) for r in sound),
+        # The prudent counterpart, named so it cannot be mistaken for the figure above:
+        # credits claimed by receipts the contract rejects. Visible, never summed in.
+        "rejected_receipt_credits_not_counted": sum(
+            _counted_credits(r.get("accounted_credits")) for r in rejected
+        ),
+        # Whether the two counts below mean anything at all. v6 published them for an
+        # unreadable boundary exactly as for an empty one, so a receipt directory that
+        # had become a symbolic link read « 0 reçu, 0 invérifiable » — and the paid
+        # commands went on reading it. `reason` is a category of BOUNDARY_REASONS, never
+        # a path and never anything an attacker chose.
+        "receipt_boundary_state": str(audit.boundary),
+        "receipt_boundary_reason": audit.reason,
+        "receipt_boundary_note": (
+            "ABSENT : aucun répertoire de reçus, donc aucune preuve et rien à lire. "
+            "AVAILABLE : répertoire sûr et lu ; les comptes ci-dessous sont exacts. "
+            "UNAVAILABLE : le répertoire existe mais n'est pas lisible sans ambiguïté ; "
+            "aucun compte n'est établi et la porte reste fermée."
+        ),
+        "verified_receipts": len(verified),
+        # D-062's own audit counter: files this installation could not verify.
+        # Spelled out rather than spread from the block below, because the
+        # qualification block counts the same idea over a different population
+        # and a dict spread let it silently win the key.
         "unverifiable_receipts": unverifiable,
         "receipt_directory": str(receipt_dir()),
+        # 6. Whether the pre-registered criteria are met. Deleting the receipt
+        # directory resets this to zero evidence, exactly as D-062 says. Every key
+        # is listed, so adding one to the protocol can never overwrite one here.
+        "qualification_protocol_version": qualification["qualification_protocol_version"],
+        "qualification_adapter_evidence_version": qualification[
+            "qualification_adapter_evidence_version"
+        ],
+        "qualification_evidence_not_before": qualification["qualification_evidence_not_before"],
+        "qualification_state": qualification["qualification_state"],
+        "criteria_results": qualification["criteria_results"],
+        "eligible_for_human_promotion_review": qualification["eligible_for_human_promotion_review"],
+        "evidence_conflicts": qualification["evidence_conflicts"],
+        "qualification_admissible_receipts": qualification["qualification_admissible_receipts"],
+        "qualification_usable_receipts": qualification["qualification_usable_receipts"],
+        "qualification_current_malformed_receipts": qualification[
+            "qualification_current_malformed_receipts"
+        ],
+        "qualification_current_contradictory_receipts": qualification[
+            "qualification_current_contradictory_receipts"
+        ],
+        "qualification_unknown_pair_receipts": qualification["qualification_unknown_pair_receipts"],
+        "qualification_historical_nonqualifying_receipts": qualification[
+            "qualification_historical_nonqualifying_receipts"
+        ],
+        "qualification_duplicate_excluded_receipts": qualification[
+            "qualification_duplicate_excluded_receipts"
+        ],
+        "qualification_unverifiable_receipts": qualification["qualification_unverifiable_receipts"],
+        "qualification_exact_duplicate_copies": qualification[
+            "qualification_exact_duplicate_copies"
+        ],
+        "qualification_population_equation": qualification["qualification_population_equation"],
+        "qualification_reasons": qualification["qualification_reasons"],
+        "qualification_note": qualification["qualification_note"],
         "scope_note": (
             "Chaque observation de couverture vaut pour un fournisseur, un bookmaker, "
             "une compétition, un événement tagué, un marché et un instant — rien de plus."
@@ -1978,26 +2980,66 @@ def build_activation_state(receipts: list[dict[str, Any]], unverifiable: int) ->
     }
 
 
-@app.command()
-def status(
-    json_output: bool = typer.Option(False, "--json"),
-) -> None:
-    """Lire l'état réel de l'activation sur cette installation. Aucun réseau."""
-    receipts, unverifiable = audit_receipts()
-    document = build_activation_state(receipts, unverifiable)
+def _reason_suffix(document: Mapping[str, Any]) -> str:
+    reason = document.get("receipt_boundary_reason") or ""
+    return f" ({reason})" if reason else ""
+
+
+def status_lines(document: Mapping[str, Any]) -> list[str]:
+    """The human rendering of the activation state.
+
+    Extracted from the command, and completed. v5 published the cost census, the
+    population it speaks about and the rejected credits in the JSON only, while the
+    runbook described ``--json`` as « le même contenu » — so an operator reading the
+    text saw a collapsed label and none of the numbers behind it. Compactness is
+    allowed; omitting a fact that would change a decision is not.
+    """
     lines = [
         f"Adaptateur          : {document['adapter_state']}",
         f"Exécution           : {document['execution_state']}",
         f"Connectivité + coût : {document['connectivity_and_cost_proof']}",
         f"Mapping + fraîcheur : {document['mapping_freshness_proof']}",
         f"Activation payante  : {document['paid_activation_state']}",
-        f"Crédits comptés     : {document['accounted_credits_total']}",
+        f"Crédits comptés     : {document['accounted_credits_total']}"
+        f" · crédits rejetés non comptés : {document['rejected_receipt_credits_not_counted']}",
+        f"Frontière des reçus : {document['receipt_boundary_state']}{_reason_suffix(document)}",
         f"Reçus vérifiés      : {document['verified_receipts']}"
-        f" · non vérifiables : {document['unverifiable_receipts']}",
+        f" · non vérifiables : {document['unverifiable_receipts']}"
+        f" · reçus payants rejetés : {document['rejected_paid_receipts']}",
+        f"Intents non résolus : {document['unresolved_attempt_intents']}",
         # A local path, printed as a path. It is gitignored and has no remote.
         f"Répertoire (local)  : {document['receipt_directory']}",
         "",
+        "Recensement du coût des appels payants :",
     ]
+    for bucket, count in document["paid_call_cost_census"].items():
+        lines.append(f"  · {bucket:<38} {count}")
+    lines.append(f"  population : {document['paid_call_cost_census_population']}")
+    if document["receipt_boundary_state"] == "UNAVAILABLE":
+        lines += [
+            "",
+            "FRONTIÈRE INDISPONIBLE — le répertoire de reçus existe mais n'a pas pu être "
+            "lu sans ambiguïté, donc aucun compte ci-dessus n'est établi et la porte reste "
+            f"fermée. Catégorie : {document['receipt_boundary_reason']}.",
+        ]
+    if any(document["rejected_paid_cost_census"].values()):
+        lines.append("Recensement médico-légal — reçus payants rejetés par le contrat :")
+        for bucket, count in document["rejected_paid_cost_census"].items():
+            if count:
+                lines.append(f"  · {bucket:<38} {count}")
+    if document["unresolved_attempt_intents"]:
+        lines += [
+            "",
+            "Tentatives dont l'intent local n'est pas résolu — une requête a pu partir "
+            "sans que sa preuve soit durable :",
+        ]
+        for intent in document["unresolved_attempt_intent_details"]:
+            lines.append(
+                f"  · {intent.get('attempt_id', '')}  {intent.get('command', '')}  "
+                f"plafond {intent.get('max_credits', '?')}  {intent.get('state', '')}"
+            )
+        lines.append(f"  portée : {document['unresolved_attempt_intent_scope']}")
+    lines.append("")
     if document["bookmaker_coverage_observations"]:
         lines.append("Observations de couverture (portée stricte) :")
         for one in document["bookmaker_coverage_observations"]:
@@ -2008,8 +3050,73 @@ def status(
             )
     else:
         lines.append("Aucune observation de couverture enregistrée.")
+    from .qualification import summary_lines
+
+    lines += summary_lines(document)
     lines += ["", document["scope_note"], f"Modèles : {document['model_impact']}."]
-    _emit(document, lines, as_json=json_output)
+    return lines
+
+
+@app.command()
+def status(
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Lire l'état réel de l'activation sur cette installation. Aucun réseau."""
+    document = build_activation_state(audit_receipts())
+    _emit(document, status_lines(document), as_json=json_output)
+
+
+receipts_app = typer.Typer(
+    help=(
+        "Opérations locales sur le répertoire de reçus. Aucun réseau, aucun crédit, "
+        "aucune promotion."
+    ),
+    no_args_is_help=True,
+)
+app.add_typer(receipts_app, name="receipts")
+
+
+@receipts_app.command("quarantine")
+def receipts_quarantine(
+    name: str = typer.Option(
+        ...,
+        "--name",
+        help=(
+            "Nom de fichier du reçu, sans chemin — tel qu'il apparaît dans le répertoire de reçus."
+        ),
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Archiver aussi un reçu signé complet. À n'utiliser qu'en connaissance de cause.",
+    ),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Mettre un reçu incomplet de côté, sans perdre un octet, et libérer son nom.
+
+    La sortie de secours que v5 documentait sans la rendre exécutable : le message de
+    refus renvoyait vers une fonction qu'aucune commande n'exposait.
+    """
+    try:
+        moved = quarantine_incomplete_receipt(name, force=force)
+    except (Refused, receipt_store.StoreRefused) as exc:
+        message = getattr(exc, "message", str(exc))
+        if json_output:
+            typer.echo(jsonlib.dumps({"status": "REFUSED", "detail": message}, ensure_ascii=False))
+        else:
+            typer.echo(f"Refusé : {message}")
+        raise typer.Exit(1) from exc
+    if json_output:
+        typer.echo(
+            jsonlib.dumps(
+                {"status": "QUARANTINED", "name": name, "moved_to": moved}, ensure_ascii=False
+            )
+        )
+    else:
+        typer.echo(
+            f"{name} est mis de côté sous {moved}. Ses octets sont conservés, il est hors "
+            "de l'audit, et le nom d'origine est libre : rejouez l'étape."
+        )
 
 
 def _iso_z(moment: datetime) -> str:

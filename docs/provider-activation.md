@@ -40,6 +40,42 @@ qu'elle prouvera — et surtout ce qu'elle ne prouvera pas. Il ne l'exécute pas
 
 ---
 
+## Ce que la frontière des reçus garantit, et ce qu'elle ne garantit pas (D-078)
+
+Cette section existe parce que sept tranches de suite, la formulation a dépassé le code.
+Lisez-la avant de citer une garantie.
+
+**La propriété garantie, littéralement :**
+
+> Dans le pipeline applicatif supporté, seuls les reçus dont le HMAC a été vérifié par
+> `audit_directory` sont transmis à l'évaluation. L'objet de provenance est un marqueur
+> interne et un contrôle contre les erreurs d'utilisation ; il ne constitue pas une sandbox
+> contre du code Python arbitraire exécuté dans le même processus.
+
+**Dans le périmètre de sécurité.** Fichiers de reçus, intents et payloads fournisseur
+hostiles ou malformés ; reçus sans signature ou signés avec une autre clé ; écritures
+interrompues et erreurs de stockage ; liens symboliques, substitutions de chemins et courses
+de système de fichiers ; appelant utilisant les API publiques et documentées ; erreurs
+accidentelles du code applicatif ; processus extérieur ne possédant ni le secret HMAC ni la
+capacité d'exécuter du code dans le processus Betmaxxing.
+
+**Hors du périmètre de sécurité.** Exécution arbitraire de Python dans le processus
+Betmaxxing ; accès réflexif aux attributs privés ; `object.__new__`, `object.__setattr__`,
+monkeypatching, modification du bytecode ou des modules ; modification du code source
+exécuté ; debugger ou processus compromis sous l'identité de l'application ; accès direct au
+secret HMAC.
+
+Un acteur capable d'exécuter arbitrairement du Python ici peut remplacer `evaluate`,
+neutraliser le vérificateur ou lire le secret. Se protéger de lui demanderait une isolation
+par processus ou service, hors périmètre de 03C-1. Donc : **l'authenticité vient du HMAC
+vérifié à l'ingestion**, une fois. Le type de provenance et la somme de contrôle
+`content_checksum` ne font que préserver cette décision jusqu'à l'évaluation — la somme de
+contrôle attrape une mutation accidentelle, elle n'authentifie rien.
+
+Ce que cela change pour vous, concrètement : si vous devez répondre « qu'est-ce qui prouve
+que ce reçu est authentique ? », la réponse est « le HMAC du secret de cette installation,
+vérifié par l'audit au moment de la lecture » — jamais « son type Python ».
+
 ## Pourquoi l'ancien script ne devait pas être lancé
 
 `scripts/smoke_the_odds_api.py`, dans sa forme précédente, demandait un booléen
@@ -141,7 +177,11 @@ que soient les régions configurées.
   incomparablement plus forte qu'un booléen : on ne peut pas les fournir sans
   savoir ce que l'étape coûte.
 * **Chaîne explicite.** `core` exige `--discovery-receipt`, `additional` exige
-  `--core-receipt`. L'outil ne parcourt plus le répertoire de reçus pour se
+  `--core-receipt`. Depuis D-077 la valeur est réduite **textuellement** à un nom de
+  base du répertoire de reçus autorisé : le nom seul, ou le chemin que la commande
+  précédente a imprimé, et rien d'autre. Aucune cible n'est résolue, donc aucun lien
+  n'est suivi, et le fichier est lu par le même descripteur que l'audit.
+  L'outil ne parcourt plus le répertoire de reçus pour se
   choisir une preuve à la place de l'opérateur.
 * **Aucun endpoint historique ou payant** n'est joignable depuis cet outil.
 * **Toute tentative réseau laisse un reçu**, quel que soit son statut terminal.
@@ -184,9 +224,25 @@ appartient à l'opérateur, pas au dépôt.
 ### Le secret local de signature
 
 Un secret aléatoire est créé au premier besoin réseau, dans le répertoire de
-reçus, en `O_CREAT | O_EXCL` et mode `0600`. Il n'est jamais affiché, jamais
+reçus, publié atomiquement en mode `0600`. Il n'est jamais affiché, jamais
 journalisé, jamais versionné. Les tests injectent un secret déterministe par
 `BETMAXXING_ACTIVATION_RECEIPT_SECRET` et ne dépendent d'aucun aléa réel.
+
+Sa politique, depuis D-077, en toutes lettres :
+
+* **un secret est exactement 64 caractères hexadécimaux minuscules.** Rien n'est
+  « réparé » : ni `strip()`, ni casse tolérée, ni régénération d'un secret invalide —
+  le régénérer rendrait invérifiable chaque reçu déjà signé ;
+* **la variable d'environnement est une configuration, pas un argument.** Elle gagne
+  quand elle est *positionnée*, et une variable **présente mais vide** est une valeur
+  invalide, plus une absence. Seule l'absence réelle autorise la lecture du fichier ou
+  la création ;
+* **sur POSIX, un secret que quelqu'un d'autre peut lire est refusé** : non régulier,
+  appartenant à un autre UID, ou accordant un droit au groupe ou à tous. Le mode
+  attendu est `0600`. Sur une plateforme sans propriété ni bits de permission POSIX ce
+  contrôle est **sauté**, et c'est une limite énoncée, pas une garantie implicite ;
+* **des octets qui ne sont pas de l'UTF-8 valide sont un refus typé**, jamais un
+  `UnicodeDecodeError` remonté à l'opérateur.
 
 ### Contenu (schéma v3)
 
@@ -337,7 +393,7 @@ python -m betmaxxing.providers.the_odds_api.activation core \
   --sport soccer_france_ligue_one \
   --bookmaker winamax_fr \
   --event-id EVENT_ID_CHOISI \
-  --discovery-receipt CHEMIN_RECU_DISCOVER \
+  --discovery-receipt NOM_RECU_DISCOVER.json \
   --max-credits 1 \
   --acknowledge-credits 1 \
   --allow-network
@@ -359,7 +415,7 @@ python -m betmaxxing.providers.the_odds_api.activation additional \
   --sport soccer_france_ligue_one \
   --bookmaker winamax_fr \
   --event-id LE_MEME_EVENT_ID \
-  --core-receipt CHEMIN_RECU_CORE \
+  --core-receipt NOM_RECU_CORE.json \
   --max-credits 5 \
   --acknowledge-credits 5 \
   --allow-network
@@ -412,3 +468,220 @@ entraînement ou backtest sur données nouvelles, promotion de modèle, publicat
 de candidat en `paper` ou `live_analysis`, démarrage d'un ordonnanceur réel,
 envoi de notification, pari ou automatisme de mise, interface web, et
 versionnement d'un payload fournisseur brut.
+
+## Lire la qualification (D-071, corrigée par D-072 à D-077)
+
+`activation status` porte, depuis 03C-1, un sixième bloc : l'évaluation des
+critères **préenregistrés** de `docs/provider-validation-protocol.md`
+(`PROVIDER_VALIDATION_PROTOCOL_VERSION = 7`,
+`PROVIDER_ADAPTER_EVIDENCE_VERSION = 1`, schéma de reçu `v4`).
+
+```bash
+python -m betmaxxing.providers.the_odds_api.activation status         # lecture humaine
+python -m betmaxxing.providers.the_odds_api.activation status --json  # les mêmes faits, parseable
+```
+
+Les deux sorties portent les **mêmes faits matériels** : recensement du coût et sa
+population, crédits comptés, crédits rejetés non comptés, reçus payants rejetés, intents
+de tentative non résolus, états d'exécution et de commande, preuve de connectivité, et
+raisons bloquantes. La lecture humaine est plus compacte ; elle n'omet rien qui changerait
+une décision. Jusqu'à la v5 le recensement et les crédits rejetés n'existaient qu'en JSON
+alors que ce document annonçait « le même contenu ».
+
+### Trois états de la frontière des reçus
+
+`activation status` publie, en JSON et en lecture humaine, l'état de la frontière
+elle-même — parce qu'un répertoire qu'on ne peut pas lire n'est pas un répertoire vide,
+et que la v6 rapportait les deux à l'identique :
+
+| État | Ce qu'il dit | Effet sur la porte |
+| :-- | :-- | :-- |
+| `ABSENT` | aucun répertoire de reçus : rien n'a encore été exécuté, et **rien n'est créé** par la lecture | aucune preuve, donc fermée |
+| `AVAILABLE` | répertoire sûr et lu ; les comptes de reçus valent ce qu'ils disent | selon les critères |
+| `UNAVAILABLE` | le répertoire existe et n'est pas lisible sans ambiguïté — lien symbolique, composant substitué, objet non régulier, permission refusée, garantie noyau absente | **conflit de preuve**, fermée |
+
+`UNAVAILABLE` est accompagné d'une **catégorie** (`ambiguous_component`,
+`not_a_directory`, `permission_denied`, `kernel_support_missing`, `unreadable`), jamais
+d'un chemin. La lecture humaine ajoute une ligne `FRONTIÈRE INDISPONIBLE` qui dit que
+plus aucun compte n'est établi.
+
+### Le contrat d'un intent de tentative
+
+Un intent est un **bloqueur prudent**, jamais une preuve positive. Depuis D-077 son
+contrat est fermé dans les deux sens : neuf champs exactement — `intent_version`,
+`attempt_id`, `command`, `sport_key`, `bookmaker`, `event_tag`, `max_credits`, `state`,
+`prepared_at` —, types et bornes vérifiés, commande dans un domaine fermé, et
+identifiant du corps égal au nom du fichier. Un champ absent, un champ en trop, une
+valeur mal typée ou hors borne : l'intent est **invalide**, il reste **bloquant**, et il
+est rapporté sous son seul nom local avec l'état `UNREADABLE_OR_INVALID`. Aucune valeur
+de son contenu n'est réfléchie dans le JSON ni dans le terminal.
+
+Publier deux fois le même intent est idempotent **sur octets identiques seulement**.
+Le même `attempt_id` avec une commande, un sport, un bookmaker, un tag ou un plafond
+différents est un refus typé **avant le réseau**, et une cible vide, tronquée, lien ou
+répertoire n'est jamais comptée comme une publication réussie.
+
+Un intent n'est résolu que par un reçu **durable, vérifié par l'audit contre le secret
+local, de schéma accepté**, portant le même identifiant, la même commande, le même
+sport, le même bookmaker, le même tag éventuel, un coût compatible avec son plafond, un
+couple réellement persistable du catalogue, aucune faute structurelle, aucune
+contradiction et la même lignée de versions. Un JSON seulement analysable, une signature
+d'une autre clé, un schéma inconnu, une commande inconnue ou une portée différente ne le
+résolvent **jamais** : la v6 les acceptait tous les treize.
+
+### Reprendre après un reçu incomplet
+
+Une interruption peut laisser un fichier de reçu vide ou tronqué. Il est nommé comme tel
+et jamais confondu avec un reçu signé divergent, et la sortie de secours est une commande,
+pas une fonction interne :
+
+```bash
+python -m betmaxxing.providers.the_odds_api.activation receipts quarantine --name NOM.json
+```
+
+Elle exige un **nom de base** du répertoire de reçus, jamais un chemin ; elle conserve
+tous les octets sous un nom hors de l'audit, ne remplace jamais une quarantaine
+existante, libère le nom d'origine, et refuse un reçu signé complet sans `--force`.
+Rejouez ensuite l'étape : le même reçu est republié à l'identique.
+
+**Son périmètre, depuis D-077 :** un nom de base finissant par `.json`, et rien d'autre.
+Le secret de signature, tout fichier `*.intent`, tout temporaire de publication et tout
+autre fichier régulier sont refusés **avec et sans `--force`**. La v6 ne l'imposait pas :
+`--name <identifiant>.intent` rendait 0 et faisait passer la porte de
+`EVIDENCE_CONFLICT` à `CRITERIA_MET_AWAITING_HUMAN_REVIEW` — un conflit supprimé sans
+qu'aucun reçu existe — et `--name signing-key.secret` rendait huit reçus vérifiés
+invérifiables. `--force` ne sert qu'à archiver un reçu signé complet.
+
+### Une tentative dont la preuve n'a pas pu être écrite
+
+Avant chaque requête, y compris `discover`, un **intent** local est écrit et synchronisé.
+Si la publication du reçu échoue ensuite, la commande sort avec un code non nul, dit
+lequel des faits est perdu, et l'intent reste : c'est la trace qu'une requête a pu partir.
+
+```bash
+python -m betmaxxing.providers.the_odds_api.activation status --json | \
+  python -c "import json,sys; d=json.load(sys.stdin); print(d['unresolved_attempt_intents'])"
+```
+
+Tant qu'un intent n'est pas résolu, `qualification_state` reste `EVIDENCE_CONFLICT` :
+le corpus est incomplet d'une manière que rien sur ce disque ne permet de chiffrer.
+Rejouer l'étape publie le reçu et résout l'intent, sans compter le coût deux fois.
+
+Ce que le bloc dit, et ce qu'il ne dit pas :
+
+- `qualification_state` vaut au mieux `CRITERIA_MET_AWAITING_HUMAN_REVIEW`. Le
+  vocabulaire de l'évaluateur ne contient aucun statut « vérifié » : la promotion
+  est une décision humaine, prise ailleurs. Voir `QualificationState` ;
+- chaque `criteria_results[]` porte son `observed`, son `required` et son `missing`.
+  Lisez `missing` : c'est la réponse à « qu'est-ce qu'il manque encore » ;
+- `limit` dit ce que le critère **n'**établit pas. Un `CORE_MAPPING_FOOTBALL` vert
+  ne dit rien d'un bookmaker, d'une compétition non observée ou d'une autre date ;
+- `evidence_conflicts` non vide est un **échec fermé**, pas une preuve à pondérer ;
+- **sept populations exclusives**, dont les noms disent la différence, et une
+  équation publiée sous `qualification_population_equation` qui les réconcilie avec
+  le nombre de reçus vérifiés : `qualification_usable_receipts`,
+  `qualification_current_malformed_receipts`,
+  `qualification_current_contradictory_receipts`,
+  `qualification_unknown_pair_receipts`,
+  `qualification_historical_nonqualifying_receipts`,
+  `qualification_duplicate_excluded_receipts` et
+  `qualification_unverifiable_receipts` (comptés, jamais lus). Un reçu **courant**
+  malformé ou contradictoire n'est plus rangé sous « historique » : ce classement se
+  lisait comme « produit sous un protocole antérieur ».
+  `qualification_exact_duplicate_copies` est à part — une **dimension croisée**, pas
+  une population : la même observation deux fois reste dans la population de son
+  contenu. `qualification_admissible_receipts` reste publié sous son nom d'origine,
+  égal à `qualification_usable_receipts`, pour que deux rapports restent comparables.
+  `qualification_reasons` agrège **pourquoi**, en comptes seulement ;
+- un reçu v2 ou v3 reste lisible et peut encore autoriser l'étape suivante ; il ne
+  qualifie plus aucun critère, `COST_CONFORMITY` inclus. C'est le prix assumé de
+  la correction D-072 ;
+- une preuve enregistrée avant `qualification_evidence_not_before`
+  (`2026-08-10T14:00:37+00:00`) est de l'histoire. Aucune preuve réelle n'a encore été
+  collectée sous protocole 5 : l'état courant est `INSUFFICIENT_EVIDENCE` avec zéro
+  reçu utilisable ;
+- **toute** preuve de réponse — mapping, couverture, fraîcheur — exige que l'atteinte du
+  fournisseur soit établie : `network_attempted is true`, `attempts ≥ 1` **et**
+  `may_have_reached_provider is true`. Un statut impliquant une réponse sur un reçu qui
+  ne l'établit pas est **contradictoire**, pas seulement non qualifiant (D-075) ;
+- l'état de tentative est **à trois valeurs** : pas de tentative, tentative confirmée, ou
+  état non établi. Le troisième est visible sous
+  `NETWORK_ATTEMPT_STATE_UNESTABLISHED` / `PAID_ATTEMPT_STATE_UNESTABLISHED`, il bloque, et
+  il n'est jamais décrit comme tenté, réel ou exécuté ;
+- une **tentative confirmée non envoyée** — les deux drapeaux exacts,
+  `may_have_reached_provider is false` — est recensée sous `confirmed_attempts_not_sent` :
+  elle ne bloque pas et ne qualifie rien, parce qu'une requête certainement non servie n'a
+  mesuré aucun tarif ;
+- une **copie byte-à-byte** ne change aucun nombre sémantique : crédits, recensement,
+  observations, catégories et seuils passent par une collection dédupliquée. Seuls
+  `verified_receipts`, `unverifiable_receipts` et
+  `qualification_exact_duplicate_copies` comptent des fichiers, et aucun n'est une preuve ;
+- `accounted_credits_total` ne somme que des reçus distincts et structurellement lisibles ;
+  ce qu'un reçu rejeté revendique est publié à part sous
+  `rejected_receipt_credits_not_counted` ;
+- un reçu courant **mal typé** — booléen là où un entier est attendu, chaîne là où un
+  booléen est attendu — ne prouve rien et fait passer l'état à `EVIDENCE_CONFLICT`,
+  avec la raison `malformed_current_schema` et les **noms** des champs fautifs. Une
+  signature valide atteste des octets, pas des types ;
+- un critère de mapping exige `bookmaker_state = OBSERVED`. Absent, inconnu ou
+  `NOT_RETURNED`, il ne qualifie rien : la portée « bookmaker observé » est désormais
+  vérifiée et non seulement affichée ;
+- `COST_CONFORMITY` expose **cinq** catégories exhaustives et disjointes sur une
+  population écrite — tout pas payant distinct du protocole courant dont l'état de
+  tentative n'est pas « jamais tenté » — et échoue si une seule d'entre elles est non
+  conforme, non établie, ou d'état de tentative non établi, même après six appels
+  conformes. `COST_UNVERIFIED` compte comme coût **non établi**, pas comme non conforme :
+  un en-tête illisible n'est pas un tarif qui a désaccordé (D-075) ;
+- les cinq dimensions plus anciennes lisent la **même** preuve que le bloc strict.
+  `connectivity_and_cost_proof` suit la précédence
+  `NONCONFORMING > UNESTABLISHED > CONFORMING > NOT_EXERCISED` et dispose désormais
+  d'un état `EXERCISED_UNESTABLISHED` : un coût non établi n'est jamais présenté
+  comme conforme. `mapping_freshness_proof = OBTAINED_LIVE` exige une observation de
+  mapping **saine** — statut positif, bookmaker observé, marché cartographié,
+  fraîcheur valide, contrat satisfait — et non un simple `selections_mapped > 0`.
+  `paid_activation_state` gagne `PAID_ATTEMPT_INCONCLUSIVE` pour un appel payant
+  réellement parti qui n'a établi ni couverture ni mapping, et applique la **même**
+  cascade à `core` et à `additional` : `ADDITIONAL_EXECUTED` exige qu'une preuve
+  `additional` classifiée et valide établisse effectivement couverture ou mapping, jamais
+  la seule présence d'un reçu `additional` (D-075) ;
+- `paid_call_cost_census` publie le recensement dont `connectivity_and_cost_proof`
+  est dérivé, avec sa population en clair : **toute** tentative payante réelle du
+  disque, protocoles antérieurs compris et sans déduplication. `COST_CONFORMITY`
+  compte une population plus étroite — protocole courant, dédupliquée — donc les deux
+  nombres peuvent légitimement différer ;
+- `bookmaker_coverage_observations` ne contient que des reçus dont la phase a
+  réellement répondu à la question du bookmaker, structurellement valides et non
+  contradictoires. Une observation est une **réponse**, pas la trace d'une tentative,
+  et aucune valeur d'un reçu invalide n'y est recopiée ;
+- un reçu obtenu à travers un lien symbolique, ou dont la cible se résout hors du
+  répertoire de reçus, n'est **pas lu** : il est compté invérifiable, sans que son
+  chemin ni son contenu apparaisse dans une sortie ;
+- le seuil de fraîcheur du protocole est le littéral **900 s**. Le réglage runtime
+  `max_odds_age_seconds` du produit vaut aussi 900 par défaut et reste
+  configurable pour le scan : les deux sont censés coïncider, mais reconfigurer le
+  second ne déplace **pas** le premier ;
+- les tags HMAC locaux apparaissent dans `bookmaker_coverage_observations`, et
+  nulle part ailleurs — pas dans `criteria_results`, pas dans les raisons. Ce sont
+  des substituts locaux, jamais l'identifiant fournisseur en clair ;
+- supprimer le répertoire de reçus remet la preuve à zéro. C'est voulu.
+
+Aucun appel réseau n'est fait par `status`, et aucune clé n'est lue.
+
+## Campagne de qualification — préparée, non lancée
+
+Le plan complet, ses seuils argumentés, son budget et ses arrêts anticipés sont
+dans `docs/provider-validation-protocol.md` §8. Résumé opérationnel :
+
+| | |
+|---|---|
+| Piste A | vérifier le parser avec un bookmaker documenté comme susceptible d'être couvert — choix, source officielle et date à écrire **avant** le premier appel |
+| Piste B | couverture `winamax_fr`, indépendante ; le constat du 2026-08-07 reste borné aux deux événements SPL testés |
+| Invocations CLI maximales | **12** |
+| Requêtes HTTP maximales | **16**, dont **8** payantes — `discover` fait deux requêtes par invocation |
+| Crédits contractuels maximaux | **16** — borne tarifaire relue, pas une garantie de facture |
+| Autorisations humaines | **12**, une par invocation |
+| Arrêt immédiat | `COVERAGE_MISSING`, `COST_MISMATCH`, mapping rejeté |
+| Substitution automatique | **aucune**, ni de bookmaker ni d'événement |
+
+Aucune de ces commandes n'a été exécutée par les tranches 03C-1 ni 03C-1 ter :
+elles n'écrivent que le protocole, l'évaluateur et leurs tests.

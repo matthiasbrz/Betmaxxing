@@ -43,6 +43,7 @@ import pytest
 from helpers_activation import (
     BOOKMAKER,
     EVENT_ID,
+    FAKE_RECEIPT_SECRET,
     OTHER_BOOKMAKER,
     Recorder,
     core_args,
@@ -460,7 +461,9 @@ class TestTheSyntheticCoreSuccessPath:
 
         run_core_against(monkeypatch, keyed, synthetic_grouped_odds())
         r = core_receipt(keyed)
-        assert A.verify_receipt({k: v for k, v in r.items() if k != "_filename"})
+        assert A.verify_receipt(
+            {k: v for k, v in r.items() if k != "_filename"}, FAKE_RECEIPT_SECRET
+        )
         blob = json.dumps(r)
         for forbidden in (
             SYNTHETIC_HOME,

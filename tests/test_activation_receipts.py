@@ -214,7 +214,9 @@ class TestSignature:
 
         do_discover(monkeypatch)
         path = receipt_path(keyed, "discover")
-        assert activation.verify_receipt(json.loads(path.read_text(encoding="utf-8")))
+        assert activation.verify_receipt(
+            json.loads(path.read_text(encoding="utf-8")), FAKE_RECEIPT_SECRET
+        )
 
     def test_a_changed_field_invalidates_it(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
@@ -224,7 +226,9 @@ class TestSignature:
         do_discover(monkeypatch)
         path = receipt_path(keyed, "discover")
         tamper(path, status="CORE_LIVE_VERIFIED")
-        assert not activation.verify_receipt(json.loads(path.read_text(encoding="utf-8")))
+        assert not activation.verify_receipt(
+            json.loads(path.read_text(encoding="utf-8")), FAKE_RECEIPT_SECRET
+        )
 
     def test_it_is_computed_over_canonical_json(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
@@ -235,7 +239,7 @@ class TestSignature:
         do_discover(monkeypatch)
         payload = json.loads(receipt_path(keyed, "discover").read_text(encoding="utf-8"))
         shuffled = dict(reversed(list(payload.items())))
-        assert activation.verify_receipt(shuffled)
+        assert activation.verify_receipt(shuffled, FAKE_RECEIPT_SECRET)
 
     def test_a_receipt_signed_with_another_secret_is_refused(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
@@ -244,8 +248,11 @@ class TestSignature:
 
         do_discover(monkeypatch)
         payload = json.loads(receipt_path(keyed, "discover").read_text(encoding="utf-8"))
-        monkeypatch.setenv("BETMAXXING_ACTIVATION_RECEIPT_SECRET", "f" * 64)
-        assert not activation.verify_receipt(payload)
+        # The secret is a parameter since v6, so the other installation's key is passed
+        # rather than installed in the environment: the property — a receipt signed here
+        # does not verify there — is the same one, stated without an ambient lookup.
+        assert not activation.verify_receipt(payload, "f" * 64)
+        assert activation.verify_receipt(payload, FAKE_RECEIPT_SECRET)
 
 
 class TestTheEventIdentifierIsHmacNotSha:
@@ -265,8 +272,8 @@ class TestTheEventIdentifierIsHmacNotSha:
     ) -> None:
         from betmaxxing.providers.the_odds_api import activation
 
-        first = activation.event_tag(EVENT_ID)
-        second = activation.event_tag(EVENT_ID)
+        first = activation.event_tag(EVENT_ID, FAKE_RECEIPT_SECRET)
+        second = activation.event_tag(EVENT_ID, FAKE_RECEIPT_SECRET)
         assert first == second and first
 
     def test_it_differs_between_installations(
@@ -274,15 +281,16 @@ class TestTheEventIdentifierIsHmacNotSha:
     ) -> None:
         from betmaxxing.providers.the_odds_api import activation
 
-        mine = activation.event_tag(EVENT_ID)
-        monkeypatch.setenv("BETMAXXING_ACTIVATION_RECEIPT_SECRET", "a" * 64)
-        theirs = activation.event_tag(EVENT_ID)
+        mine = activation.event_tag(EVENT_ID, FAKE_RECEIPT_SECRET)
+        theirs = activation.event_tag(EVENT_ID, "a" * 64)
         assert mine != theirs
 
     def test_two_events_get_two_tags(self, keyed: Path) -> None:
         from betmaxxing.providers.the_odds_api import activation
 
-        assert activation.event_tag(EVENT_ID) != activation.event_tag(OTHER_EVENT_ID)
+        assert activation.event_tag(EVENT_ID, FAKE_RECEIPT_SECRET) != activation.event_tag(
+            OTHER_EVENT_ID, FAKE_RECEIPT_SECRET
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +321,7 @@ class TestDiscoverWritesEvidence:
 
         do_discover(monkeypatch)
         receipt = receipts_in(keyed)[-1]
-        assert receipt["event_tags"] == [activation.event_tag(EVENT_ID)]
+        assert receipt["event_tags"] == [activation.event_tag(EVENT_ID, FAKE_RECEIPT_SECRET)]
         blob = json.dumps(receipt)
         assert EVENT_ID not in blob
         for forbidden in ("Olympique", "Rennais"):
@@ -515,6 +523,9 @@ class TestAdditionalDemandsACoreReceipt:
                 f"{command} reaches for the audit scan instead of the named receipt"
             )
         authorise = inspect.getsource(activation.load_parent)
+        # The docstring recounts what earlier versions did and names `audit_receipts`
+        # while doing so; the property is about the code, so the prose is removed first.
+        authorise = authorise.split('"""', 2)[-1]
         assert "audit_receipts" not in authorise
         assert "glob(" not in authorise, "load_parent enumerates files instead of reading one"
 

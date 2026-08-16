@@ -177,7 +177,7 @@ relue est naïve : `from_storage()` la réattache à UTC. `ensure_utc()` continu
 cas sont volontairement dans des fonctions distinctes pour que la lecture permissive
 ne soit jamais atteignable depuis un chemin d'ingestion.
 
-## Reçus d'activation fournisseur — schéma v3
+## Reçus d'activation fournisseur — schéma v4
 
 Ces fichiers **ne sont pas** en base : ce sont des JSON locaux signés sous
 `.activation-receipts/` (répertoire gitignoré, jamais versionné, sans contrepartie
@@ -186,22 +186,23 @@ appels réels au fournisseur.
 
 | Champ | Sens |
 |---|---|
-| `schema_version` | 3 pour tout reçu écrit désormais. Les v2 restent **lus** et honorés, jamais réécrits ni re-signés ; v1 et inconnues sont refusées |
-| `receipt_id` | identifiant local du reçu |
+| `schema_version` | 4 pour tout reçu écrit désormais. Les v2 et v3 restent **lus** et honorés comme autorité de chaînage, jamais réécrits ni re-signés, et ne qualifient plus rien (D-072) ; v1 et inconnues sont refusées |
+| `qualification_protocol_version` / `provider_adapter_evidence_version` | v4 seulement : sous quel protocole ce reçu serait jugé, et quel parser l'a produit. **Couverts par la signature** — altérer l'un invalide le reçu. Des entiers **réels** : un booléen ou une chaîne numérique rend le reçu malformé, jamais admissible (D-073) |
+| `receipt_id` | identifiant local du reçu, **complet dans le nom de fichier** et créé de façon exclusive : un reçu n'est jamais remplacé silencieusement. Deux reçus courants de même identifiant et de contenus signés différents sont un conflit de preuve (D-073) |
 | `parent_receipt_id` / `parent_schema_version` | le reçu qui a autorisé cette étape, et sous quel schéma il a été accepté |
 | `command`, `status`, `recorded_at`, `expires_at` | étape, issue terminale, instant, péremption (6 h) |
 | `sport_key`, `bookmaker` | portée demandée |
-| `event_tag` / `event_tags` | identifiant(s) d'événement en **HMAC local**, jamais en clair |
+| `event_tag` / `event_tags` | identifiant(s) d'événement en **HMAC local**, jamais en clair. Volontairement visible dans `bookmaker_coverage_observations` et nulle part ailleurs : c'est ce qui borne une observation à un événement sans le nommer (D-062). Ce n'est pas l'identifiant fournisseur et ne doit jamais être présenté comme tel |
 | `window_from`, `window_to` | fenêtre déclarée |
-| `endpoints`, `endpoint`, `attempts` | endpoints **templatés** (jamais d'URL avec query string) et nombre exact de requêtes tentées |
-| `network_attempted`, `may_have_reached_provider` | une socket a-t-elle été ouverte ; la requête a-t-elle pu être servie (un timeout de lecture vaut « oui ») |
+| `endpoints`, `endpoint`, `attempts` | endpoints **templatés** (jamais d'URL avec query string) et nombre exact de requêtes tentées. `attempts` est **obligatoire** et cohérent avec le drapeau réseau : `network_attempted = false` impose `0`, `true` impose `≥ 1` (D-074) |
+| `network_attempted`, `may_have_reached_provider` | une socket a-t-elle été ouverte ; la requête a-t-elle pu être servie (un timeout de lecture vaut « oui »). Exactement `true` ou `false` : une valeur absente ou mal typée n'établit **rien**, et en particulier ne prouve pas qu'un appel n'est jamais parti (D-074). Les deux ensemble, avec `attempts`, forment l'**atteinte du fournisseur**, précondition de toute preuve de réponse — mapping, couverture, fraîcheur (D-075) |
 | `estimated_credits` | borne calculée avant l'appel |
 | `observed_credits` | `x-requests-last`, ou **`null`** s'il est absent, illisible ou négatif — jamais remplacé par zéro |
 | `accounted_credits` | ce qui est retenu : l'observation si elle existe, l'estimation sinon |
 | `quota_remaining` | `x-requests-remaining` de la dernière réponse, ou `null` |
 | **`bookmaker_state`** | `core` / `additional` seulement. `OBSERVED` ou `NOT_RETURNED` — dimension **indépendante** de l'état des marchés. **Absent** d'un reçu `discover` : `/events` ne renvoie aucune information de bookmaker, donc il n'y a rien à constater, et un défaut à `NOT_RETURNED` se lirait comme un constat |
 | `markets_requested` | portée de marchés de l'appel |
-| **`market_states`** | un état par marché demandé, **total** : `NOT_EVALUATED_BOOKMAKER_ABSENT`, `NOT_RETURNED`, `OBSERVED_REJECTED` ou `OBSERVED_MAPPED` |
+| **`market_states`** | un état par marché demandé, **total** — pour un reçu dont les marchés ont réellement été classifiés : `NOT_EVALUATED_BOOKMAKER_ABSENT`, `NOT_RETURNED`, `OBSERVED_REJECTED` ou `OBSERVED_MAPPED`. **Vide** pour un reçu dont l'appel a échoué avant toute classification — phase `ATTEMPTED_UNCLASSIFIED` — et vide *parce que rien n'a été regardé*, ce qui interdit de le lire comme une observation (D-074) |
 | `markets_mapped` / `markets_rejected` / `markets_absent` / **`markets_not_evaluated`** / `markets_observed` | projections strictes de `market_states`, partitionnant `markets_requested` exactement une fois — aucune ne peut le contredire |
 | `freshness` | âge **en secondes** par marché, dérivé de l'horodatage que v4 envoie pour cette forme de réponse |
 | `selections_mapped` | sélections retenues par le parseur réel |
@@ -213,3 +214,77 @@ appels réels au fournisseur.
 Ne s'y trouvent **jamais** : la clé API, le secret de signature, une URL non
 expurgée, un corps de réponse brut, une cote, un nom de participant, un horaire
 individuel, ni l'identifiant d'événement en clair.
+
+## Les cinq dimensions de `activation status` (D-062, resserrées par D-074 puis D-075)
+
+Cinq faits distincts qu'un seul libellé ne porte pas, plus le bloc de qualification
+ci-dessous. Distinct ne veut pas dire indulgent : depuis D-074 chacune lit ses reçus
+avec la même rigueur que le bloc strict, et aucune ne peut employer un libellé positif
+sur une preuve que celui-ci rejette pour le même fait.
+
+| Champ | Type | Sens |
+|---|---|---|
+| `adapter_state` | `str` | `IMPLEMENTED_UNVERIFIED`, quelle que soit l'issue de tout le reste |
+| `execution_state` | `str` | jusqu'où la séquence est allée : `NO_NETWORK_ATTEMPTED`, `NETWORK_ATTEMPT_STATE_UNESTABLISHED`, `DISCOVERY_ATTEMPTED`, `CORE_ATTEMPTED`, `ADDITIONAL_ATTEMPTED`. Seule une tentative **confirmée** — `network_attempted is true` et `attempts ≥ 1` — produit un `*_ATTEMPTED` ; un drapeau absent ou mal typé produit l'état non établi, jamais un fait (D-075). Depuis D-076 la commande est lue par `CommandState` : seul `discover` exact produit `DISCOVERY_ATTEMPTED`, là où la v5 y arrondissait `plan`, une commande absente, `sync`, `7`, `Core` et `" core "` |
+| `CommandState` | `str` | `PLAN`, `DISCOVER`, `CORE`, `ADDITIONAL` ou `COMMAND_STATE_UNESTABLISHED`. Domaine fermé, sans casse, sans espace et sans coercition ; une commande non établie est une faute structurelle et n'entre pas dans le dénominateur payant (D-076) |
+| `receipt_boundary_state` | `str` | `ABSENT`, `AVAILABLE` ou `UNAVAILABLE`. Trois faits distincts : aucun répertoire de reçus ; un répertoire sûr et lu, dont les comptes valent ce qu'ils disent ; un répertoire qui existe et n'est pas lisible sans ambiguïté. Le dernier est un **conflit de preuve** et ferme la porte. La v6 publiait les deux extrêmes à l'identique — « 0 reçu, 0 invérifiable » — donc un répertoire devenu lien symbolique se lisait comme une installation propre (D-077) |
+| `receipt_boundary_reason` | `str` | vide si la frontière est lisible ; sinon une **catégorie** de `BOUNDARY_REASONS` : `absent`, `ambiguous_component`, `not_a_directory`, `permission_denied`, `kernel_support_missing`, `unreadable`. Jamais un chemin, jamais un nom choisi par un tiers (D-077) |
+| `BoundaryState` | type | le domaine fermé des trois valeurs ci-dessus (D-077) |
+| `UNREADABLE_OR_INVALID` | `str` | l'état sous lequel un intent hors contrat ou illisible est rapporté. Il remplace **le corps entier** de l'intent : la v6 publiait le fichier verbatim, donc un `command` et un `max_credits` hostiles étaient réfléchis dans le JSON et le terminal (D-077) |
+| `VerifiedReceipt` / `VerifiedReceiptBatch` / `AuditResult` | type | la provenance d'un reçu et le résultat d'un audit. Depuis D-077 **aucun des trois n'est constructible** : chacun prend un jeton privé en premier argument positionnel, `trust()` et `require_verified()` sont supprimés, et le seul chemin est `audit_directory`, qui reçoit un répertoire déjà ouvert composant par composant et fait lui-même lecture, contrôle de schéma et HMAC contre le secret de l'installation. `qualification.evaluate` n'accepte qu'un `AuditResult` : ni liste, ni tuple, ni lot assemblé à la main. Depuis **D-078** les constructeurs refusent **inconditionnellement**, il n'existe plus aucun jeton au niveau module, les quatre types refusent le sous-classement, et les frontières internes comparent une identité de type exacte. Un reçu admis est **gelé récursivement** — `FrozenMapping` implémente `Mapping` sans hériter d'aucun conteneur mutable, les séquences sont des `tuple`, et les quinze appels directs aux mutateurs de `dict` et de `list` lèvent ; l'audit enregistre en plus une **somme de contrôle** sha256 non clée par reçu sous `AuditResult.checksums`, que `require_audited` recalcule. Cette somme de contrôle est un contrôle d'intégrité contre une mutation accidentelle, **pas** une preuve d'origine : l'authenticité vient du HMAC vérifié à l'ingestion. Les primitives réflexives de Python (`object.__new__`, `object.__setattr__`) atteignent ces objets et sont **hors périmètre** de sécurité par D-078. La v6, qui exposait un constructeur public sans contrôle et ne gelait qu'un niveau, laissait un corpus non signé atteindre la porte et une écriture imbriquée changer un verdict après vérification (D-076, corrigée par D-077) |
+| `connectivity_and_cost_proof` | `str` | `NOT_EXERCISED`, `EXERCISED_CONFORMING`, `EXERCISED_UNESTABLISHED` ou `EXERCISED_NONCONFORMING`, par la précédence `NONCONFORMING > UNESTABLISHED > CONFORMING > NOT_EXERCISED`. `EXERCISED_UNESTABLISHED` existe parce qu'un coût non établi n'est ni conforme ni un écart (D-074) |
+| `paid_call_cost_census` | `dict[str, int]` | le recensement dont le champ précédent est dérivé, sur **la même** population : tout pas payant **distinct** que le contrat accepte de lire, protocoles antérieurs compris, reçus rejetés exclus. **Six** clés depuis D-076 : `provider_reached_conforming_cost`, `provider_reached_nonconforming_cost`, `provider_reached_cost_unestablished`, `provider_reach_unestablished`, `paid_attempt_state_unestablished`, `confirmed_attempts_not_sent`. Le seau unique « non établi » de D-075 affirmait dans son nom une atteinte que deux de ses trois alimentations démentaient ; il est scindé. `COST_CONFORMITY` en compte une plus étroite — protocole courant —, d'où des nombres qui peuvent légitimement différer |
+| `rejected_paid_receipts` | `int` | nombre de pas payants **distincts** que le contrat rejette : malformés, contradictoires, de couple inconnu, ou d'identifiant divergent. Comptés, jamais tarifés (D-076) |
+| `rejected_paid_cost_census` | `dict[str, int]` | la même taxonomie à six clés, appliquée aux reçus payants rejetés. Recensement **médico-légal** : deux populations — `provider_reach_unestablished` et `paid_attempt_state_unestablished` — ne peuvent naître que d'un reçu hors contrat, donc elles restent à zéro dans le recensement sémantique et parlent ici (D-076) |
+| `unresolved_attempt_intents` | `int` | nombre de tentatives dont l'intent local, écrit et `fsync`-é **avant** la requête, n'a pas été résolu par la publication durable de son reçu. Chacun est un conflit de preuve et bloque la porte : une requête a pu partir sans laisser de reçu (D-076) |
+| `unresolved_attempt_intent_details` | `list[dict]` | ces intents. Un intent **valide** est publié tel que ce programme l'a écrit : identifiant, commande, portée, plafond contractuel, état, instant. Un intent hors contrat ou illisible est réduit à son **nom local** et à `UNREADABLE_OR_INVALID` — il bloque toujours, et rien de son contenu n'est réfléchi. Aucune clé, aucune URL, aucun événement en clair, aucune cote, aucun payload (D-076, corrigée par D-077) |
+| `unresolved_attempt_intent_scope` | `str` | cette population, en clair, pour que le compteur ne se lise pas comme un incident réseau |
+| `paid_call_cost_census_population` | `str` | cette population, écrite en clair, pour que l'écart avec le critère ne se lise pas comme une contradiction |
+| `mapping_freshness_proof` | `str` | `NOT_OBTAINED_LIVE`, `OFFLINE_CONTRACT_VERIFIED` ou `OBTAINED_LIVE`. `OBTAINED_LIVE` exige une observation de mapping **saine** — atteinte du fournisseur établie, statut positif, bookmaker observé, marché cartographié, fraîcheur valide, contrat satisfait, aucune contradiction — jamais un simple `selections_mapped > 0` (D-074, D-075) |
+| `paid_activation_state` | `str` | `PREPARED_NOT_EXECUTED`, `PAID_ATTEMPT_STATE_UNESTABLISHED`, `PAID_ATTEMPT_INCONCLUSIVE`, `CORE_EXECUTED_NO_COVERAGE`, `CORE_EXECUTED_COVERAGE_OBSERVED` ou `ADDITIONAL_EXECUTED`. Cascade **identique** pour `core` et `additional`, preuves d'abord : `ADDITIONAL_EXECUTED` exige qu'une preuve `additional` classifiée et valide établisse effectivement couverture ou mapping — la seule présence d'un reçu `additional` ne suffit pas (D-075) |
+| `bookmaker_coverage_observations` | `list[dict]` | observations de portée stricte — un fournisseur, un bookmaker, une compétition, un événement tagué, un instant. N'y figurent que des reçus dont la phase a réellement répondu à la question du bookmaker, structurellement valides et non contradictoires : une observation est une **réponse**, pas la trace d'une tentative |
+| `accounted_credits_total` | `int` | somme des `accounted_credits` de reçus **distincts** et **structurellement lisibles**, en n'additionnant que des entiers réels non négatifs. Ni booléen, ni chaîne numérique, ni négatif, ni copie de fichier : c'est un chiffre de dépense lu avant de décider d'en dépenser plus (D-075) |
+| `rejected_receipt_credits_not_counted` | `int` | ce que revendiquent les reçus que le contrat structurel rejette. Publié pour être visible, **jamais** sommé dans le champ précédent : le nom dit lequel des deux est une comptabilité (D-075) |
+| `bookmaker_coverage_observation_scope` | `str` | la population des observations, en clair : reçus distincts, de phase classifiée, structurellement valides, non contradictoires, et dont l'atteinte du fournisseur est établie |
+| `verified_receipts` / `unverifiable_receipts` | `int` | population de l'audit local D-062. `unverifiable_receipts` compte aussi les liens symboliques, les cibles hors répertoire et les répertoires nommés `*.json`, jamais ouverts (D-074) |
+| `receipt_directory` | `str` | chemin **local**, gitignoré et sans distant. Le supprimer remet la preuve à zéro, ce qui est voulu |
+
+## Bloc de qualification fournisseur (D-071, corrigé par D-072, D-073 puis D-074)
+
+Produit par `qualification.evaluate()` et recopié champ par champ dans la sortie
+de `activation status` — jamais étalé, pour qu'une clé du protocole ne puisse pas
+écraser un champ D-062 du même nom. Calcul pur : aucun réseau, aucune clé, aucune
+configuration, aucun reçu modifié. Le protocole complet est dans
+`docs/provider-validation-protocol.md`.
+
+| Champ | Type | Sens |
+|---|---|---|
+| `qualification_protocol_version` | `int` | version des seuils et des règles d'admissibilité appliqués — `5` ; deux versions ne se comparent pas |
+| `qualification_adapter_evidence_version` | `int` | version du parser sous laquelle une preuve compte — `1` |
+| `qualification_evidence_not_before` | `str` | instant UTC littéral avant lequel un reçu est historique et jamais qualifiant |
+| `qualification_state` | `str` | `INSUFFICIENT_EVIDENCE`, `EVIDENCE_CONFLICT` ou `CRITERIA_MET_AWAITING_HUMAN_REVIEW`. Il n'existe pas de `VERIFIED` |
+| `criteria_results` | `list` | un élément par critère, ordre stable |
+| `criteria_results[].criterion_id` | `str` | identifiant stable, ex. `CORE_MAPPING_FOOTBALL` |
+| `criteria_results[].passed` | `bool` | seuils atteints pour ce critère seul |
+| `criteria_results[].observed` | `dict` | compteurs après déduplication : `events`, `competitions`, `utc_days`. Pour `COST_CONFORMITY` : les quatre catégories de coût `conforming_paid_calls`, `nonconforming_paid_calls`, `paid_calls_with_unestablished_cost`, `paid_calls_that_never_left` — exhaustives et disjointes sur les **tentatives payantes réelles du protocole courant**, dédupliquées ; les trois premières doivent valoir `≥ 6`, `0` et `0` |
+| `criteria_results[].required` | `dict` | seuils préenregistrés, mêmes clés |
+| `criteria_results[].missing` | `list[str]` | ce qui manque, en clair, ou vide |
+| `criteria_results[].scope` | `str` | sport, commande, marché, âge maximal |
+| `criteria_results[].limit` | `str` | ce que le critère **n'**établit pas |
+| `eligible_for_human_promotion_review` | `bool` | vrai seulement à `CRITERIA_MET_AWAITING_HUMAN_REVIEW`. N'autorise aucune promotion |
+| `evidence_conflicts` | `list[str]` | contradictions internes nommées ; non vide ⇒ échec fermé |
+| `qualification_admissible_receipts` | `int` | synonyme conservé de `qualification_usable_receipts`, publié sous son nom d'origine pour que deux rapports restent comparables d'une version de protocole à l'autre |
+| `qualification_usable_receipts` | `int` | reçus qui sont une preuve **courante** et lisible : v4, versions `4/1`, postérieurs à la date d'effet, bien formés, non contradictoires |
+| `qualification_current_malformed_receipts` | `int` | reçus **courants** hors contrat structurel. Comptés à part de l'histoire : les ranger sous « historique » se lisait comme « produits sous un protocole antérieur », l'inverse de la vérité (D-074) |
+| `qualification_current_contradictory_receipts` | `int` | reçus **courants** qui se contredisent eux-mêmes |
+| `qualification_unknown_pair_receipts` | `int` | reçus courants portant un couple commande/statut absent de la table de phases versionnée `RECEIPT_PHASES` (D-074) |
+| `qualification_historical_nonqualifying_receipts` | `int` | reçus valides et lisibles qui ne qualifient rien parce qu'ils viennent d'ailleurs : v2/v3, autre version de protocole ou d'adaptateur, antérieurs à la date d'effet, `recorded_at` inutilisable |
+| `qualification_duplicate_excluded_receipts` | `int` | population **exclusive et prioritaire** : un `receipt_id` nommant deux contenus signés différents rend tous les exemplaires concernés inutilisables, quelle que soit leur sous-population. Calculé sur **l'ensemble** des reçus vérifiés (D-074) |
+| `qualification_unverifiable_receipts` | `int` | fichiers comptés et **jamais lus** : signature invalide, schéma inconnu, v1, lien symbolique, cible hors répertoire, répertoire nommé `*.json`. Distinct du champ D-062 `unverifiable_receipts`, qui compte la même idée sur la population de l'audit local |
+| `qualification_exact_duplicate_copies` | `int` | **dimension croisée**, pas une population : combien de reçus répètent byte pour byte un reçu déjà vu. Chacun reste dans la population de son contenu, et seuls les compteurs de diversité les dédupliquent |
+| `qualification_population_equation` | `str` | l'équation de réconciliation, publiée en clair : reçus vérifiés + fichiers invérifiables = la somme des sept populations exclusives ci-dessus |
+| `qualification_reasons` | `dict[str, int]` | taxonomie agrégée : `stale_schema`, `malformed_current_schema`, `duplicate_receipt_identifier`, `other_protocol_version`, `other_adapter_evidence_version`, `before_effective_instant`, `unusable_recorded_at`, `self_contradictory`, `unverified_or_unknown_schema`, `unknown_command_status_pair`. **Des comptes seulement** — aucun chemin, reçu, tag ni identifiant |
+
+Aucun de ces champs ne porte de cote, de nom d'équipe, d'identifiant d'événement en
+clair, de clé ni de payload. `adapter_state` reste `IMPLEMENTED_UNVERIFIED` quelle
+que soit la valeur de ce bloc.
