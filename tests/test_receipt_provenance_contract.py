@@ -47,6 +47,8 @@ from __future__ import annotations
 
 import copy
 import pickle
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -638,15 +640,145 @@ class TestTheDocumentsPublishOneThreatModel:
         assert "not a sandbox against arbitrary Python code" in docstring
         assert "Out of scope:" in docstring
         assert "In scope:" in docstring
-        # The absolutes must never be *asserted*. They may be quoted in the sentence that
-        # retires them, which is why the forbidden forms are the affirmative ones.
-        for forbidden in (
-            "is non-forgeable",
-            "is unconstructible",
-            "cannot be forged",
-            "is impossible to fabricate",
-        ):
-            assert forbidden not in source, f"{forbidden!r} is claimed again"
+
+    #: Every absolute D-078 retires, in both languages, as the sexdecies re-audit found
+    #: them. Written normalised: lower case, no Markdown emphasis, hyphens folded to
+    #: spaces. Test the normaliser below before adding to this list.
+    RETIRED_ABSOLUTES = (
+        "unconstructible",
+        "non constructible",
+        "non forgeable",
+        "unforgeable",
+        "cannot be constructed",
+        "cannot be forged",
+        "cannot be fabricated",
+        "impossible to construct",
+        "impossible to forge",
+        "impossible to fabricate",
+        "impossible a construire",
+        "impossible a forger",
+        "impossible a fabriquer",
+        "ne peut pas etre construit",
+        "ne peuvent pas etre construits",
+        "aucun objet mutable",
+        "preuve cryptographique portee par le type",
+    )
+
+    #: The artefacts whose *active* prose must not claim an absolute. The two modules and
+    #: the roadmap are here because the sexdecies re-audit found the claim alive in all
+    #: three; the normative documents are here because they are what an operator reads.
+    ACTIVE_PROSE = (
+        "src/betmaxxing/providers/the_odds_api/receipt_store.py",
+        "src/betmaxxing/providers/the_odds_api/qualification.py",
+        "docs/roadmap.md",
+        "docs/provider-validation-protocol.md",
+        "docs/provider-activation.md",
+        "docs/data-dictionary.md",
+        "docs/decisions.md",
+    )
+
+    @staticmethod
+    def normalise(text: str) -> str:
+        """Fold the ways the same claim can be spelled, so the guard cannot be dodged.
+
+        Case, Markdown emphasis (``**``, ``*``, ``_``), backticks, RST double backticks,
+        hyphens and non-breaking spaces all disappear; accents are stripped so that
+        « impossible à fabriquer » and « impossible a fabriquer » are one string. Without
+        this the sexdecies occurrences slip through: ``is now **unconstructible**`` puts
+        emphasis markers *inside* the phrase, which a plain substring ban never sees.
+        """
+        folded = unicodedata.normalize("NFKD", text.lower())
+        folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+        for noise in ("**", "``", "`", "*", "_"):
+            folded = folded.replace(noise, "")
+        # Every Unicode dash, not just ASCII: NFKD folds a non-breaking hyphen to
+        # U+2010, which a plain "[-\u2013\u2014]" class silently misses.
+        folded = re.sub(r"[\u2010-\u2015\u2212-]+", " ", folded)
+        return re.sub(r"[\s\u00a0\u202f]+", " ", folded)
+
+    @staticmethod
+    def active_prose_only(text: str) -> str:
+        """Drop what is quoted, so a retired word may still be *named* as retired.
+
+        Two exemptions, and both are narrow. A phrase inside French guillemets is a
+        **mention**, not a claim — « non-forgeable » is how D-078 names the term it
+        withdraws. And a line that marks itself historical (« retiré », « supersédé »,
+        « historique », « ancienne formulation », or the English equivalents) is a
+        record of what was said, not a statement that it holds. Everything else is an
+        assertion and is checked.
+        """
+        without_quotations = re.sub(r"«[^»]*»", " ", text)
+        kept = []
+        for line in without_quotations.splitlines():
+            marks = TestTheDocumentsPublishOneThreatModel.normalise(line)
+            if any(
+                marker in marks
+                for marker in (
+                    "retire",
+                    "retiree",
+                    "retirees",
+                    "superced",
+                    "supersed",
+                    "historique",
+                    "ancienne formulation",
+                    "no longer used",
+                    "not used here as guarantees",
+                    "retired",
+                    "superseded",
+                )
+            ):
+                continue
+            kept.append(line)
+        return "\n".join(kept)
+
+    def test_the_normaliser_sees_through_emphasis_and_spelling(self) -> None:
+        """The guard is only worth its normaliser, so the normaliser is tested first."""
+        normalise = self.normalise
+        assert "unconstructible" in normalise("provenance is now **unconstructible**, and")
+        assert "non constructible" in normalise("provenance **non-constructible** et gelée")
+        assert "non constructible" in normalise("provenance NON\u2011CONSTRUCTIBLE")
+        assert "cannot be constructed" in normalise("An ``AuditResult`` cannot be constructed")
+        assert "impossible a fabriquer" in normalise("« impossible à fabriquer »".strip("« »"))
+
+    def test_the_normaliser_keeps_a_named_retirement_out_of_scope(self) -> None:
+        """A word may be spoken in order to be withdrawn — that must stay legal."""
+        active = self.active_prose_only(
+            "So the words « non-forgeable », « unconstructible » are **not** used here.\n"
+            "Vocabulaire retiré. « non constructible » n'est plus employé.\n"
+        )
+        assert self.normalise(active).strip() in ("", "so the words , are not used here.")
+
+    @pytest.mark.parametrize("relative", ACTIVE_PROSE)
+    def test_no_active_prose_claims_an_absolute(self, relative: str) -> None:
+        """D-078 retired these words; the sexdecies re-audit found three still asserted.
+
+        Two were in ``qualification.py`` — the module docstring said provenance « is now
+        **unconstructible** » and ``evaluate`` said an ``AuditResult`` « cannot be
+        constructed » — and one was in ``docs/roadmap.md``, inside the very sentence that
+        announces D-078. All three are assertions, not citations, so all three are caught
+        here.
+        """
+        text = (self.ROOT / relative).read_text(encoding="utf-8")
+        haystack = self.normalise(self.active_prose_only(text))
+        claimed = [phrase for phrase in self.RETIRED_ABSOLUTES if phrase in haystack]
+        assert claimed == [], (
+            f"{relative} asserts {claimed!r}; D-078 retired these. State the supported "
+            "property instead: the objects handed to evaluation come from the HMAC audit, "
+            "and the marker guards against ordinary misuse, not arbitrary Python."
+        )
+
+    @pytest.mark.parametrize(
+        "relative",
+        [
+            "src/betmaxxing/providers/the_odds_api/receipt_store.py",
+            "src/betmaxxing/providers/the_odds_api/qualification.py",
+        ],
+    )
+    def test_both_modules_state_the_supported_property(self, relative: str) -> None:
+        """Removing a claim is half the job; the module must say what *does* hold."""
+        text = self.normalise((self.ROOT / relative).read_text(encoding="utf-8"))
+        assert "hmac" in text, f"{relative} does not name the boundary that carries origin"
+        assert "d 078" in text, f"{relative} does not name the decision that bounds it"
 
     def test_the_protocol_keeps_version_seven_and_its_instant(self) -> None:
         assert qual.PROVIDER_VALIDATION_PROTOCOL_VERSION == 7

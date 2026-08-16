@@ -16,12 +16,16 @@ receipt directory a descriptor rather than a path, an attempt left a durable tra
 
 v7 finishes what v6 named. The sixth audit built eight receipts with the ``signature``
 key *deleted*, wrapped them in the provenance type by hand, and reached the human-review
-gate — so provenance is now **unconstructible**, obtainable only by auditing a real
-directory. It also wrote ``receipt["freshness"][market] = 300`` through the documented
-Mapping API and moved a corpus from ``INSUFFICIENT_EVIDENCE`` to that same gate *after*
-verification — so an admitted receipt is a recursively frozen value. And a receipt
-directory that could not be read safely used to report exactly what an empty one
-reports, so the boundary now has three states and the unreadable one blocks.
+gate — so the provenance type lost its public constructor, and in the supported
+application pipeline the only objects reaching this module come from
+:func:`~.receipt_store.audit_directory`, which verified their HMAC first. **D-078** fixes
+what that is worth and what it is not: the marker guards against ordinary misuse of the
+application code, not against arbitrary Python executed in this process. The sixth audit
+also wrote ``receipt["freshness"][market] = 300`` through the documented Mapping API and
+moved a corpus from ``INSUFFICIENT_EVIDENCE`` to that same gate *after* verification — so
+an admitted receipt is a recursively frozen value. And a receipt directory that could not
+be read safely used to report exactly what an empty one reports, so the boundary now has
+three states and the unreadable one blocks.
 
 **Pure, and provably so.** :func:`evaluate` reads no environment, no clock and no
 file, writes nothing, and computes no HMAC. It accepts only the result of a real audit —
@@ -1648,11 +1652,17 @@ def evaluate(
     """Judge one audit of the receipt directory against the pre-registered criteria. Pure.
 
     The argument is the **result of an audit**, not a list. v6 took a batch and a
-    number, and both were forgeable: ``[VerifiedReceipt(payload) for payload in
+    number, and any caller could supply both: ``[VerifiedReceipt(payload) for payload in
     forged]`` satisfied its ``isinstance`` check and reached
     ``CRITERIA_MET_AWAITING_HUMAN_REVIEW``, and the number could be anything at all.
-    An :class:`~.receipt_store.AuditResult` cannot be constructed, so the only way to
-    reach this function is to have had a real directory read.
+    :class:`~.receipt_store.AuditResult` now has no public constructor and no subclass,
+    and this function checks exact type identity, so in the supported pipeline the way
+    to reach it is to have had a real directory read and its receipts' HMAC verified.
+
+    Per **D-078**, that is a guard against ordinary misuse of the application code, not
+    a barrier against arbitrary Python running in this process: whoever can execute code
+    here can equally replace this function or read the signing secret. Authenticity is
+    carried by the HMAC :func:`~.receipt_store.audit_directory` checks at ingestion.
 
     That result also carries the **boundary state**, which v6 dropped on the floor. An
     ``UNAVAILABLE`` boundary is an evidence conflict here: the counts it came with are

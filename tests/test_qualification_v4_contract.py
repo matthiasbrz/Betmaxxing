@@ -39,6 +39,25 @@ from betmaxxing.providers.the_odds_api import qualification as qual
 #: pinned exactly once, by ``tests/test_qualification_v5_contract.py``.
 D074_EFFECTIVE_INSTANT = "2026-08-10T09:11:48+00:00"
 
+#: Every term on the right-hand side of the reconciliation equation, in the order the
+#: protocol publishes them. Seven are exclusive semantic populations plus the count of
+#: files this installation could not verify; the eighth,
+#: ``qualification_exact_duplicate_copies``, is **not** a population — it is the
+#: adjustment between the number of verified *files* and the deduplicated canon the
+#: semantic populations are computed over. The sexdecies re-audit found the protocol
+#: document publishing only seven of the eight, so the documented equation did not
+#: balance as soon as one receipt file was filed twice.
+EQUATION_TERMS = (
+    "qualification_usable_receipts",
+    "qualification_current_malformed_receipts",
+    "qualification_current_contradictory_receipts",
+    "qualification_unknown_pair_receipts",
+    "qualification_historical_nonqualifying_receipts",
+    "qualification_duplicate_excluded_receipts",
+    "qualification_unverifiable_receipts",
+    "qualification_exact_duplicate_copies",
+)
+
 FOOTBALL = "soccer_france_ligue_one"
 FOOTBALL_2 = "soccer_epl"
 TENNIS = "tennis_atp_paris"
@@ -1161,22 +1180,29 @@ class TestThePopulationsReconcile:
         ]
 
     def test_every_receipt_is_in_exactly_one_population(self) -> None:
+        """All eight terms, not the six this test used to sum.
+
+        Its fixture has neither an unknown pair nor an exact copy, so omitting those two
+        terms left the sum right by accident. ``TestThePublishedEquationIsComplete``
+        below carries a corpus where both are non-zero.
+        """
         receipts = self._mixed()
         document = _evaluate(receipts, 0)
-        total = (
-            document["qualification_usable_receipts"]
-            + document["qualification_current_malformed_receipts"]
-            + document["qualification_current_contradictory_receipts"]
-            + document["qualification_historical_nonqualifying_receipts"]
-            + document["qualification_duplicate_excluded_receipts"]
-            + document["qualification_unverifiable_receipts"]
-        )
+        total = sum(document[field] for field in EQUATION_TERMS)
         assert total == len(receipts)
 
     def test_a_current_malformed_receipt_is_not_called_historical(self) -> None:
         document = _evaluate([core(selections_mapped="3")], 0)
         assert document["qualification_current_malformed_receipts"] == 1
         assert document["qualification_historical_nonqualifying_receipts"] == 0
+
+    def test_the_published_equation_names_all_eight_terms(self) -> None:
+        """The string `status` prints must not describe a shorter sum than it computes."""
+        published = _evaluate(self._mixed(), 0)["qualification_population_equation"]
+        left, _, right = published.partition("=")
+        assert "invérifiables" in left, published
+        assert len(right.split("+")) == len(EQUATION_TERMS), published
+        assert "copies exactes" in right, published
 
     def test_a_current_contradictory_receipt_is_not_called_historical(self) -> None:
         """A contradiction the structural contract does not already catch.
@@ -1196,6 +1222,95 @@ class TestThePopulationsReconcile:
         document = _evaluate([one, dict(one), dict(one)], 0)
         assert entry(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 1
         assert document["qualification_duplicate_excluded_receipts"] == 0
+
+
+class TestThePublishedEquationIsComplete:
+    """One corpus, four agreements: the sum, the fields, the string, the protocol.
+
+    The sexdecies re-audit found the equation right in the code and wrong in the
+    document that publishes it as normative. ``docs/provider-validation-protocol.md``
+    §3.1 listed seven terms; the calculation uses eight. Eight honest receipts plus two
+    byte-identical copies made the documented form read ``10 = 8``, so an operator
+    reconciling `status` by hand against the protocol saw a gap and could not tell a
+    silently dropped receipt from a documentation error.
+
+    The corpus below deliberately makes the two previously omitted terms non-zero — an
+    unknown command/status pair and an exact copy — because a fixture where they are
+    zero is exactly how the omission survived.
+    """
+
+    PROTOCOL = Path(qual.__file__).resolve().parents[4] / "docs" / "provider-validation-protocol.md"
+
+    def _corpus(self) -> list[dict[str, Any]]:
+        twin = core(receipt_id="a1" * 8, event_tag="a" * 32)
+        return [
+            twin,
+            dict(twin),  # byte-for-byte copy -> qualification_exact_duplicate_copies
+            core(receipt_id="b2" * 8, event_tag="b" * 32),
+            core(receipt_id="c3" * 8, event_tag="c" * 32, command="discover"),  # unknown pair
+            core(receipt_id="d4" * 8, event_tag="d" * 32, selections_mapped="3"),  # malformed
+            core(receipt_id="e5" * 8, event_tag="e" * 32, observed_credits=1, accounted_credits=0),
+            core(receipt_id="f6" * 8, event_tag="f" * 32, qualification_protocol_version=3),
+            core(receipt_id="07" * 8, event_tag="0" * 32),
+            core(receipt_id="07" * 8, event_tag="1" * 32),  # divergent identifier
+        ]
+
+    def _document(self) -> Any:
+        return _evaluate(self._corpus(), 2)
+
+    def test_the_corpus_exercises_the_two_previously_omitted_terms(self) -> None:
+        """Guard the guard: a corpus where these are zero proves nothing."""
+        document = self._document()
+        assert document["qualification_unknown_pair_receipts"] >= 1
+        assert document["qualification_exact_duplicate_copies"] >= 1
+        assert document["qualification_unverifiable_receipts"] >= 1
+
+    def test_the_sum_is_exact_on_a_non_trivial_corpus(self) -> None:
+        corpus = self._corpus()
+        document = self._document()
+        assert sum(document[field] for field in EQUATION_TERMS) == len(corpus) + 2
+
+    def test_every_term_of_the_equation_is_published_as_a_field(self) -> None:
+        document = self._document()
+        for field in EQUATION_TERMS:
+            assert field in document, f"{field} is summed but never published"
+            assert isinstance(document[field], int) and not isinstance(document[field], bool)
+            assert document[field] >= 0
+
+    def test_the_published_string_and_the_fields_agree(self) -> None:
+        """As many named terms on the right of the string as there are summed fields."""
+        document = self._document()
+        _, _, right = document["qualification_population_equation"].partition("=")
+        assert len(right.split("+")) == len(EQUATION_TERMS)
+        assert "copies exactes" in right
+
+    def test_the_protocol_publishes_exactly_the_terms_the_code_sums(self) -> None:
+        """The normative block must name the eight fields — no more, no fewer.
+
+        Red on ``76ef6d6``: the block named seven, omitting
+        ``qualification_exact_duplicate_copies``.
+        """
+        text = self.PROTOCOL.read_text(encoding="utf-8")
+        section = text.split("### 3.1", 1)[1].split("### 3.2", 1)[0]
+        block = section.split("```text", 1)[1].split("```", 1)[0]
+        named = {line.strip(" +=\t") for line in block.splitlines()}
+        named = {item for item in named if item.startswith("qualification_")}
+        assert named == set(EQUATION_TERMS), (
+            "the normative equation and the calculation disagree; "
+            f"missing from the document: {sorted(set(EQUATION_TERMS) - named)}; "
+            f"documented but not summed: {sorted(named - set(EQUATION_TERMS))}"
+        )
+
+    def test_the_protocol_says_exact_copies_are_an_adjustment_not_a_population(self) -> None:
+        """The eighth term must not read as a ninth kind of receipt."""
+        section = (
+            self.PROTOCOL.read_text(encoding="utf-8").split("### 3.1", 1)[1].split("### 3.2", 1)[0]
+        )
+        # Prose is hard-wrapped, so a phrase may straddle a newline.
+        flat = " ".join(section.split())
+        assert "pas une population" in flat
+        assert "ajustement" in flat
+        assert "dédupliqué" in flat, "the canon the populations are computed over must be named"
 
     @pytest.mark.parametrize(
         ("label", "first", "second"),

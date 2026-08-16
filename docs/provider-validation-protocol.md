@@ -613,9 +613,20 @@ Le coût a sa propre définition, cumulative, au §2.1 : elle ne se réduit pas 
 
 ### 3.1 Populations et équation de réconciliation
 
-Chaque reçu vérifié appartient à **exactement une** population, et un fichier que
-cette installation n'a pas pu vérifier est compté à part. L'équation est publiée par
-`status` sous `qualification_population_equation` et testée :
+Trois choses distinctes entrent dans cette équation, et les confondre est la façon dont
+elle cesse de s'équilibrer :
+
+1. les **populations sémantiques exclusives** — tout reçu vérifié *distinct* appartient à
+   exactement une d'entre elles ;
+2. les **fichiers invérifiables**, comptés et jamais lus, donc jamais rangés dans une
+   population sémantique ;
+3. l'**ajustement des copies physiques exactes** : les populations sont calculées sur un
+   canon dédupliqué, alors que le membre de gauche compte des **fichiers**. Ce terme est
+   l'écart entre les deux, **pas** une population supplémentaire.
+
+L'équation est publiée par `status` sous `qualification_population_equation`, avec ses
+**huit** termes, et testée sur un corpus où l'ajustement et le couple inconnu sont tous
+deux non nuls :
 
 ```text
 reçus vérifiés + fichiers invérifiables
@@ -626,7 +637,14 @@ reçus vérifiés + fichiers invérifiables
   + qualification_historical_nonqualifying_receipts
   + qualification_duplicate_excluded_receipts
   + qualification_unverifiable_receipts
+  + qualification_exact_duplicate_copies
 ```
+
+Le huitième terme a manqué à ce bloc jusqu'au réaudit sexdecies, alors que le calcul
+l'utilisait depuis toujours : huit reçus honnêtes plus deux copies octet-pour-octet
+donnaient `10 = 8` sous la forme documentée. Le code, lui, s'équilibrait ; c'était la
+documentation normative qui était fausse, et un opérateur qui réconciliait ses comptes à
+la main ne pouvait pas distinguer un reçu silencieusement perdu d'une erreur de rédaction.
 
 | Population | Ce qu'elle contient |
 | --- | --- |
