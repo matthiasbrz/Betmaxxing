@@ -922,6 +922,67 @@ et requêtes fait échouer la suite au lieu de passer inaperçue.
 
 Le pire cas coûte 16 crédits. Le cas d'échec précoce en coûte 1.
 
+### Exécution en deux tranches (D-079)
+
+Les 16 crédits sont le coût **contractuel de la campagne complète**, et le fractionner ne
+le réduit pas. Il est en revanche exécuté en deux tranches autorisées séparément, parce que
+les deux moitiés ne prouvent pas la même chose et n'ont pas le même prix.
+
+| | Invocations | Crédits max | Critères atteignables au mieux |
+| --- | --- | --- | --- |
+| **Tranche 1** | six `core` d'un crédit | **6** | `CORE_MAPPING_FOOTBALL`, `CORE_MAPPING_TENNIS`, `COST_CONFORMITY` — soit **3 sur 8** |
+| **Tranche 2** | deux `additional` de cinq crédits | **10** | les cinq `ADDITIONAL_MAPPING_FOOTBALL_*` — soit les **5** restants |
+| **Total** | douze, plus quatre `discover` gratuites | **16** | 8 sur 8 |
+
+La tranche 2 n'est engagée qu'après validation de la tranche 1, et jamais par déduction :
+une autorisation ne se déduit pas de la précédente.
+
+**Ce que `plan --max-credits 6` chiffre, et ce qu'il ne chiffre pas.** Ce plafond est
+`TOTAL_MAX_CREDITS`, la somme de `STEP_CEILINGS` — le coût d'une séquence locale portant sur
+**un seul événement** : un `core` à 1 crédit et un `additional` à 5. Ce n'est pas le budget
+de la campagne, et le lire comme tel conduit à une conclusion fausse : six crédits dépensés
+en un `core` et un `additional` donnent un événement dans chaque étape et ne satisfont
+**aucun** critère, puisque les seuils demandent trois événements pour `core` et deux pour
+chaque marché `additional`.
+
+**Les seuils ne se satisfont pas par répétition.** `min_competitions` et `min_utc_days`
+portent sur des compétitions et des jours UTC **distincts**, calculés sur un canon
+dédupliqué par identifiant et somme de contrôle. Rejouer le même événement, ou re-déposer
+le même reçu, ne rapproche d'aucun seuil : `qualification_exact_duplicate_copies` compte les
+copies et aucun compteur sémantique ne bouge. `LOCAL_BOUNDS` borne d'ailleurs chaque
+invocation payante à **un** événement, si bien que trois événements exigent trois
+invocations et trois autorisations humaines.
+
+**Aucun résultat intermédiaire n'est une qualification.** Trois critères sur huit, c'est
+trois critères sur huit : `qualification_state` reste `INSUFFICIENT_EVIDENCE` tant que les
+huit ne sont pas satisfaits, `adapter_state` reste `IMPLEMENTED_UNVERIFIED` dans tous les
+cas, et le plafond machine demeure `CRITERIA_MET_AWAITING_HUMAN_REVIEW`.
+
+### La seule récupération après la fenêtre de crash (D-079)
+
+Un intent est écrit et `fsync`-é **avant** la requête, retiré une fois son reçu durablement
+publié. Le processus peut mourir entre les deux : l'intent survit alors qu'un reçu existe, et
+la porte reste fermée puisqu'un intent non résolu est un conflit de preuve.
+
+```bash
+python -m betmaxxing.providers.the_odds_api.activation receipts reconcile [--json]
+```
+
+C'est la **seule** récupération autorisée. Elle n'ouvre aucune socket, ne lit aucune clé
+fournisseur, charge le secret de vérification **sans en créer un**, audite par
+`audit_directory`, et ne retire un intent que sur un reçu durable, vérifié par le HMAC, de
+portée matérielle identique et de même lignée de versions au sens de D-077. Elle est
+idempotente, laisse intact tout intent sans preuve correspondante, et échoue de façon typée
+si la frontière, le secret, la lecture, la suppression ou le `fsync` échoue.
+
+`reconcile_intents` existait depuis la v7 et était documentée ici comme la résolution
+comptable, mais aucune commande ne l'appelait : la récupération était décrite et non
+exécutable — le défaut que D-077 avait fermé un cran plus bas pour la quarantaine.
+
+**La suppression manuelle d'un intent reste interdite.** `receipts quarantine` refuse les
+`*.intent` avec et sans `--force`, et il n'existe aucune commande de suppression. Retirer un
+intent à la main rouvrirait la porte sans preuve, ce qui est l'inverse d'une récupération.
+
 ## 9. Écriture et audit des reçus : un descripteur, pas un chemin
 
 **Frontière du répertoire.** Le répertoire de reçus est ouvert **une fois**, composant

@@ -2109,3 +2109,67 @@ les affirmations absolues sont supprimées ou supersédées. P3-F5 : l'incident 
 **Ce que cette décision n'autorise pas.** Aucun appel fournisseur, aucune activation, aucune
 promotion d'adaptateur ou de modèle, aucun changement de critère, de seuil, de protocole, de
 schéma ou d'instant d'effet.
+
+### D-079 — La récupération d'un intent est une commande, et la campagne se paie en deux tranches
+
+**Contexte.** Le préflight statique 03C-2A, en lecture seule sur `269f339`, a relevé deux
+divergences qu'aucune suite ne pouvait attraper parce qu'aucune ne les décrivait.
+
+**La première est un manque d'exécutabilité.** `reconcile_intents` existait depuis la v7,
+était documentée au §3.2 du protocole comme la résolution comptable des intents, et était
+testée — mais aucune commande CLI ne l'appelait. Or l'intent est écrit et `fsync`-é avant la
+requête et retiré après publication durable du reçu : entre les deux, un arrêt laisse un
+intent que rien ne peut plus retirer proprement. La quarantaine refuse les `*.intent` avec et
+sans `--force`, à juste titre depuis D-077, et aucune commande de suppression n'existe. Il
+restait donc à l'opérateur soit d'éditer du Python, soit de supprimer le fichier à la main —
+et supprimer un intent à la main rouvre la porte sans preuve, ce que l'intent existe
+précisément pour empêcher. C'est le défaut que D-077 avait fermé un cran plus bas : « v5
+documentait une sortie de secours sans la rendre exécutable ».
+
+`receipts reconcile [--json]` ferme cette voie. Aucune socket, aucune clé fournisseur lue,
+le secret de vérification chargé **sans être créé** — `installation_secret`, pas `ensure` :
+une récupération qui forgerait une clé rendrait invérifiable tout reçu déjà signé avec
+l'ancienne, ce qui est l'inverse de récupérer. Une seule ouverture de `SecureDirectory` pour
+toute l'opération : le secret, l'audit, la liste des intents et les suppressions passent par
+le même descripteur. Un intent n'est retiré que sur un reçu durable, vérifié par le HMAC, de
+portée matérielle identique et de même lignée de versions au sens de D-077. La commande est
+idempotente, laisse intact tout intent sans preuve, et publie des comptes et des catégories —
+jamais un chemin, un corps d'intent ou une valeur de secret.
+
+**Fermer, et fermer proprement.** Deux échecs qui se ressemblent sont désormais distingués.
+Un objet que la frontière **refuse** — lien symbolique, FIFO, répertoire, octets non
+décodables — reste bloquant, réduit à une catégorie par `unresolved_intents`, et n'interrompt
+pas le rapprochement des autres : sinon un fichier illisible interdirait la récupération de
+toutes les autres tentatives. Une `OSError` du **stockage** — `EIO`, `ENOSPC`, `EACCES` en
+lecture, à la suppression ou au `fsync` — arrête tout de façon typée : le nombre d'intents
+restants n'est alors pas établi, et rapporter « rien à rapprocher » depuis un répertoire
+qu'on n'a pas pu lire est la même erreur de catégorie que le `except StoreRefused: return
+(), 0` de la v6. Au passage, une `OSError` brute pouvait remonter de la lecture du secret et
+sortir sans un octet sur stdout — le défaut fermé pour les autres verbes par D-077 ; toute
+faute de stockage de cette opération est maintenant un refus métier avec rapport.
+
+**La seconde divergence est arithmétique.** Les seuils préenregistrés portent sur des
+**événements** — trois pour chaque `CORE_MAPPING_*`, sur deux compétitions et deux jours UTC
+distincts ; deux pour chaque `ADDITIONAL_MAPPING_FOOTBALL_*` — et `LOCAL_BOUNDS` borne
+chaque invocation payante à **un** événement. Trois événements exigent donc trois
+invocations. La campagne préenregistrée le dit déjà : `CAMPAIGN_INVOCATIONS` donne douze
+invocations, seize requêtes dont huit payantes, et **seize crédits**.
+
+`plan --max-credits 6` chiffre autre chose : `TOTAL_MAX_CREDITS`, la somme de
+`STEP_CEILINGS`, soit une séquence locale sur **un seul événement**. Lire ce plafond comme
+le budget de la campagne conduit à une conclusion fausse — six crédits dépensés en un `core`
+et un `additional` ne satisfont **aucun** critère. Le protocole publie désormais la
+distinction et le fractionnement : tranche 1, six `core`, six crédits, au mieux trois
+critères sur huit ; tranche 2, deux `additional`, dix crédits, les cinq restants, engagée
+seulement après validation de la première et jamais par déduction. Le total contractuel
+reste seize : fractionner n'en réduit pas le coût.
+
+**Ce que cette décision ne change pas.** Ni critère, ni seuil, ni tarif, ni taxonomie de
+coût, ni déduplication, ni équation de population. Protocole **7**, schéma de reçu **4**,
+preuve adaptateur **1**, instant d'effet `2026-08-11T14:20:00+00:00` : inchangés. Aucun
+résultat intermédiaire n'est une qualification — `adapter_state` reste
+`IMPLEMENTED_UNVERIFIED` et le plafond machine demeure
+`CRITERIA_MET_AWAITING_HUMAN_REVIEW`.
+
+**Ce que cette décision n'autorise pas.** Aucun provisionnement de secret, aucun `plan`,
+`discover`, `core` ni `additional`, aucun appel fournisseur, aucun crédit, aucune promotion.

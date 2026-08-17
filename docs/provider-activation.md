@@ -567,6 +567,35 @@ Tant qu'un intent n'est pas résolu, `qualification_state` reste `EVIDENCE_CONFL
 le corpus est incomplet d'une manière que rien sur ce disque ne permet de chiffrer.
 Rejouer l'étape publie le reçu et résout l'intent, sans compter le coût deux fois.
 
+### Rapprocher un intent dont le reçu est déjà publié (D-079)
+
+Il reste une fenêtre que rejouer l'étape ne referme pas : le reçu a été publié
+durablement, **puis** le processus est mort avant que son intent soit retiré. Rejouer
+republierait le même reçu à l'identique, mais l'intent, lui, resterait — et la porte avec
+lui. C'est la seule situation où une commande de récupération est nécessaire :
+
+```bash
+python -m betmaxxing.providers.the_odds_api.activation receipts reconcile [--json]
+```
+
+Elle publie `boundary_state`, `verified_receipts_considered`, `resolved_intents`,
+`remaining_intents`, `qualification_state` et `eligible_for_human_promotion_review` — des
+comptes et des catégories, jamais un chemin, un corps d'intent ni une valeur de secret.
+
+Ce qu'elle fait, exactement : aucun réseau, aucune clé fournisseur lue, le secret de
+vérification **chargé sans être créé**, l'audit par `audit_directory`, et un intent retiré
+**seulement** s'il existe un reçu durable, vérifié par le HMAC, de portée matérielle
+identique et de même lignée de versions. Elle est idempotente : un second passage résout
+zéro. Elle laisse intact tout intent que rien ne prouve. Et elle échoue de façon typée, avec
+un rapport non vide et un code de sortie non nul, si la frontière, le secret, la lecture, la
+suppression ou le `fsync` échoue — un intent n'est jamais retiré sur la base d'une lecture
+incomplète.
+
+**Ce qui reste interdit.** Supprimer un intent à la main, ou le passer en quarantaine :
+`receipts quarantine` refuse les `*.intent` avec et sans `--force`, et aucune commande de
+suppression n'existe. Un intent retiré sans reçu correspondant rouvrirait la porte sans
+preuve, c'est-à-dire exactement le défaut que l'intent existe pour empêcher.
+
 Ce que le bloc dit, et ce qu'il ne dit pas :
 
 - `qualification_state` vaut au mieux `CRITERIA_MET_AWAITING_HUMAN_REVIEW`. Le
