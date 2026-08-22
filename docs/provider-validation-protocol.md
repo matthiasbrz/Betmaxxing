@@ -1023,6 +1023,20 @@ ce qui permet à un second passage, après une faute de durabilité, d'établir 
 l'état courant et de répondre `DURABLE` plutôt que « rien à faire » — et de produire un
 rapport cohérent et idempotent.
 
+**`UNCERTAIN` a donc deux formes, à lire avec `resolved_intents` (D-081).**
+
+| Forme | `resolved_intents` | Ce qui s'est passé |
+| --- | --- | --- |
+| avec suppression | non nul | un `unlink` a réussi, le `fsync` qui le rend durable a échoué |
+| sans aucune suppression | `0` | rien n'a été retiré ; c'est le `fsync` destiné à établir durablement l'état courant qui a échoué |
+
+`resolved_intents` est le seul champ qui sépare les deux, et il suffit. Dans les **deux**
+cas : erreur typée, code de sortie non nul, `EVIDENCE_CONFLICT`, `eligible = false`, porte
+fermée, et **une nouvelle exécution est nécessaire** pour établir durablement l'état. Un
+rapport qui répondrait `DURABLE` après un `fsync` d'établissement en échec affirmerait une
+durabilité qu'il n'a pas établie — la faute même que cette section interdit. Un test le
+tient : supprimer la synchronisation d'établissement le fait passer au rouge.
+
 ## 9. Écriture et audit des reçus : un descripteur, pas un chemin
 
 **Frontière du répertoire.** Le répertoire de reçus est ouvert **une fois**, composant

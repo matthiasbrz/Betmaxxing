@@ -2231,3 +2231,60 @@ d'appariement, ni la lignée de versions, ni un critère, un seuil ou un tarif, 
 
 **Ce que cette décision n'autorise pas.** Aucun provisionnement de secret, aucun `plan`,
 `discover`, `core` ni `additional`, aucun appel fournisseur, aucun crédit, aucune promotion.
+
+### D-081 — Ce qui n'est pas gardé par un test n'est pas acquis
+
+**Contexte.** Le réaudit indépendant 03C-2A quinquies, en lecture seule sur `9462f98`, a
+confirmé la règle de véracité de D-080 sur trente-deux confrontations rapport ↔ répertoire,
+sans une divergence. Il a néanmoins relevé un P2 et deux P3, tous de la même famille : un
+comportement correct que **rien ne retient**, et deux énoncés documentaires plus larges que
+ce que la suite établit.
+
+**La synchronisation d'établissement n'était gardée par rien.** D-080 exige qu'une exécution
+complète synchronise le répertoire même lorsqu'elle ne retire aucun intent, afin que l'état
+courant soit établi durablement. Le code le faisait. Une mutation locale — supprimer ce seul
+`directory.fsync()` — laissait pourtant les cent vingt-trois tests du fichier au vert, alors
+qu'elle change la sortie observable : sur un `fsync` en échec avec zéro intent, l'arbre livré
+répond `exit 1 · UNCERTAIN · EVIDENCE_CONFLICT`, le mutant répond `exit 0 · DURABLE ·
+INSUFFICIENT_EVIDENCE`. Le mutant affirme donc une durabilité qu'il n'a pas établie : très
+exactement la faute que D-080 venait d'interdire, réintroduite sans qu'aucune suite ne
+bronche. C'est la forme récurrente que ce dépôt ferme depuis plusieurs tranches — un
+comportement écrit dans un document et non retenu par un test.
+
+**`UNCERTAIN` était défini plus étroitement qu'il ne survient.** Le runbook affirmait qu'il
+« signifie que l'`unlink` d'un intent a réussi ». Un cas atteignable le dément : frontière
+disponible, secret valide, zéro intent, `fsync` d'établissement en échec — `UNCERTAIN` avec
+`resolved_intents = 0` et aucun `unlink`.
+
+**La garde des champs publiés était unidirectionnelle.** Un seul test comparait la sortie au
+runbook, dans un seul sens : tout champ émis devait figurer au runbook, mais rien
+n'obligeait un champ documenté à être émis. `boundary_reason` n'était asserté nulle part.
+
+**Décision.**
+
+- La synchronisation d'établissement est **gardée par un test discriminant** : frontière
+  `AVAILABLE`, secret valide, zéro intent, `fsync` en échec, et le rapport attendu
+  `0 / 0 · ESTABLISHED · UNCERTAIN · EVIDENCE_CONFLICT · eligible = false`, code de sortie
+  non nul. Le supprimer du code fait tomber ce test, et lui seul suffit ;
+- `UNCERTAIN` est publié avec ses **deux formes** — après un `unlink` réussi dont le `fsync`
+  échoue, et sans aucun `unlink` lorsque le `fsync` d'établissement échoue. `resolved_intents`
+  distingue les deux. Dans les deux cas la porte reste fermée et une nouvelle exécution est
+  nécessaire ;
+- les **dix champs publiés** sont un ensemble normatif, énoncé une fois dans le runbook sous
+  une balise stable et comparé à la sortie réelle **dans les deux sens** : ensemble émis =
+  ensemble documenté. Un refus ajoute `status` et `detail`, et rien d'autre ;
+- le harnais `tests/helpers_receipt_boundary.py::audited` **supprime son répertoire jetable**
+  dans un `finally` — après succès, après exception, après audit refusé. Il créait jusqu'ici
+  un répertoire par appel avec `tempfile.mkdtemp` sans jamais le retirer ; le réaudit en a
+  compté 143 182 dans la zone temporaire, chacun portant une clé de signature synthétique et
+  un corpus synthétique, soit environ 2,2 Go accumulés sans borne. Seul le chemin créé par
+  l'appel est supprimé, et le résultat d'audit rendu n'est pas touché.
+
+**Ce que cette décision ne change pas.** Aucune ligne de comportement de production :
+`activation.py` et `receipt_store.py` sont inchangés. Ni l'authenticité HMAC, ni les règles
+d'appariement, ni la lignée de versions, ni un critère, un seuil ou un tarif, ni les budgets
+6 / 10 / 16, ni le protocole **7**, le schéma **4** ou l'instant d'effet
+`2026-08-11T14:20:00+00:00`, ni le plafond `CRITERIA_MET_AWAITING_HUMAN_REVIEW`.
+
+**Ce que cette décision n'autorise pas.** Aucun provisionnement de secret, aucun `plan`,
+`discover`, `core` ni `additional`, aucun appel fournisseur, aucun crédit, aucune promotion.

@@ -28,6 +28,7 @@ import os
 import re
 import socket
 import stat
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1266,3 +1267,358 @@ class TestTheDocumentsPublishTheTruthRule:
         text = self._read("docs/provider-activation.md")
         for field in payload_of(reconcile("--json")):
             assert field in text, field
+
+
+# ---------------------------------------------------------------------------
+# §sexies — the behaviours a mutation would otherwise carry away silently
+# ---------------------------------------------------------------------------
+#: Exactly what a successful `receipts reconcile --json` publishes. A refusal adds
+#: `status` and `detail`, and nothing else. The runbook carries the same list between
+#: two stable markers, and the guards below compare the two sets **in both directions**.
+PUBLISHED_FIELDS = frozenset(
+    {
+        "boundary_state",
+        "boundary_reason",
+        "verified_receipts_considered",
+        "unverifiable_receipts",
+        "resolved_intents",
+        "remaining_intents",
+        "intent_counts_state",
+        "intent_resolution_durability",
+        "qualification_state",
+        "eligible_for_human_promotion_review",
+    }
+)
+
+REFUSAL_EXTRA_FIELDS = frozenset({"status", "detail"})
+
+RUNBOOK_FIELD_MARKERS = (
+    "<!-- champs-publiés-reconcile:début -->",
+    "<!-- champs-publiés-reconcile:fin -->",
+)
+
+
+def documented_fields(root: Path) -> set[str]:
+    """The field list the runbook declares, read from between its two markers."""
+    text = (root / "docs/provider-activation.md").read_text(encoding="utf-8")
+    opening, closing = RUNBOOK_FIELD_MARKERS
+    assert opening in text and closing in text, "les balises de la liste ont disparu"
+    block = text.split(opening, 1)[1].split(closing, 1)[0]
+    return {line.strip() for line in block.splitlines() if line.strip() and "```" not in line}
+
+
+class TestTheEstablishingSyncIsGuarded:
+    """Red if the establishing ``fsync`` is dropped — and nothing else in this file is.
+
+    D-080 requires a completed run to synchronise the directory *even when it removes
+    nothing*, so that a replay after a durability fault establishes the current state
+    instead of shrugging. The code did that, and deleting the single ``directory.fsync()``
+    left all 123 tests of this file green while changing the observable answer from
+    ``exit 1 · UNCERTAIN`` to ``exit 0 · DURABLE`` — a report claiming a durability it
+    never established, which is the exact fault D-080 forbids. This class is the guard.
+    """
+
+    @staticmethod
+    def _break_fsync(monkeypatch: pytest.MonkeyPatch) -> None:
+        def faulty_fsync(fd: int) -> None:
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+        monkeypatch.setattr(os, "fsync", faulty_fsync)
+
+    def test_a_failed_establishing_sync_is_uncertain_without_any_removal(
+        self, receipts: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No intent, so the only ``fsync`` of the whole run is the establishing one."""
+        assert list(receipts.glob(f"*{store.INTENT_SUFFIX}")) == []
+        self._break_fsync(monkeypatch)
+        result = reconcile("--json")
+        document = payload_of(result)
+        assert result.exit_code != 0, result.stdout
+        assert document["resolved_intents"] == 0
+        assert document["remaining_intents"] == 0
+        assert document["intent_counts_state"] == act.INTENT_COUNTS_ESTABLISHED
+        assert document["intent_resolution_durability"] == act.DURABILITY_UNCERTAIN
+        assert document["qualification_state"] == "EVIDENCE_CONFLICT"
+        assert document["eligible_for_human_promotion_review"] is False
+        # Nothing was removed and nothing was created: only the sync failed.
+        assert list(receipts.glob(f"*{store.INTENT_SUFFIX}")) == []
+
+    def test_the_human_rendering_says_the_state_could_not_be_made_durable(
+        self, receipts: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """And it must not borrow the sentence written for an observed removal."""
+        self._break_fsync(monkeypatch)
+        text = reconcile().stdout
+        assert f"Durabilité           : {act.DURABILITY_UNCERTAIN}" in text
+        assert "L'état courant n'a pas pu être rendu durable" in text
+        assert "La suppression a été observée" not in text
+        assert "Un intent restant bloque la porte" not in text
+        assert not ANSI.search(text)
+
+    def test_the_two_forms_of_uncertain_differ_only_by_the_resolution_count(
+        self, receipts: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both forms are `UNCERTAIN`; `resolved_intents` is what separates them."""
+        # A toggle rather than `monkeypatch.undo()`: undoing would also revert the
+        # fixture's own environment setup, and `publish_intent` needs a working `fsync`.
+        broken = {"on": True}
+        real_fsync = os.fsync
+
+        def faulty_fsync(fd: int) -> None:
+            if broken["on"]:
+                raise OSError(errno.EIO, os.strerror(errno.EIO))
+            real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", faulty_fsync)
+        without = payload_of(reconcile("--json"))
+
+        broken["on"] = False
+        act.publish_intent(attempt())
+        publish(receipts, receipt_of())
+        broken["on"] = True
+        with_removal = payload_of(reconcile("--json"))
+
+        assert without["intent_resolution_durability"] == act.DURABILITY_UNCERTAIN
+        assert with_removal["intent_resolution_durability"] == act.DURABILITY_UNCERTAIN
+        assert without["resolved_intents"] == 0
+        assert with_removal["resolved_intents"] == 1
+        # And the one that removed something really did remove it.
+        assert not (receipts / f"{ATTEMPT}{store.INTENT_SUFFIX}").exists()
+
+    def test_a_clean_run_that_removes_nothing_still_reports_durable(self, receipts: Path) -> None:
+        """The other half of the same rule: the sync happens, so the state is settled."""
+        document = payload_of(reconcile("--json"))
+        assert document["resolved_intents"] == 0
+        assert document["intent_resolution_durability"] == act.DURABILITY_DURABLE
+
+
+class TestThePublishedFieldsAreExactlyTheDocumentedOnes:
+    """A bidirectional guard: emitted set == documented set, no field on either side alone.
+
+    The previous guard ran one way — every emitted field had to appear in the runbook —
+    so a field could be dropped from the report and the runbook would keep advertising
+    it, unguarded. ``boundary_reason`` was in exactly that position: asserted nowhere.
+    """
+
+    ROOT = Path(act.__file__).resolve().parents[4]
+
+    def test_a_successful_run_emits_exactly_the_normative_set(self, receipts: Path) -> None:
+        assert set(payload_of(reconcile("--json"))) == set(PUBLISHED_FIELDS)
+
+    def test_a_refusal_emits_the_normative_set_plus_status_and_detail(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(act.RECEIPT_DIR_VARIABLE, str(tmp_path / "nowhere"))
+        monkeypatch.delenv(act.SECRET_VARIABLE, raising=False)
+        result = reconcile("--json")
+        assert result.exit_code != 0, result.stdout
+        assert set(payload_of(result)) == set(PUBLISHED_FIELDS | REFUSAL_EXTRA_FIELDS)
+
+    def test_the_runbook_declares_exactly_the_normative_set(self) -> None:
+        assert documented_fields(self.ROOT) == set(PUBLISHED_FIELDS)
+
+    def test_every_emitted_field_is_documented(self, receipts: Path) -> None:
+        assert set(payload_of(reconcile("--json"))) <= documented_fields(self.ROOT)
+
+    def test_every_documented_field_is_emitted(self, receipts: Path) -> None:
+        """The direction that was missing. Dropping `boundary_reason` fails here."""
+        assert documented_fields(self.ROOT) <= set(payload_of(reconcile("--json")))
+
+    @pytest.mark.parametrize("field", sorted(PUBLISHED_FIELDS))
+    def test_each_field_is_published_by_both_renderings(self, receipts: Path, field: str) -> None:
+        document = payload_of(reconcile("--json"))
+        assert field in document
+        # Every field's *value* reaches the human rendering too, under its own label or
+        # inside one — `boundary_reason` is the empty string on a healthy boundary, so
+        # only the non-empty values are checked for presence.
+        value = document[field]
+        if isinstance(value, str) and value:
+            assert value in reconcile().stdout, field
+
+
+class TestTheThrowawayDirectoryIsThrownAway:
+    """`helpers_receipt_boundary.audited` used to leak one directory per call.
+
+    Each leak held a synthetic signing key and a synthetic corpus; the quinquies
+    re-audit counted 143 182 of them, about 2.2 GB, accumulated by the five qualification
+    suites over the life of the runner. The fix is a `finally`; these tests are what
+    keeps it there.
+    """
+
+    @staticmethod
+    def _corpus() -> list[dict[str, Any]]:
+        return [receipt_of()]
+
+    def test_the_directory_is_removed_after_a_successful_audit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import tempfile
+
+        from helpers_receipt_boundary import audited
+
+        seen: list[Path] = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def spy(*a: Any, **k: Any) -> str:
+            made = real_mkdtemp(*a, **k)
+            seen.append(Path(made))
+            return made
+
+        monkeypatch.setattr(tempfile, "mkdtemp", spy)
+        result = audited(self._corpus(), secret=LOCAL)
+        assert seen, "aucun répertoire jetable n'a été créé"
+        assert not seen[-1].exists(), seen[-1]
+        # The result survives its directory: everything was read before the removal.
+        assert len(result.batch) == 1
+
+    def test_the_directory_is_removed_when_the_audit_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import tempfile
+
+        from helpers_receipt_boundary import audited
+
+        seen: list[Path] = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def spy(*a: Any, **k: Any) -> str:
+            made = real_mkdtemp(*a, **k)
+            seen.append(Path(made))
+            return made
+
+        monkeypatch.setattr(tempfile, "mkdtemp", spy)
+
+        def boom() -> Any:
+            raise RuntimeError("audit refusé")
+
+        monkeypatch.setattr(act, "audit_receipts", boom)
+        with pytest.raises(RuntimeError):
+            audited(self._corpus(), secret=LOCAL)
+        assert seen, "aucun répertoire jetable n'a été créé"
+        assert not seen[-1].exists(), seen[-1]
+
+    def test_the_directory_is_removed_when_writing_the_corpus_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The `finally` must cover the write, not only the audit."""
+        import tempfile
+
+        import helpers_receipt_boundary as helper
+
+        seen: list[Path] = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def spy(*a: Any, **k: Any) -> str:
+            made = real_mkdtemp(*a, **k)
+            seen.append(Path(made))
+            return made
+
+        monkeypatch.setattr(tempfile, "mkdtemp", spy)
+
+        def boom(*a: Any, **k: Any) -> Any:
+            raise RuntimeError("écriture impossible")
+
+        monkeypatch.setattr(helper, "write_receipt_files", boom)
+        with pytest.raises(RuntimeError):
+            helper.audited(self._corpus(), secret=LOCAL)
+        assert seen, "aucun répertoire jetable n'a été créé"
+        assert not seen[-1].exists(), seen[-1]
+
+    def test_a_series_of_calls_leaves_nothing_behind(self) -> None:
+        """Measured the way the re-audit measured it: count, bytes, keys."""
+        from helpers_receipt_boundary import audited
+
+        temporary = Path(tempfile.gettempdir())
+
+        def leaked() -> list[Path]:
+            return sorted(temporary.glob("audited-*"))
+
+        before = set(leaked())
+        for _ in range(8):
+            audited(self._corpus(), secret=LOCAL)
+        after = [path for path in leaked() if path not in before]
+        assert after == [], after
+        assert sum(sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) for p in after) == 0
+        assert [p for p in after if (p / act.SECRET_FILENAME).exists()] == []
+
+    def test_the_environment_variable_is_restored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Cleanup must not disturb what the caller had configured."""
+        from helpers_receipt_boundary import audited
+
+        monkeypatch.setenv(act.RECEIPT_DIR_VARIABLE, "/nowhere/at/all")
+        audited(self._corpus(), secret=LOCAL)
+        assert os.environ[act.RECEIPT_DIR_VARIABLE] == "/nowhere/at/all"
+
+    def test_no_path_outside_the_created_directory_is_removed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A neighbour of the throwaway directory must survive it."""
+        import tempfile
+
+        from helpers_receipt_boundary import audited
+
+        neighbour = tmp_path / "neighbour"
+        neighbour.mkdir()
+        (neighbour / "keep.txt").write_text("keep", encoding="utf-8")
+        real_mkdtemp = tempfile.mkdtemp
+        seen: list[Path] = []
+
+        def spy(*a: Any, **k: Any) -> str:
+            made = real_mkdtemp(*a, **k)
+            seen.append(Path(made))
+            return made
+
+        monkeypatch.setattr(tempfile, "mkdtemp", spy)
+        audited(self._corpus(), secret=LOCAL)
+        assert not seen[-1].exists()
+        assert (neighbour / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
+class TestTheDocumentsPublishBothFormsOfUncertain:
+    ROOT = Path(act.__file__).resolve().parents[4]
+
+    def _read(self, relative: str) -> str:
+        return " ".join((self.ROOT / relative).read_text(encoding="utf-8").split())
+
+    @pytest.mark.parametrize(
+        "relative",
+        [
+            "docs/provider-validation-protocol.md",
+            "docs/provider-activation.md",
+            "docs/decisions.md",
+        ],
+    )
+    def test_every_document_names_the_decision(self, relative: str) -> None:
+        assert "D-081" in self._read(relative)
+
+    @pytest.mark.parametrize(
+        "relative",
+        ["docs/provider-validation-protocol.md", "docs/provider-activation.md"],
+    )
+    def test_both_documents_publish_the_two_forms(self, relative: str) -> None:
+        text = self._read(relative)
+        assert "avec suppression" in text
+        assert "sans aucune suppression" in text
+        assert "resolved_intents" in text
+
+    @pytest.mark.parametrize(
+        "relative",
+        ["docs/provider-validation-protocol.md", "docs/provider-activation.md"],
+    )
+    def test_both_documents_say_a_new_run_is_needed(self, relative: str) -> None:
+        assert "une nouvelle exécution est nécessaire" in self._read(relative)
+
+    def test_the_protocol_states_the_form_without_any_unlink(self) -> None:
+        text = self._read("docs/provider-validation-protocol.md")
+        assert "rien n'a été retiré" in text
+        assert "fsync` destiné à établir durablement l'état courant qui a échoué" in text
+
+    def test_the_runbook_no_longer_defines_uncertain_by_the_unlink_alone(self) -> None:
+        """The exact sentence the quinquies re-audit falsified must be gone."""
+        text = self._read("docs/provider-activation.md")
+        assert "Elle signifie que l'`unlink` d'un intent a réussi" not in text
+
+    def test_the_register_records_the_harness_leak_and_its_size(self) -> None:
+        text = self._read("docs/decisions.md")
+        assert "143 182" in text
+        assert "helpers_receipt_boundary" in text
