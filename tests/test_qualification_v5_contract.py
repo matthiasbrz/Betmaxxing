@@ -65,6 +65,12 @@ ABSENT = object()
 # `audit_receipts` verifies them against.
 from helpers_activation import FAKE_RECEIPT_SECRET as _SIGNING  # noqa: E402
 
+#: Every test in this module reads the receipt directory through
+#: ``activation.receipt_dir()``. Without this, an unrelated
+#: ``.activation-receipts`` in the working directory would be picked up and could
+#: close the qualification gate for the whole module — see the fixture's docstring.
+pytestmark = pytest.mark.usefixtures("isolated_receipt_directory")
+
 
 # ---------------------------------------------------------------------------
 # v6 provenance shim — see D-076

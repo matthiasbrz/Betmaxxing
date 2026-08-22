@@ -210,12 +210,58 @@ def pg_settings(postgres_url: str, request: pytest.FixtureRequest) -> Iterator[S
 # ---------------------------------------------------------------------------
 # Activation harness
 # ---------------------------------------------------------------------------
+@pytest.fixture
+def isolated_receipt_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the receipt directory at a clean per-test path, never at the cwd.
+
+    ``DEFAULT_RECEIPT_DIR`` is ``.activation-receipts``, a **relative** path, so
+    ``activation.receipt_dir()`` resolves it against the process's working directory
+    whenever ``BETMAXXING_ACTIVATION_RECEIPTS`` is unset. That is the intended
+    behaviour for an operator running the CLI inside a project, and this fixture does
+    not change it — production keeps the relative default, and the test that pins that
+    default deliberately declines this fixture.
+
+    What it changes is the suites. ``build_activation_state`` calls
+    ``unresolved_intents()``, and a single unresolved intent closes the qualification
+    gate; so one stray ``.activation-receipts/<id>.intent`` left in a checkout — by a
+    manual CLI run, a demo, an interrupted probe — silently turned green suites red,
+    with the failure surfacing far from its cause. The septies re-audit reproduced
+    exactly that: five tests across two suites, red with a foreign intent present and
+    green without it.
+
+    Deliberately **not** ``autouse``. A blanket fixture would also neuter the test
+    that verifies the relative default, and a guard nobody can opt out of is a guard
+    nobody can test. Suites opt in with ``pytest.mark.usefixtures``.
+
+    Function-scoped, so every test gets its own directory and no ordering can leak
+    state. The path is *not* created: an absent directory is what a clean installation
+    looks like, and several suites assert on that boundary state. ``monkeypatch``
+    restores the previous value exactly, including after a failure — teardown runs
+    either way.
+    """
+    directory = tmp_path / "isolated-activation-receipts"
+    monkeypatch.setenv("BETMAXXING_ACTIVATION_RECEIPTS", str(directory))
+    return directory
+
+
 #: These three live here rather than in a test module because four suites need
 #: them, and pytest only discovers fixtures from conftest. The payloads and
 #: argument builders they go with are in ``tests/helpers_activation.py``.
 @pytest.fixture
-def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, db_settings: Settings) -> Path:
-    """A throwaway receipt directory and a database, with no key configured."""
+def workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    db_settings: Settings,
+    isolated_receipt_directory: Path,
+) -> Path:
+    """A throwaway receipt directory and a database, with no key configured.
+
+    Depends on :func:`isolated_receipt_directory` so that the ordering is fixed
+    rather than incidental: isolation runs first, this fixture then overrides the
+    variable with its own path. A module applying both therefore gets ``workspace``'s
+    directory deterministically, instead of whichever fixture pytest happened to
+    instantiate last.
+    """
     from helpers_activation import FAKE_RECEIPT_SECRET
 
     monkeypatch.setenv("BETMAXXING_MODE", "paper")

@@ -34,6 +34,12 @@ from betmaxxing.providers.the_odds_api import activation as act
 from betmaxxing.providers.the_odds_api import qualification as qual
 from helpers_activation import FAKE_RECEIPT_SECRET
 
+#: Every test in this module reads the receipt directory through
+#: ``activation.receipt_dir()``. Without this, an unrelated
+#: ``.activation-receipts`` in the working directory would be picked up and could
+#: close the qualification gate for the whole module — see the fixture's docstring.
+pytestmark = pytest.mark.usefixtures("isolated_receipt_directory")
+
 FOOTBALL = "soccer_france_ligue_one"
 FOOTBALL_2 = "soccer_epl"
 TENNIS = "tennis_atp_paris"

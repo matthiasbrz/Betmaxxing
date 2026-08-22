@@ -25,7 +25,7 @@ import pytest
 from betmaxxing.providers.the_odds_api import activation as act
 from helpers_activation import FAKE_RECEIPT_SECRET
 
-pytestmark = pytest.mark.usefixtures("workspace")
+pytestmark = pytest.mark.usefixtures("isolated_receipt_directory", "workspace")
 
 
 def _signed(**fields: Any) -> dict[str, Any]:

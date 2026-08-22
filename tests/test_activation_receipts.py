@@ -62,6 +62,12 @@ from helpers_activation import (
     tamper,
 )
 
+#: Every test in this module reads the receipt directory through
+#: ``activation.receipt_dir()``. Without this, an unrelated
+#: ``.activation-receipts`` in the working directory would be picked up and could
+#: close the qualification gate for the whole module — see the fixture's docstring.
+pytestmark = pytest.mark.usefixtures("isolated_receipt_directory")
+
 FREE_HEADERS = {"x-requests-last": "0", "x-requests-remaining": "480"}
 PAID_HEADERS = {"x-requests-last": "1", "x-requests-remaining": "479"}
 
