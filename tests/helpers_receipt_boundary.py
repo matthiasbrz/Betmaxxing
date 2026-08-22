@@ -117,18 +117,33 @@ def audited(receipts: Any, unverifiable: int = 0, *, secret: str) -> Any:
 
     No fixture is available at this depth, so the receipt-directory variable is set and
     restored around the single call. Nothing else in the environment is touched.
+
+    **Throwaway means thrown away.** The directory used to be created with
+    ``tempfile.mkdtemp`` and never removed, so every run of the five qualification suites
+    left one directory per call in the system temporary area — each holding a synthetic
+    signing key and a synthetic corpus, accumulating without bound on a long-lived
+    runner. The quinquies re-audit counted 143 182 of them. Creation, audit and removal
+    are now one cycle: the ``finally`` runs after a success, after an exception raised
+    while writing the corpus, and after an audit the boundary refuses. Only the path
+    this call created is ever removed, and the audit result it returns is untouched —
+    every receipt it carries was read into memory before the directory went away.
     """
     import os
+    import shutil
     import tempfile
 
     directory = Path(tempfile.mkdtemp(prefix="audited-"))
-    write_receipt_files(directory, list(receipts), secret=secret, unreadable=unverifiable)
     previous = os.environ.get(act.RECEIPT_DIR_VARIABLE)
-    os.environ[act.RECEIPT_DIR_VARIABLE] = str(directory)
     try:
+        write_receipt_files(directory, list(receipts), secret=secret, unreadable=unverifiable)
+        os.environ[act.RECEIPT_DIR_VARIABLE] = str(directory)
         return act.audit_receipts()
     finally:
         if previous is None:
             os.environ.pop(act.RECEIPT_DIR_VARIABLE, None)
         else:
             os.environ[act.RECEIPT_DIR_VARIABLE] = previous
+        # `ignore_errors` covers the one benign case: a test that removed the directory
+        # itself. It cannot widen what is removed — `directory` is the exact path this
+        # call created, and nothing else is ever passed here.
+        shutil.rmtree(directory, ignore_errors=True)

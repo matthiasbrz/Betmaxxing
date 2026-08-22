@@ -1007,25 +1007,357 @@ def reconcile_intents() -> int:
     installation's secret; and it must satisfy :func:`_matches_intent`, so it is the
     outcome of *that* attempt and not merely a file bearing the same identifier.
     """
-    audit = audit_receipts()
-    if not audit.readable:
+    try:
+        resolved = reconcile_intents_report()["resolved_intents"]
+    except (Refused, receipt_store.StoreRefused):
         return 0
+    # A completed report always carries an integer here; the guard is for the callers
+    # of this legacy shape, which have no way to express « not established ».
+    return int(resolved or 0)
+
+
+#: What ``intent_counts_state`` may say. A count reaches a report only once it has
+#: been taken — there is no fourth value, and in particular no zero standing in for
+#: « je n'ai pas regardé ».
+INTENT_COUNTS_ESTABLISHED = "ESTABLISHED"
+INTENT_COUNTS_PARTIAL = "PARTIAL"
+INTENT_COUNTS_UNESTABLISHED = "UNESTABLISHED"
+
+#: What ``intent_resolution_durability`` may say, and it is orthogonal to the counts:
+#: a run can establish both counts exactly and still not know that its removals
+#: survive a crash.
+DURABILITY_NOT_ATTEMPTED = "NOT_ATTEMPTED"
+DURABILITY_DURABLE = "DURABLE"
+DURABILITY_UNCERTAIN = "UNCERTAIN"
+
+#: How a count that was never taken renders for a human. ``null`` in JSON, this in
+#: prose, and never ``0`` in either.
+UNESTABLISHED_COUNT = "NON ÉTABLI"
+
+
+@dataclass(frozen=True, slots=True)
+class _Resolution:
+    """The outcome of a completed resolution phase."""
+
+    resolved: int
+    durability: str
+
+
+class _ResolutionInterrupted(Exception):
+    """A storage fault stopped the resolution phase, after zero or more removals.
+
+    It carries the counts the phase *did* establish, because the alternative — losing
+    them in the traceback and publishing the initialised zeros — is the defect this
+    whole path exists to avoid.
+    """
+
+    def __init__(self, message: str, *, resolved: int, durability: str) -> None:
+        super().__init__(message)
+        self.message = message
+        self.resolved = resolved
+        self.durability = durability
+
+
+def _resolve_matched_intents(
+    directory: receipt_store.SecureDirectory, audit: receipt_store.AuditResult
+) -> _Resolution:
+    """Drop every intent an admitted receipt of identical scope already accounts for.
+
+    Each removal goes through :func:`receipt_store.resolve_intent`, so the entry is
+    unlinked relative to the open descriptor and the directory is ``fsync``-ed: a
+    reconciliation that says it forgot an intent has forgotten it durably.
+
+    An ``unlink`` that fails is a durability failure, not a silent skip — the previous
+    version returned ``0`` for any :class:`~receipt_store.StoreRefused` and could not
+    tell « nothing matched » from « the disk refused ». Those are different answers and
+    an operator acts differently on each.
+    """
     resolved = 0
+    removed_any = False
+    for intent in receipt_store.unresolved_intents(directory):
+        if intent.get("state") == receipt_store.INTENT_INVALID_STATE:
+            continue
+        identifier = str(intent.get("attempt_id") or "")
+        if not identifier:
+            continue
+        if not any(_matches_intent(intent, receipt) for receipt in audit.batch):
+            continue
+        try:
+            outcome = receipt_store.resolve_intent_reporting(directory, identifier)
+        except FileNotFoundError:
+            # Another reconciliation won the race and removed the same entry. The
+            # receipt remains the single record of the cost, so this is not an error
+            # and it is not a second resolution either.
+            continue
+        except OSError as exc:
+            raise _ResolutionInterrupted(
+                "Un intent rapproché n'a pas pu être retiré du répertoire de reçus ; "
+                f"le rapprochement s'arrête et rien d'autre n'est retiré ({exc.errno}).",
+                resolved=resolved,
+                durability=(DURABILITY_DURABLE if removed_any else DURABILITY_NOT_ATTEMPTED),
+            ) from exc
+        if not outcome.removed:
+            continue
+        resolved += 1
+        removed_any = True
+        if not outcome.durable:
+            # The entry is gone from the current namespace. That is observed, so it is
+            # counted; what is *not* established is that the removal survives a crash.
+            # The phase stops here rather than unlinking more entries against a
+            # directory that has just refused to synchronise.
+            raise _ResolutionInterrupted(
+                "Un intent rapproché a été retiré du répertoire, mais la suppression "
+                "n'a pas pu être rendue durable ; l'état courant n'est pas établi "
+                "durablement et le rapprochement s'arrête.",
+                resolved=resolved,
+                durability=DURABILITY_UNCERTAIN,
+            )
+    # Synchronised even when nothing was removed. That is what lets a replay after an
+    # interrupted run answer ``DURABLE`` about the state it found, instead of merely
+    # « rien à faire » — the directory is the thing being established, not the delta.
+    try:
+        directory.fsync()
+    except (receipt_store.PersistenceFailed, OSError) as exc:
+        raise _ResolutionInterrupted(
+            "Le répertoire de reçus n'a pas pu être synchronisé ; l'état courant n'est "
+            "pas établi durablement.",
+            resolved=resolved,
+            durability=DURABILITY_UNCERTAIN,
+        ) from exc
+    return _Resolution(resolved=resolved, durability=DURABILITY_DURABLE)
+
+
+def _refuse_unreadable_intents(directory: receipt_store.SecureDirectory) -> None:
+    """Stop the reconciliation if the storage itself fails while reading an intent.
+
+    Two failures that look alike and are not. An object the boundary **declines** —
+    a symlink, a FIFO, a directory, undecodable bytes — raises
+    :class:`~receipt_store.StoreRefused`; those keep blocking the gate through
+    :func:`~receipt_store.unresolved_intents`, which reduces them to a category rather
+    than echoing what someone wrote, and that is the behaviour P2-E8 asked for. An
+    ``EIO`` or ``ENOSPC`` raised by the read itself is a **storage** fault: the disk is
+    not answering, so the count of remaining intents is not trustworthy. Reporting
+    « rien à rapprocher » from a directory that could not be read is the same category
+    of error as v6's ``except StoreRefused: return (), 0``.
+    """
+    for name in directory.names_ending(receipt_store.INTENT_SUFFIX):
+        try:
+            directory.read_text(name)
+        except receipt_store.StoreRefused:
+            # Refused, not broken. It stays on disk and it stays blocking.
+            continue
+        except OSError as exc:
+            raise receipt_store.PersistenceFailed(
+                "Un intent n'a pas pu être lu depuis le répertoire de reçus ; le "
+                "rapprochement s'arrête et le nombre d'intents restants n'est pas "
+                f"établi ({exc.errno}).",
+                published=False,
+            ) from exc
+
+
+def reconcile_intents_report() -> dict[str, Any]:
+    """Reconcile the intents, and report what an operator needs to decide next.
+
+    The whole operation happens inside **one** :class:`~receipt_store.SecureDirectory`,
+    opened once: the secret is loaded through it, the audit reads through it, the
+    intents are listed through it and the matched ones are unlinked through it. Nothing
+    here returns to ``directory / name`` after the open, and nothing here creates
+    anything — not the directory, not the secret. ``status`` and this command are the
+    two paths that must be safe to run on an installation that has never been used.
+
+    The secret is loaded with :func:`~receipt_store.installation_secret` rather than
+    ``ensure``: a recovery path that mints a key would make every receipt already
+    signed with the old one unverifiable, which is the opposite of recovering.
+    Loading it explicitly also turns « no usable key » into a refusal, where
+    :func:`~receipt_store.audit_directory` alone would have reported every receipt
+    unverifiable and resolved nothing — the same outcome for two different causes.
+
+    Raises :class:`Refused` carrying a partial document when the boundary, the secret
+    or the storage refuses, so the caller can publish the boundary state it did
+    establish instead of an empty error. *Partial* is meant literally: every count in
+    that document is either a number this run took, or ``None``. The initialised
+    document holds no zeros, because a zero that was never measured is a false
+    statement about the directory, and a report is not allowed to make one — the same
+    reasoning that gave an unreadable boundary its own state rather than letting it
+    answer « 0 reçu ».
+    """
+    document: dict[str, Any] = _reconcile_defaults()
+    audit: receipt_store.AuditResult | None = None
+    interruption: _ResolutionInterrupted | None = None
+    uncounted: Exception | None = None
     try:
         with receipt_directory() as directory:
-            for intent in receipt_store.unresolved_intents(directory):
-                if intent.get("state") == receipt_store.INTENT_INVALID_STATE:
-                    continue
-                identifier = str(intent.get("attempt_id") or "")
-                if not identifier:
-                    continue
-                if not any(_matches_intent(intent, receipt) for receipt in audit.batch):
-                    continue
-                if receipt_store.resolve_intent(directory, identifier):
-                    resolved += 1
-    except receipt_store.StoreRefused:
-        return 0
-    return resolved
+            document["boundary_state"] = str(receipt_store.BoundaryState.AVAILABLE)
+            document["boundary_reason"] = ""
+            # Loaded, never used to sign and never printed: this call exists so that a
+            # missing or malformed key stops the recovery instead of quietly making
+            # every receipt unverifiable.
+            receipt_store.installation_secret(directory, SECRET_FILENAME)
+            audit = receipt_store.audit_directory(
+                directory,
+                secret_name=SECRET_FILENAME,
+                signature_field=SIGNATURE_FIELD,
+                accepted_schema_versions=SUPPORTED_SCHEMA_VERSIONS,
+            )
+            document["verified_receipts_considered"] = len(audit.batch)
+            document["unverifiable_receipts"] = audit.unverifiable
+            _refuse_unreadable_intents(directory)
+            try:
+                outcome = _resolve_matched_intents(directory, audit)
+            except _ResolutionInterrupted as exc:
+                interruption = exc
+                document["resolved_intents"] = exc.resolved
+                document["intent_resolution_durability"] = exc.durability
+            else:
+                document["resolved_intents"] = outcome.resolved
+                document["intent_resolution_durability"] = outcome.durability
+            # Taken whether or not the phase completed. A measurement that succeeds is
+            # published even when another one failed: that is the whole difference
+            # between a partial report and an empty one.
+            try:
+                document["remaining_intents"] = len(receipt_store.unresolved_intents(directory))
+            except (receipt_store.StoreRefused, OSError) as exc:
+                uncounted = exc
+    except receipt_store.DirectoryAbsent as exc:
+        document["boundary_state"] = str(receipt_store.BoundaryState.ABSENT)
+        document["boundary_reason"] = "absent"
+        raise _reconcile_refused(
+            document,
+            "Le répertoire de reçus autorisé n'existe pas ; aucun intent n'est "
+            "inventorié, aucun compte n'est établi, et cette commande ne crée rien.",
+        ) from exc
+    except receipt_store.DirectoryUnsafe as exc:
+        document["boundary_state"] = str(receipt_store.BoundaryState.UNAVAILABLE)
+        document["boundary_reason"] = getattr(exc, "reason", "unreadable")
+        raise _reconcile_refused(
+            document,
+            "La frontière du répertoire de reçus n'a pas pu être franchie sans "
+            "ambiguïté ; aucun intent n'est retiré ni compté.",
+        ) from exc
+    except receipt_store.StoreRefused as exc:
+        raise _reconcile_refused(document, getattr(exc, "message", str(exc))) from exc
+    except OSError as exc:
+        # The last door. Reading the secret goes through `os.read` too, and neither
+        # `load_secret` nor `read_text` wraps a failing disk — so an `EACCES` there used
+        # to leave this command with a bare `PermissionError` and zero bytes on stdout,
+        # which is the defect P2-E3 and P2-E5 closed for the other verbs. Every storage
+        # fault of this operation now leaves as a typed refusal with a report.
+        raise _reconcile_refused(
+            document,
+            "Le répertoire de reçus n'a pas pu être lu ou modifié de façon fiable ; "
+            f"aucun intent n'est retiré sur la base d'une lecture incomplète ({exc.errno}).",
+        ) from exc
+
+    if interruption is not None:
+        raise _reconcile_refused(document, interruption.message) from interruption
+    if uncounted is not None:
+        raise _reconcile_refused(
+            document,
+            "Le nombre d'intents restants n'a pas pu être établi ; la porte reste "
+            "fermée et rien n'est conclu d'un inventaire incomplet.",
+        ) from uncounted
+
+    # Deferred, like every other use in this module: `qualification` imports *from*
+    # here, so a top-level import would be a cycle.
+    from .qualification import evaluate as evaluate_qualification
+
+    verdict = evaluate_qualification(audit, unresolved_intents=document["remaining_intents"])
+    document["qualification_state"] = verdict["qualification_state"]
+    document["eligible_for_human_promotion_review"] = verdict["eligible_for_human_promotion_review"]
+    return _settle_counts(document)
+
+
+def _settle_counts(document: dict[str, Any]) -> dict[str, Any]:
+    """Derive ``intent_counts_state`` from what was measured, never from intent.
+
+    Computed rather than assigned at each exit, so the published state cannot drift
+    from the published counts: the two answers come from the same values.
+    """
+    taken = (
+        document.get("resolved_intents") is not None,
+        document.get("remaining_intents") is not None,
+    )
+    document["intent_counts_state"] = (
+        INTENT_COUNTS_ESTABLISHED
+        if all(taken)
+        else INTENT_COUNTS_PARTIAL
+        if any(taken)
+        else INTENT_COUNTS_UNESTABLISHED
+    )
+    return document
+
+
+def _reconcile_refused(document: dict[str, Any], message: str) -> Refused:
+    """A refusal that carries everything this run did establish, and nothing more."""
+    return Refused(ActivationStatus.PREPARED_NOT_EXECUTED, message, _settle_counts(document))
+
+
+def qualification_state_unknown() -> str:
+    """The state to publish when the boundary never became readable.
+
+    Not ``INSUFFICIENT_EVIDENCE``: that is a conclusion about a corpus this command
+    was unable to read. An unreadable boundary establishes no count, so it concludes
+    nothing — the same reasoning that gave ``UNAVAILABLE`` its own boundary state.
+    """
+    return "EVIDENCE_CONFLICT"
+
+
+def _published_count(value: Any) -> str:
+    """A count as prose. ``None`` says so; it never borrows the appearance of zero."""
+    return UNESTABLISHED_COUNT if value is None else str(value)
+
+
+def reconcile_lines(document: dict[str, Any]) -> list[str]:
+    """The operator's rendering. Counts and categories only — never a path or a body.
+
+    Word for word the same facts as the JSON, including the absences: a ``null`` there
+    is ``NON ÉTABLI`` here, and the closing sentence is chosen by the state rather than
+    fixed, so the prose can no longer say « un intent restant bloque la porte » under a
+    line that reads « Intents restants : 0 ».
+    """
+    remaining = document["remaining_intents"]
+    durability = document["intent_resolution_durability"]
+    lines = [
+        "Rapprochement des intents — aucun réseau, aucun crédit, aucun secret créé.",
+        f"Frontière            : {document['boundary_state']}"
+        + (f" ({document['boundary_reason']})" if document["boundary_reason"] else ""),
+        f"Reçus vérifiés lus   : {_published_count(document['verified_receipts_considered'])}"
+        f" · invérifiables : {_published_count(document['unverifiable_receipts'])}",
+        f"Intents résolus      : {_published_count(document['resolved_intents'])}",
+        f"Intents restants     : {_published_count(remaining)}",
+        f"Comptage des intents : {document['intent_counts_state']}",
+        f"Durabilité           : {durability}",
+        f"Qualification        : {document['qualification_state']}"
+        f" · éligible revue humaine : {document['eligible_for_human_promotion_review']}",
+    ]
+    if durability == DURABILITY_UNCERTAIN:
+        lines.append(
+            (
+                "La suppression a été observée dans le répertoire, mais sa durabilité "
+                "n'est pas établie : "
+                if document["resolved_intents"]
+                else "L'état courant n'a pas pu être rendu durable : "
+            )
+            + "relancez le rapprochement pour établir durablement l'état du répertoire."
+        )
+    if remaining is None:
+        lines.append(
+            "Le nombre d'intents restants n'est pas établi : rien ici n'affirme qu'il "
+            "n'en reste aucun, et la porte reste fermée. Aucune suppression manuelle "
+            "n'est autorisée."
+        )
+    elif remaining:
+        lines.append(
+            "Un intent restant bloque la porte : il n'est retiré que par un reçu durable, "
+            "vérifié et de portée identique. Aucune suppression manuelle n'est autorisée."
+        )
+    else:
+        lines.append(
+            "Aucun intent ne reste en attente : un intent n'est retiré que par un reçu "
+            "durable, vérifié et de portée identique. Aucune suppression manuelle "
+            "n'est autorisée."
+        )
+    return lines
 
 
 def _signing_secret() -> str:
@@ -3117,6 +3449,74 @@ def receipts_quarantine(
             f"{name} est mis de côté sous {moved}. Ses octets sont conservés, il est hors "
             "de l'audit, et le nom d'origine est libre : rejouez l'étape."
         )
+
+
+@receipts_app.command("reconcile")
+def receipts_reconcile(
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Rapprocher les intents dont le reçu est déjà publié. Aucun réseau, 0 crédit.
+
+    La seule récupération autorisée après la fenêtre de crash : l'intent est écrit et
+    ``fsync``-é *avant* la requête, retiré une fois son reçu durablement publié, et le
+    processus peut mourir entre les deux. L'intent survit alors, la porte se ferme, et
+    jusqu'ici aucune commande n'exposait la résolution — `reconcile_intents` existait,
+    était documentée au §3.2 du protocole et testée, mais n'était joignable que depuis
+    Python. C'est le défaut que le registre tredecies avait consigné comme fermé pour la
+    quarantaine, un cran plus bas : une sortie de secours documentée et non exécutable.
+
+    Ce que cette commande ne fait pas, et qui est le point : elle ne supprime jamais un
+    intent que rien ne prouve. Un intent n'est retiré que par un reçu **durable**,
+    **vérifié par l'audit** contre le secret local, de **portée matérielle identique**
+    et de **même lignée** de versions. La quarantaine continue de refuser les `*.intent`
+    avec et sans ``--force``, et il n'existe aucune commande de suppression : retirer un
+    intent à la main rouvrirait la porte sans preuve, ce qui est exactement le contraire
+    d'une récupération.
+    """
+    try:
+        document = reconcile_intents_report()
+    except (Refused, receipt_store.StoreRefused) as exc:
+        partial = getattr(exc, "document", None) or {}
+        message = getattr(exc, "message", str(exc))
+        # The same merge feeds both renderings, so a refusal cannot publish a field in
+        # one and omit it in the other.
+        refused = _settle_counts({**_reconcile_defaults(), **partial})
+        if json_output:
+            typer.echo(
+                jsonlib.dumps(
+                    {**refused, "status": "REFUSED", "detail": message},
+                    indent=2,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            for line in reconcile_lines(refused):
+                typer.echo(line)
+            typer.echo(f"Refusé : {message}")
+        raise typer.Exit(1) from exc
+    _emit(document, reconcile_lines(document), as_json=json_output)
+
+
+def _reconcile_defaults() -> dict[str, Any]:
+    """Every field the rendering needs, so a partial refusal still renders.
+
+    Every count starts at ``None``, not at ``0``. A refusal that never reached the
+    directory has not counted zero intents — it has counted nothing, and those are
+    different reports for an operator deciding whether the crash window is closed.
+    """
+    return {
+        "boundary_state": str(receipt_store.BoundaryState.UNAVAILABLE),
+        "boundary_reason": "unreadable",
+        "verified_receipts_considered": None,
+        "unverifiable_receipts": None,
+        "resolved_intents": None,
+        "remaining_intents": None,
+        "intent_counts_state": INTENT_COUNTS_UNESTABLISHED,
+        "intent_resolution_durability": DURABILITY_NOT_ATTEMPTED,
+        "qualification_state": qualification_state_unknown(),
+        "eligible_for_human_promotion_review": False,
+    }
 
 
 def _iso_z(moment: datetime) -> str:

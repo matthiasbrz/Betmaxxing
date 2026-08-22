@@ -2109,3 +2109,182 @@ les affirmations absolues sont supprimées ou supersédées. P3-F5 : l'incident 
 **Ce que cette décision n'autorise pas.** Aucun appel fournisseur, aucune activation, aucune
 promotion d'adaptateur ou de modèle, aucun changement de critère, de seuil, de protocole, de
 schéma ou d'instant d'effet.
+
+### D-079 — La récupération d'un intent est une commande, et la campagne se paie en deux tranches
+
+**Contexte.** Le préflight statique 03C-2A, en lecture seule sur `269f339`, a relevé deux
+divergences qu'aucune suite ne pouvait attraper parce qu'aucune ne les décrivait.
+
+**La première est un manque d'exécutabilité.** `reconcile_intents` existait depuis la v7,
+était documentée au §3.2 du protocole comme la résolution comptable des intents, et était
+testée — mais aucune commande CLI ne l'appelait. Or l'intent est écrit et `fsync`-é avant la
+requête et retiré après publication durable du reçu : entre les deux, un arrêt laisse un
+intent que rien ne peut plus retirer proprement. La quarantaine refuse les `*.intent` avec et
+sans `--force`, à juste titre depuis D-077, et aucune commande de suppression n'existe. Il
+restait donc à l'opérateur soit d'éditer du Python, soit de supprimer le fichier à la main —
+et supprimer un intent à la main rouvre la porte sans preuve, ce que l'intent existe
+précisément pour empêcher. C'est le défaut que D-077 avait fermé un cran plus bas : « v5
+documentait une sortie de secours sans la rendre exécutable ».
+
+`receipts reconcile [--json]` ferme cette voie. Aucune socket, aucune clé fournisseur lue,
+le secret de vérification chargé **sans être créé** — `installation_secret`, pas `ensure` :
+une récupération qui forgerait une clé rendrait invérifiable tout reçu déjà signé avec
+l'ancienne, ce qui est l'inverse de récupérer. Une seule ouverture de `SecureDirectory` pour
+toute l'opération : le secret, l'audit, la liste des intents et les suppressions passent par
+le même descripteur. Un intent n'est retiré que sur un reçu durable, vérifié par le HMAC, de
+portée matérielle identique et de même lignée de versions au sens de D-077. La commande est
+idempotente, laisse intact tout intent sans preuve, et publie des comptes et des catégories —
+jamais un chemin, un corps d'intent ou une valeur de secret.
+
+**Fermer, et fermer proprement.** Deux échecs qui se ressemblent sont désormais distingués.
+Un objet que la frontière **refuse** — lien symbolique, FIFO, répertoire, octets non
+décodables — reste bloquant, réduit à une catégorie par `unresolved_intents`, et n'interrompt
+pas le rapprochement des autres : sinon un fichier illisible interdirait la récupération de
+toutes les autres tentatives. Une `OSError` du **stockage** — `EIO`, `ENOSPC`, `EACCES` en
+lecture, à la suppression ou au `fsync` — arrête tout de façon typée : le nombre d'intents
+restants n'est alors pas établi, et rapporter « rien à rapprocher » depuis un répertoire
+qu'on n'a pas pu lire est la même erreur de catégorie que le `except StoreRefused: return
+(), 0` de la v6. Au passage, une `OSError` brute pouvait remonter de la lecture du secret et
+sortir sans un octet sur stdout — le défaut fermé pour les autres verbes par D-077 ; toute
+faute de stockage de cette opération est maintenant un refus métier avec rapport.
+
+**La seconde divergence est arithmétique.** Les seuils préenregistrés portent sur des
+**événements** — trois pour chaque `CORE_MAPPING_*`, sur deux compétitions et deux jours UTC
+distincts ; deux pour chaque `ADDITIONAL_MAPPING_FOOTBALL_*` — et `LOCAL_BOUNDS` borne
+chaque invocation payante à **un** événement. Trois événements exigent donc trois
+invocations. La campagne préenregistrée le dit déjà : `CAMPAIGN_INVOCATIONS` donne douze
+invocations, seize requêtes dont huit payantes, et **seize crédits**.
+
+`plan --max-credits 6` chiffre autre chose : `TOTAL_MAX_CREDITS`, la somme de
+`STEP_CEILINGS`, soit une séquence locale sur **un seul événement**. Lire ce plafond comme
+le budget de la campagne conduit à une conclusion fausse — six crédits dépensés en un `core`
+et un `additional` ne satisfont **aucun** critère. Le protocole publie désormais la
+distinction et le fractionnement : tranche 1, six `core`, six crédits, au mieux trois
+critères sur huit ; tranche 2, deux `additional`, dix crédits, les cinq restants, engagée
+seulement après validation de la première et jamais par déduction. Le total contractuel
+reste seize : fractionner n'en réduit pas le coût.
+
+**Ce que cette décision ne change pas.** Ni critère, ni seuil, ni tarif, ni taxonomie de
+coût, ni déduplication, ni équation de population. Protocole **7**, schéma de reçu **4**,
+preuve adaptateur **1**, instant d'effet `2026-08-11T14:20:00+00:00` : inchangés. Aucun
+résultat intermédiaire n'est une qualification — `adapter_state` reste
+`IMPLEMENTED_UNVERIFIED` et le plafond machine demeure
+`CRITERIA_MET_AWAITING_HUMAN_REVIEW`.
+
+**Ce que cette décision n'autorise pas.** Aucun provisionnement de secret, aucun `plan`,
+`discover`, `core` ni `additional`, aucun appel fournisseur, aucun crédit, aucune promotion.
+
+### D-080 — Un compte n'est publié qu'une fois pris
+
+**Contexte.** Le réaudit indépendant 03C-2A ter, en lecture seule sur `69c69b2`, a mesuré
+deux constats P2 sur la commande que D-079 venait d'ouvrir. Ils portent le même défaut.
+
+**Le rapport publiait des zéros qu'il n'avait pas mesurés.** `reconcile_intents_report`
+construisait son document avec `resolved_intents = 0` et `remaining_intents = 0`, et chaque
+branche `except` levait avec ce document tel quel. Une faute de lecture avant l'inventaire,
+un secret absent, une frontière refusée : dans les trois cas la commande imprimait
+« Intents restants : 0 » à propos d'un répertoire qu'elle n'avait pas lu, pendant qu'un
+intent y était physiquement présent. C'est exactement la catégorie d'énoncé pour laquelle
+D-077 avait créé `BoundaryState.UNAVAILABLE` un cran plus bas — « 0 reçu » depuis un
+répertoire illisible — reproduite un cran plus haut.
+
+**Un échec de `fsync` faisait mentir le rapport sur ce qui avait été fait.**
+`resolve_intent` délie **puis** synchronise, donc une faute du `fsync` laisse l'entrée déjà
+retirée du répertoire. Le rapport annonçait pourtant `resolved_intents = 0` et
+`remaining_intents = 0`, suivis de la phrase « Un intent restant bloque la porte » — trois
+affirmations dont deux étaient fausses et dont la troisième contredisait les deux autres.
+
+**Décision.** Aucun compteur numérique n'est publié avant d'avoir été établi.
+
+- `resolved_intents` et `remaining_intents`, comme `verified_receipts_considered` et
+  `unverifiable_receipts`, sont des **entiers ou `null`**. Le rendu humain affiche
+  `NON ÉTABLI` là où le JSON porte `null`. Remplacer une absence de mesure par zéro est
+  interdit : zéro est une mesure, et prétendre l'avoir faite est une erreur de catégorie,
+  pas une approximation ;
+- `intent_counts_state` vaut `ESTABLISHED`, `PARTIAL` ou `UNESTABLISHED`. Il est **dérivé**
+  des compteurs publiés, jamais assigné à la main, pour que l'état et les nombres ne
+  puissent pas diverger ;
+- `intent_resolution_durability` vaut `NOT_ATTEMPTED`, `DURABLE` ou `UNCERTAIN`. C'est une
+  question distincte de celle des comptes : une exécution peut établir les deux compteurs
+  exactement et ignorer si ses suppressions survivent à un crash ;
+- dès que `unlink` réussit, la suppression **a eu lieu** dans l'espace de noms courant.
+  Elle est comptée. Un échec du `fsync` qui suit publie la résolution observée, le nombre
+  restant si sa mesure aboutit, `UNCERTAIN`, une erreur typée, un code de sortie non nul,
+  `EVIDENCE_CONFLICT` et `eligible = false` — et une phrase qui dit que la suppression a
+  été observée mais que sa durabilité n'est pas établie ;
+- une exécution complète **synchronise le répertoire même si elle ne retire rien**, de sorte
+  qu'un second passage après une faute de durabilité établit durablement l'état courant et
+  répond `DURABLE` au lieu de « rien à faire » ;
+- la phrase de clôture du rendu humain est **choisie par l'état**. Elle ne peut plus
+  affirmer qu'un intent restant bloque la porte sous une ligne qui affiche zéro restant, ni
+  affirmer qu'il n'en reste aucun quand le compte n'est pas établi.
+
+`receipt_store.resolve_intent_reporting` sépare les deux faits que `resolve_intent`
+confondait dans un seul booléen : `removed` est ce que montre le répertoire, `durable` est
+ce que garantit le disque. `resolve_intent` conserve la forme stricte — une faute de
+synchronisation y propage — pour ses appelants existants, qui n'ont pas à distinguer.
+
+**Ce que cette décision ne change pas.** Ni l'authenticité HMAC, ni les règles
+d'appariement, ni la lignée de versions, ni un critère, un seuil ou un tarif, ni les budgets
+6 / 10 / 16, ni le protocole **7**, le schéma **4** ou l'instant d'effet
+`2026-08-11T14:20:00+00:00`, ni le plafond `CRITERIA_MET_AWAITING_HUMAN_REVIEW`.
+
+**Ce que cette décision n'autorise pas.** Aucun provisionnement de secret, aucun `plan`,
+`discover`, `core` ni `additional`, aucun appel fournisseur, aucun crédit, aucune promotion.
+
+### D-081 — Ce qui n'est pas gardé par un test n'est pas acquis
+
+**Contexte.** Le réaudit indépendant 03C-2A quinquies, en lecture seule sur `9462f98`, a
+confirmé la règle de véracité de D-080 sur trente-deux confrontations rapport ↔ répertoire,
+sans une divergence. Il a néanmoins relevé un P2 et deux P3, tous de la même famille : un
+comportement correct que **rien ne retient**, et deux énoncés documentaires plus larges que
+ce que la suite établit.
+
+**La synchronisation d'établissement n'était gardée par rien.** D-080 exige qu'une exécution
+complète synchronise le répertoire même lorsqu'elle ne retire aucun intent, afin que l'état
+courant soit établi durablement. Le code le faisait. Une mutation locale — supprimer ce seul
+`directory.fsync()` — laissait pourtant les cent vingt-trois tests du fichier au vert, alors
+qu'elle change la sortie observable : sur un `fsync` en échec avec zéro intent, l'arbre livré
+répond `exit 1 · UNCERTAIN · EVIDENCE_CONFLICT`, le mutant répond `exit 0 · DURABLE ·
+INSUFFICIENT_EVIDENCE`. Le mutant affirme donc une durabilité qu'il n'a pas établie : très
+exactement la faute que D-080 venait d'interdire, réintroduite sans qu'aucune suite ne
+bronche. C'est la forme récurrente que ce dépôt ferme depuis plusieurs tranches — un
+comportement écrit dans un document et non retenu par un test.
+
+**`UNCERTAIN` était défini plus étroitement qu'il ne survient.** Le runbook affirmait qu'il
+« signifie que l'`unlink` d'un intent a réussi ». Un cas atteignable le dément : frontière
+disponible, secret valide, zéro intent, `fsync` d'établissement en échec — `UNCERTAIN` avec
+`resolved_intents = 0` et aucun `unlink`.
+
+**La garde des champs publiés était unidirectionnelle.** Un seul test comparait la sortie au
+runbook, dans un seul sens : tout champ émis devait figurer au runbook, mais rien
+n'obligeait un champ documenté à être émis. `boundary_reason` n'était asserté nulle part.
+
+**Décision.**
+
+- La synchronisation d'établissement est **gardée par un test discriminant** : frontière
+  `AVAILABLE`, secret valide, zéro intent, `fsync` en échec, et le rapport attendu
+  `0 / 0 · ESTABLISHED · UNCERTAIN · EVIDENCE_CONFLICT · eligible = false`, code de sortie
+  non nul. Le supprimer du code fait tomber ce test, et lui seul suffit ;
+- `UNCERTAIN` est publié avec ses **deux formes** — après un `unlink` réussi dont le `fsync`
+  échoue, et sans aucun `unlink` lorsque le `fsync` d'établissement échoue. `resolved_intents`
+  distingue les deux. Dans les deux cas la porte reste fermée et une nouvelle exécution est
+  nécessaire ;
+- les **dix champs publiés** sont un ensemble normatif, énoncé une fois dans le runbook sous
+  une balise stable et comparé à la sortie réelle **dans les deux sens** : ensemble émis =
+  ensemble documenté. Un refus ajoute `status` et `detail`, et rien d'autre ;
+- le harnais `tests/helpers_receipt_boundary.py::audited` **supprime son répertoire jetable**
+  dans un `finally` — après succès, après exception, après audit refusé. Il créait jusqu'ici
+  un répertoire par appel avec `tempfile.mkdtemp` sans jamais le retirer ; le réaudit en a
+  compté 143 182 dans la zone temporaire, chacun portant une clé de signature synthétique et
+  un corpus synthétique, soit environ 2,2 Go accumulés sans borne. Seul le chemin créé par
+  l'appel est supprimé, et le résultat d'audit rendu n'est pas touché.
+
+**Ce que cette décision ne change pas.** Aucune ligne de comportement de production :
+`activation.py` et `receipt_store.py` sont inchangés. Ni l'authenticité HMAC, ni les règles
+d'appariement, ni la lignée de versions, ni un critère, un seuil ou un tarif, ni les budgets
+6 / 10 / 16, ni le protocole **7**, le schéma **4** ou l'instant d'effet
+`2026-08-11T14:20:00+00:00`, ni le plafond `CRITERIA_MET_AWAITING_HUMAN_REVIEW`.
+
+**Ce que cette décision n'autorise pas.** Aucun provisionnement de secret, aucun `plan`,
+`discover`, `core` ni `additional`, aucun appel fournisseur, aucun crédit, aucune promotion.

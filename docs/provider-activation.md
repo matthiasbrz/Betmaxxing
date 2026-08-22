@@ -567,6 +567,80 @@ Tant qu'un intent n'est pas résolu, `qualification_state` reste `EVIDENCE_CONFL
 le corpus est incomplet d'une manière que rien sur ce disque ne permet de chiffrer.
 Rejouer l'étape publie le reçu et résout l'intent, sans compter le coût deux fois.
 
+### Rapprocher un intent dont le reçu est déjà publié (D-079)
+
+Il reste une fenêtre que rejouer l'étape ne referme pas : le reçu a été publié
+durablement, **puis** le processus est mort avant que son intent soit retiré. Rejouer
+republierait le même reçu à l'identique, mais l'intent, lui, resterait — et la porte avec
+lui. C'est la seule situation où une commande de récupération est nécessaire :
+
+```bash
+python -m betmaxxing.providers.the_odds_api.activation receipts reconcile [--json]
+```
+
+Elle publie exactement ces dix champs — des comptes et des catégories, jamais un chemin, un
+corps d'intent ni une valeur de secret :
+
+<!-- champs-publiés-reconcile:début -->
+```text
+boundary_state
+boundary_reason
+verified_receipts_considered
+unverifiable_receipts
+resolved_intents
+remaining_intents
+intent_counts_state
+intent_resolution_durability
+qualification_state
+eligible_for_human_promotion_review
+```
+<!-- champs-publiés-reconcile:fin -->
+
+Un refus ajoute `status` et `detail`, et rien d'autre. Cette liste n'est pas décorative :
+une garde **bidirectionnelle** la compare à la sortie réelle de la commande — tout champ
+émis doit figurer ici, et tout champ listé ici doit être émis.
+
+Ce qu'elle fait, exactement : aucun réseau, aucune clé fournisseur lue, le secret de
+vérification **chargé sans être créé**, l'audit par `audit_directory`, et un intent retiré
+**seulement** s'il existe un reçu durable, vérifié par le HMAC, de portée matérielle
+identique et de même lignée de versions. Elle est idempotente : un second passage résout
+zéro. Elle laisse intact tout intent que rien ne prouve. Et elle échoue de façon typée, avec
+un rapport non vide et un code de sortie non nul, si la frontière, le secret, la lecture, la
+suppression ou le `fsync` échoue — un intent n'est jamais retiré sur la base d'une lecture
+incomplète.
+
+#### Lire les compteurs sans se tromper (D-080)
+
+Les quatre compteurs sont des **entiers ou `null`**, et `null` s'affiche `NON ÉTABLI` en
+rendu humain. Un refus survenu avant l'inventaire ne compte pas zéro intent : il ne compte
+rien, et le rapport le dit au lieu d'imprimer un zéro qu'il n'a pas mesuré.
+
+- `intent_counts_state` — `ESTABLISHED` (les deux compteurs pris), `PARTIAL` (l'un des deux
+  seulement, la porte reste fermée), `UNESTABLISHED` (aucun) ;
+- `intent_resolution_durability` — `NOT_ATTEMPTED`, `DURABLE`, ou `UNCERTAIN`.
+
+`UNCERTAIN` est la seule sortie qui demande une action, et elle prend **deux formes** (D-081) :
+
+- **avec suppression** — l'`unlink` d'un intent a réussi, la suppression **a eu lieu** et
+  elle est comptée dans `resolved_intents`, mais le `fsync` qui la rend durable a échoué ;
+- **sans aucune suppression** — rien n'a été retiré, et c'est le `fsync` destiné à établir
+  durablement l'état courant du répertoire qui a échoué. `resolved_intents` vaut alors `0`.
+
+**C'est `resolved_intents` qui distingue les deux** : non nul, une suppression est en jeu ;
+nul, aucune ne l'est et seule l'établissement de l'état a échoué. Le rendu humain le dit
+aussi en toutes lettres, avec une phrase différente pour chaque forme.
+
+Dans les deux cas le code de sortie est non nul, la qualification reste
+`EVIDENCE_CONFLICT`, la porte reste fermée, et **une nouvelle exécution est nécessaire**.
+**Relancez la commande** : une exécution complète synchronise le répertoire même sans rien
+retirer, ce qui établit durablement l'état courant et rend le rapport `DURABLE`. Rien
+d'autre n'est à faire, et surtout pas toucher au répertoire à la main.
+
+**Ce qui reste interdit.** Supprimer un intent à la main, ou le passer en quarantaine :
+`receipts quarantine` refuse les `*.intent` avec et sans `--force`, et aucune commande de
+suppression n'existe. Un intent retiré sans reçu correspondant rouvrirait la porte sans
+preuve, c'est-à-dire exactement le défaut que l'intent existe pour empêcher.
+
 Ce que le bloc dit, et ce qu'il ne dit pas :
 
 - `qualification_state` vaut au mieux `CRITERIA_MET_AWAITING_HUMAN_REVIEW`. Le

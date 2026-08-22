@@ -922,6 +922,121 @@ et requêtes fait échouer la suite au lieu de passer inaperçue.
 
 Le pire cas coûte 16 crédits. Le cas d'échec précoce en coûte 1.
 
+### Exécution en deux tranches (D-079)
+
+Les 16 crédits sont le coût **contractuel de la campagne complète**, et le fractionner ne
+le réduit pas. Il est en revanche exécuté en deux tranches autorisées séparément, parce que
+les deux moitiés ne prouvent pas la même chose et n'ont pas le même prix.
+
+| | Invocations | Crédits max | Critères atteignables au mieux |
+| --- | --- | --- | --- |
+| **Tranche 1** | six `core` d'un crédit | **6** | `CORE_MAPPING_FOOTBALL`, `CORE_MAPPING_TENNIS`, `COST_CONFORMITY` — soit **3 sur 8** |
+| **Tranche 2** | deux `additional` de cinq crédits | **10** | les cinq `ADDITIONAL_MAPPING_FOOTBALL_*` — soit les **5** restants |
+| **Total** | douze, plus quatre `discover` gratuites | **16** | 8 sur 8 |
+
+La tranche 2 n'est engagée qu'après validation de la tranche 1, et jamais par déduction :
+une autorisation ne se déduit pas de la précédente.
+
+**Ce que `plan --max-credits 6` chiffre, et ce qu'il ne chiffre pas.** Ce plafond est
+`TOTAL_MAX_CREDITS`, la somme de `STEP_CEILINGS` — le coût d'une séquence locale portant sur
+**un seul événement** : un `core` à 1 crédit et un `additional` à 5. Ce n'est pas le budget
+de la campagne, et le lire comme tel conduit à une conclusion fausse : six crédits dépensés
+en un `core` et un `additional` donnent un événement dans chaque étape et ne satisfont
+**aucun** critère, puisque les seuils demandent trois événements pour `core` et deux pour
+chaque marché `additional`.
+
+**Les seuils ne se satisfont pas par répétition.** `min_competitions` et `min_utc_days`
+portent sur des compétitions et des jours UTC **distincts**, calculés sur un canon
+dédupliqué par identifiant et somme de contrôle. Rejouer le même événement, ou re-déposer
+le même reçu, ne rapproche d'aucun seuil : `qualification_exact_duplicate_copies` compte les
+copies et aucun compteur sémantique ne bouge. `LOCAL_BOUNDS` borne d'ailleurs chaque
+invocation payante à **un** événement, si bien que trois événements exigent trois
+invocations et trois autorisations humaines.
+
+**Aucun résultat intermédiaire n'est une qualification.** Trois critères sur huit, c'est
+trois critères sur huit : `qualification_state` reste `INSUFFICIENT_EVIDENCE` tant que les
+huit ne sont pas satisfaits, `adapter_state` reste `IMPLEMENTED_UNVERIFIED` dans tous les
+cas, et le plafond machine demeure `CRITERIA_MET_AWAITING_HUMAN_REVIEW`.
+
+### La seule récupération après la fenêtre de crash (D-079)
+
+Un intent est écrit et `fsync`-é **avant** la requête, retiré une fois son reçu durablement
+publié. Le processus peut mourir entre les deux : l'intent survit alors qu'un reçu existe, et
+la porte reste fermée puisqu'un intent non résolu est un conflit de preuve.
+
+```bash
+python -m betmaxxing.providers.the_odds_api.activation receipts reconcile [--json]
+```
+
+C'est la **seule** récupération autorisée. Elle n'ouvre aucune socket, ne lit aucune clé
+fournisseur, charge le secret de vérification **sans en créer un**, audite par
+`audit_directory`, et ne retire un intent que sur un reçu durable, vérifié par le HMAC, de
+portée matérielle identique et de même lignée de versions au sens de D-077. Elle est
+idempotente, laisse intact tout intent sans preuve correspondante, et échoue de façon typée
+si la frontière, le secret, la lecture, la suppression ou le `fsync` échoue.
+
+`reconcile_intents` existait depuis la v7 et était documentée ici comme la résolution
+comptable, mais aucune commande ne l'appelait : la récupération était décrite et non
+exécutable — le défaut que D-077 avait fermé un cran plus bas pour la quarantaine.
+
+**La suppression manuelle d'un intent reste interdite.** `receipts quarantine` refuse les
+`*.intent` avec et sans `--force`, et il n'existe aucune commande de suppression. Retirer un
+intent à la main rouvrirait la porte sans preuve, ce qui est l'inverse d'une récupération.
+
+### Un compte n'est publié qu'une fois pris (D-080)
+
+Le rapport de rapprochement publie des mesures, jamais des valeurs d'initialisation.
+`resolved_intents`, `remaining_intents`, `verified_receipts_considered` et
+`unverifiable_receipts` sont des **entiers ou `null`**, et le rendu humain écrit
+`NON ÉTABLI` là où le JSON porte `null`. **Remplacer une absence de mesure par zéro est
+interdit** : zéro est une mesure, et un refus survenu avant l'inventaire n'en a fait aucune.
+C'est la règle de `BoundaryState.UNAVAILABLE` (D-077) appliquée aux comptes eux-mêmes.
+
+Deux états accompagnent ces compteurs, et ils répondent à deux questions différentes :
+
+| Champ | Valeurs | Ce qu'il dit |
+| --- | --- | --- |
+| `intent_counts_state` | `ESTABLISHED`, `PARTIAL`, `UNESTABLISHED` | combien des deux compteurs d'intents ont été pris ; **dérivé** d'eux, jamais assigné à la main |
+| `intent_resolution_durability` | `NOT_ATTEMPTED`, `DURABLE`, `UNCERTAIN` | si les suppressions de cette exécution sont connues pour survivre à un crash |
+
+Trois situations, et ce que chacune doit publier :
+
+- **refus avant toute mesure** — secret absent ou invalide, frontière indisponible, faute de
+  lecture avant inventaire complet : les deux compteurs à `null`, `UNESTABLISHED`,
+  `NOT_ATTEMPTED`, `EVIDENCE_CONFLICT`, `eligible = false`. Aucune phrase n'affirme qu'il ne
+  reste aucun intent ;
+- **résultat partiel** — certaines opérations sont connues mais le comptage final échoue :
+  seules les valeurs effectivement établies sont publiées, les autres restent à `null`,
+  l'état est `PARTIAL`, et la porte reste fermée ;
+- **succès complet** — inventaire et synchronisation aboutis : les deux compteurs sont des
+  entiers mesurés, l'état est `ESTABLISHED` et la durabilité `DURABLE`.
+
+**Un `fsync` qui échoue après un `unlink` réussi.** Dès que l'`unlink` retourne, la
+suppression a eu lieu dans l'espace de noms courant : c'est un fait observé, et il est
+compté. Le rapport publie alors la résolution observée, le nombre restant si sa mesure
+aboutit, `UNCERTAIN`, une erreur typée et un code de sortie non nul, avec
+`EVIDENCE_CONFLICT` et `eligible = false`. Il ne publie **jamais** `resolved_intents = 0` et
+`remaining_intents = 0` sous une phrase affirmant qu'un intent restant bloque la porte.
+
+Une exécution complète **synchronise le répertoire même lorsqu'elle ne retire rien**. C'est
+ce qui permet à un second passage, après une faute de durabilité, d'établir durablement
+l'état courant et de répondre `DURABLE` plutôt que « rien à faire » — et de produire un
+rapport cohérent et idempotent.
+
+**`UNCERTAIN` a donc deux formes, à lire avec `resolved_intents` (D-081).**
+
+| Forme | `resolved_intents` | Ce qui s'est passé |
+| --- | --- | --- |
+| avec suppression | non nul | un `unlink` a réussi, le `fsync` qui le rend durable a échoué |
+| sans aucune suppression | `0` | rien n'a été retiré ; c'est le `fsync` destiné à établir durablement l'état courant qui a échoué |
+
+`resolved_intents` est le seul champ qui sépare les deux, et il suffit. Dans les **deux**
+cas : erreur typée, code de sortie non nul, `EVIDENCE_CONFLICT`, `eligible = false`, porte
+fermée, et **une nouvelle exécution est nécessaire** pour établir durablement l'état. Un
+rapport qui répondrait `DURABLE` après un `fsync` d'établissement en échec affirmerait une
+durabilité qu'il n'a pas établie — la faute même que cette section interdit. Un test le
+tient : supprimer la synchronisation d'établissement le fait passer au rouge.
+
 ## 9. Écriture et audit des reçus : un descripteur, pas un chemin
 
 **Frontière du répertoire.** Le répertoire de reçus est ouvert **une fois**, composant
