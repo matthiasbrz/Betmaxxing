@@ -578,9 +578,11 @@ lui. C'est la seule situation où une commande de récupération est nécessaire
 python -m betmaxxing.providers.the_odds_api.activation receipts reconcile [--json]
 ```
 
-Elle publie `boundary_state`, `verified_receipts_considered`, `resolved_intents`,
-`remaining_intents`, `qualification_state` et `eligible_for_human_promotion_review` — des
-comptes et des catégories, jamais un chemin, un corps d'intent ni une valeur de secret.
+Elle publie `boundary_state`, `boundary_reason`, `verified_receipts_considered`,
+`unverifiable_receipts`, `resolved_intents`, `remaining_intents`, `intent_counts_state`,
+`intent_resolution_durability`, `qualification_state` et
+`eligible_for_human_promotion_review` — des comptes et des catégories, jamais un chemin, un
+corps d'intent ni une valeur de secret.
 
 Ce qu'elle fait, exactement : aucun réseau, aucune clé fournisseur lue, le secret de
 vérification **chargé sans être créé**, l'audit par `audit_directory`, et un intent retiré
@@ -590,6 +592,24 @@ zéro. Elle laisse intact tout intent que rien ne prouve. Et elle échoue de fa�
 un rapport non vide et un code de sortie non nul, si la frontière, le secret, la lecture, la
 suppression ou le `fsync` échoue — un intent n'est jamais retiré sur la base d'une lecture
 incomplète.
+
+#### Lire les compteurs sans se tromper (D-080)
+
+Les quatre compteurs sont des **entiers ou `null`**, et `null` s'affiche `NON ÉTABLI` en
+rendu humain. Un refus survenu avant l'inventaire ne compte pas zéro intent : il ne compte
+rien, et le rapport le dit au lieu d'imprimer un zéro qu'il n'a pas mesuré.
+
+- `intent_counts_state` — `ESTABLISHED` (les deux compteurs pris), `PARTIAL` (l'un des deux
+  seulement, la porte reste fermée), `UNESTABLISHED` (aucun) ;
+- `intent_resolution_durability` — `NOT_ATTEMPTED`, `DURABLE`, ou `UNCERTAIN`.
+
+`UNCERTAIN` est la seule sortie qui demande une action. Elle signifie que l'`unlink` d'un
+intent a réussi — la suppression **a eu lieu**, et elle est comptée dans
+`resolved_intents` — mais que le `fsync` qui la rend durable a échoué. Le code de sortie est
+non nul, la qualification reste `EVIDENCE_CONFLICT` et la porte reste fermée. **Relancez la
+commande** : une exécution complète synchronise le répertoire même sans rien retirer, ce qui
+établit durablement l'état courant et rend le rapport `DURABLE`. Rien d'autre n'est à faire,
+et surtout pas toucher au répertoire à la main.
 
 **Ce qui reste interdit.** Supprimer un intent à la main, ou le passer en quarantaine :
 `receipts quarantine` refuse les `*.intent` avec et sans `--force`, et aucune commande de

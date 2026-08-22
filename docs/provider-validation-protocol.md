@@ -983,6 +983,46 @@ exécutable — le défaut que D-077 avait fermé un cran plus bas pour la quara
 `*.intent` avec et sans `--force`, et il n'existe aucune commande de suppression. Retirer un
 intent à la main rouvrirait la porte sans preuve, ce qui est l'inverse d'une récupération.
 
+### Un compte n'est publié qu'une fois pris (D-080)
+
+Le rapport de rapprochement publie des mesures, jamais des valeurs d'initialisation.
+`resolved_intents`, `remaining_intents`, `verified_receipts_considered` et
+`unverifiable_receipts` sont des **entiers ou `null`**, et le rendu humain écrit
+`NON ÉTABLI` là où le JSON porte `null`. **Remplacer une absence de mesure par zéro est
+interdit** : zéro est une mesure, et un refus survenu avant l'inventaire n'en a fait aucune.
+C'est la règle de `BoundaryState.UNAVAILABLE` (D-077) appliquée aux comptes eux-mêmes.
+
+Deux états accompagnent ces compteurs, et ils répondent à deux questions différentes :
+
+| Champ | Valeurs | Ce qu'il dit |
+| --- | --- | --- |
+| `intent_counts_state` | `ESTABLISHED`, `PARTIAL`, `UNESTABLISHED` | combien des deux compteurs d'intents ont été pris ; **dérivé** d'eux, jamais assigné à la main |
+| `intent_resolution_durability` | `NOT_ATTEMPTED`, `DURABLE`, `UNCERTAIN` | si les suppressions de cette exécution sont connues pour survivre à un crash |
+
+Trois situations, et ce que chacune doit publier :
+
+- **refus avant toute mesure** — secret absent ou invalide, frontière indisponible, faute de
+  lecture avant inventaire complet : les deux compteurs à `null`, `UNESTABLISHED`,
+  `NOT_ATTEMPTED`, `EVIDENCE_CONFLICT`, `eligible = false`. Aucune phrase n'affirme qu'il ne
+  reste aucun intent ;
+- **résultat partiel** — certaines opérations sont connues mais le comptage final échoue :
+  seules les valeurs effectivement établies sont publiées, les autres restent à `null`,
+  l'état est `PARTIAL`, et la porte reste fermée ;
+- **succès complet** — inventaire et synchronisation aboutis : les deux compteurs sont des
+  entiers mesurés, l'état est `ESTABLISHED` et la durabilité `DURABLE`.
+
+**Un `fsync` qui échoue après un `unlink` réussi.** Dès que l'`unlink` retourne, la
+suppression a eu lieu dans l'espace de noms courant : c'est un fait observé, et il est
+compté. Le rapport publie alors la résolution observée, le nombre restant si sa mesure
+aboutit, `UNCERTAIN`, une erreur typée et un code de sortie non nul, avec
+`EVIDENCE_CONFLICT` et `eligible = false`. Il ne publie **jamais** `resolved_intents = 0` et
+`remaining_intents = 0` sous une phrase affirmant qu'un intent restant bloque la porte.
+
+Une exécution complète **synchronise le répertoire même lorsqu'elle ne retire rien**. C'est
+ce qui permet à un second passage, après une faute de durabilité, d'établir durablement
+l'état courant et de répondre `DURABLE` plutôt que « rien à faire » — et de produire un
+rapport cohérent et idempotent.
+
 ## 9. Écriture et audit des reçus : un descripteur, pas un chemin
 
 **Frontière du répertoire.** Le répertoire de reçus est ouvert **une fois**, composant

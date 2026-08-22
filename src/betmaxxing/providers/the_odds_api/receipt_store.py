@@ -1356,8 +1356,53 @@ def publish_intent(directory: SecureDirectory, intent: Mapping[str, Any]) -> str
     return name
 
 
+@dataclass(frozen=True, slots=True)
+class IntentResolution:
+    """What a removal achieved, split into the two facts that fail independently.
+
+    ``removed`` is what the directory shows: once ``unlink`` returns, the entry is
+    gone from the current namespace, and that is observed rather than inferred.
+    ``durable`` is whether that removal is known to survive a crash, which is a
+    different question answered by a different syscall.
+
+    They are returned separately because collapsing them loses the truth in the one
+    case where it matters. ``unlink`` succeeds, the following ``fsync`` fails, and a
+    caller holding a single boolean has to choose between two false reports: « rien
+    n'a été retiré », which contradicts the directory, or « tout est en ordre », which
+    contradicts the disk.
+    """
+
+    removed: bool
+    durable: bool
+
+
+def resolve_intent_reporting(directory: SecureDirectory, attempt_id: str) -> IntentResolution:
+    """Forget an intent, reporting removal and durability separately. Idempotent.
+
+    An absent entry is not a removal, and it is not a durability problem either: there
+    is nothing left to make durable, so it reports ``removed=False, durable=True``.
+    """
+    name = _intent_name(attempt_id)
+    if not directory.exists(name):
+        return IntentResolution(removed=False, durable=True)
+    directory.unlink(name)
+    try:
+        directory.fsync()
+    except (PersistenceFailed, OSError):
+        # `SecureDirectory.fsync` reports its own failure as `PersistenceFailed`; the
+        # bare `OSError` is there for a caller that hands in a directory object which
+        # does not. Either way the unlink above already happened.
+        return IntentResolution(removed=True, durable=False)
+    return IntentResolution(removed=True, durable=True)
+
+
 def resolve_intent(directory: SecureDirectory, attempt_id: str) -> bool:
-    """Forget an intent whose receipt is durably published. Idempotent."""
+    """Forget an intent whose receipt is durably published. Idempotent.
+
+    The strict form: a failure to synchronise propagates, so a caller that gets
+    ``True`` has a removal that is both observed *and* durable. Callers that must
+    report the two facts apart use :func:`resolve_intent_reporting` instead.
+    """
     name = _intent_name(attempt_id)
     if not directory.exists(name):
         return False

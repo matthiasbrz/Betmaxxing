@@ -2173,3 +2173,61 @@ résultat intermédiaire n'est une qualification — `adapter_state` reste
 
 **Ce que cette décision n'autorise pas.** Aucun provisionnement de secret, aucun `plan`,
 `discover`, `core` ni `additional`, aucun appel fournisseur, aucun crédit, aucune promotion.
+
+### D-080 — Un compte n'est publié qu'une fois pris
+
+**Contexte.** Le réaudit indépendant 03C-2A ter, en lecture seule sur `69c69b2`, a mesuré
+deux constats P2 sur la commande que D-079 venait d'ouvrir. Ils portent le même défaut.
+
+**Le rapport publiait des zéros qu'il n'avait pas mesurés.** `reconcile_intents_report`
+construisait son document avec `resolved_intents = 0` et `remaining_intents = 0`, et chaque
+branche `except` levait avec ce document tel quel. Une faute de lecture avant l'inventaire,
+un secret absent, une frontière refusée : dans les trois cas la commande imprimait
+« Intents restants : 0 » à propos d'un répertoire qu'elle n'avait pas lu, pendant qu'un
+intent y était physiquement présent. C'est exactement la catégorie d'énoncé pour laquelle
+D-077 avait créé `BoundaryState.UNAVAILABLE` un cran plus bas — « 0 reçu » depuis un
+répertoire illisible — reproduite un cran plus haut.
+
+**Un échec de `fsync` faisait mentir le rapport sur ce qui avait été fait.**
+`resolve_intent` délie **puis** synchronise, donc une faute du `fsync` laisse l'entrée déjà
+retirée du répertoire. Le rapport annonçait pourtant `resolved_intents = 0` et
+`remaining_intents = 0`, suivis de la phrase « Un intent restant bloque la porte » — trois
+affirmations dont deux étaient fausses et dont la troisième contredisait les deux autres.
+
+**Décision.** Aucun compteur numérique n'est publié avant d'avoir été établi.
+
+- `resolved_intents` et `remaining_intents`, comme `verified_receipts_considered` et
+  `unverifiable_receipts`, sont des **entiers ou `null`**. Le rendu humain affiche
+  `NON ÉTABLI` là où le JSON porte `null`. Remplacer une absence de mesure par zéro est
+  interdit : zéro est une mesure, et prétendre l'avoir faite est une erreur de catégorie,
+  pas une approximation ;
+- `intent_counts_state` vaut `ESTABLISHED`, `PARTIAL` ou `UNESTABLISHED`. Il est **dérivé**
+  des compteurs publiés, jamais assigné à la main, pour que l'état et les nombres ne
+  puissent pas diverger ;
+- `intent_resolution_durability` vaut `NOT_ATTEMPTED`, `DURABLE` ou `UNCERTAIN`. C'est une
+  question distincte de celle des comptes : une exécution peut établir les deux compteurs
+  exactement et ignorer si ses suppressions survivent à un crash ;
+- dès que `unlink` réussit, la suppression **a eu lieu** dans l'espace de noms courant.
+  Elle est comptée. Un échec du `fsync` qui suit publie la résolution observée, le nombre
+  restant si sa mesure aboutit, `UNCERTAIN`, une erreur typée, un code de sortie non nul,
+  `EVIDENCE_CONFLICT` et `eligible = false` — et une phrase qui dit que la suppression a
+  été observée mais que sa durabilité n'est pas établie ;
+- une exécution complète **synchronise le répertoire même si elle ne retire rien**, de sorte
+  qu'un second passage après une faute de durabilité établit durablement l'état courant et
+  répond `DURABLE` au lieu de « rien à faire » ;
+- la phrase de clôture du rendu humain est **choisie par l'état**. Elle ne peut plus
+  affirmer qu'un intent restant bloque la porte sous une ligne qui affiche zéro restant, ni
+  affirmer qu'il n'en reste aucun quand le compte n'est pas établi.
+
+`receipt_store.resolve_intent_reporting` sépare les deux faits que `resolve_intent`
+confondait dans un seul booléen : `removed` est ce que montre le répertoire, `durable` est
+ce que garantit le disque. `resolve_intent` conserve la forme stricte — une faute de
+synchronisation y propage — pour ses appelants existants, qui n'ont pas à distinguer.
+
+**Ce que cette décision ne change pas.** Ni l'authenticité HMAC, ni les règles
+d'appariement, ni la lignée de versions, ni un critère, un seuil ou un tarif, ni les budgets
+6 / 10 / 16, ni le protocole **7**, le schéma **4** ou l'instant d'effet
+`2026-08-11T14:20:00+00:00`, ni le plafond `CRITERIA_MET_AWAITING_HUMAN_REVIEW`.
+
+**Ce que cette décision n'autorise pas.** Aucun provisionnement de secret, aucun `plan`,
+`discover`, `core` ni `additional`, aucun appel fournisseur, aucun crédit, aucune promotion.
