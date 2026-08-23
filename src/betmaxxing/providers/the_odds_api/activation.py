@@ -3451,6 +3451,109 @@ def receipts_quarantine(
         )
 
 
+def _named_boundary() -> Path:
+    """The receipt directory, required to be named explicitly and absolutely.
+
+    Provisioning is the one verb that writes a *durable* key, so it is the one verb
+    that refuses the relative default. ``DEFAULT_RECEIPT_DIR`` resolves against the
+    process's working directory — which is the right thing for an operator running a
+    step inside a project, and a trap for a key meant to outlive the campaign: the
+    boundary would land wherever the shell happened to be, and a later run from one
+    directory up would report a clean slate while eight signed receipts sat elsewhere.
+
+    Refusing here rather than in :func:`receipt_dir` is deliberate: the default stays
+    the default for every other command, and this one asks to be told.
+    """
+    configured = os.environ.get(RECEIPT_DIR_VARIABLE)
+    if configured is None or not configured.strip():
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{RECEIPT_DIR_VARIABLE} doit être définie sur un chemin absolu. Le défaut "
+            f"relatif {DEFAULT_RECEIPT_DIR!r} se résout contre le répertoire courant : "
+            "une clé durable n'y est pas provisionnée par accident.",
+        )
+    candidate = Path(configured.strip())
+    if not candidate.is_absolute():
+        raise Refused(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            f"{RECEIPT_DIR_VARIABLE} n'est pas un chemin absolu. Rien n'est créé.",
+        )
+    return candidate
+
+
+@receipts_app.command("provision")
+def receipts_provision(
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Ouvrir la frontière de reçus. Aucun réseau, aucun crédit, aucune promotion.
+
+    Le secret de signature naissait jusqu'ici **au premier besoin réseau** :
+    :func:`ensure_receipt_secret` n'est atteint que depuis un chemin qui s'apprête à
+    signer, et ``status`` refuse de créer quoi que ce soit en regardant. La première
+    commande qui ouvrait donc la frontière était ``discover``, c'est-à-dire un appel
+    fournisseur — provisionner *avant* toute socket n'était pas exécutable. C'est le
+    seul trou que cette commande comble.
+
+    Elle ne réimplémente rien : la génération et la publication restent celles de
+    :func:`ensure_receipt_secret`, donc la publication atomique « octets d'abord, nom
+    ensuite » qui empêche une interruption de laisser un nom qui existe et qui est
+    vide. Ce qui est ajouté ici est la politique du chemin, et la relecture qui suit.
+
+    Ce qu'elle ne fait jamais : remplacer, faire tourner ou « réparer » un secret
+    existant, même invalide. Le réécrire transformerait en bruit tout reçu déjà signé
+    avec lui, et détruire silencieusement la preuve d'un opérateur est pire que de
+    s'arrêter. Elle n'affiche pas davantage le secret, ni sa longueur, ni un fragment,
+    ni une empreinte : une clé qu'on peut reconstituer depuis un journal n'est plus
+    une clé.
+    """
+    try:
+        boundary = _named_boundary()
+        # `create=True` même quand la variable fournit la clé : le répertoire reste
+        # nécessaire aux reçus, et la frontière doit être lisible ensuite.
+        with receipt_store.SecureDirectory.open(boundary, create=True):
+            pass
+        # La seule génération et la seule publication du programme. La valeur n'est
+        # liée à rien : la connaître ici ne sert à rien et la journaliser serait un
+        # défaut.
+        ensure_receipt_secret()
+    except (Refused, receipt_store.StoreRefused) as exc:
+        message = getattr(exc, "message", str(exc))
+        _fail(ActivationStatus.PREPARED_NOT_EXECUTED, message, as_json=json_output)
+        return
+
+    # Le succès n'est pas la fin de l'écriture : c'est ce que la frontière publie
+    # ensuite. Une commande qui se déclare victorieuse sans relire est une commande
+    # qui affirme un état qu'elle n'a pas mesuré.
+    audit = audit_receipts()
+    intents = len(unresolved_intents())
+    if str(audit.boundary) != str(receipt_store.BoundaryState.AVAILABLE) or audit.reason:
+        _fail(
+            ActivationStatus.PREPARED_NOT_EXECUTED,
+            "La frontière de reçus n'est pas lisible après provisionnement "
+            f"(état {audit.boundary}, catégorie {audit.reason or 'aucune'}).",
+            as_json=json_output,
+        )
+        return
+
+    document = {
+        "status": "PROVISIONED",
+        "boundary_state": str(audit.boundary),
+        "boundary_reason": audit.reason,
+        "unresolved_attempt_intents": intents,
+    }
+    if json_output:
+        typer.echo(jsonlib.dumps(document, ensure_ascii=False))
+    else:
+        typer.echo(
+            "Frontière de reçus ouverte. Le secret de signature local est en place et "
+            "n'a pas été affiché.\n"
+            f"Frontière : {document['boundary_state']} · intents non résolus : {intents}.\n"
+            "Conservez cette clé jusqu'à la fin de la campagne : sa perte rendrait "
+            "invérifiables tous les reçus signés avec elle. Aucun appel fournisseur, "
+            "aucune tentative et aucun crédit n'ont été engagés."
+        )
+
+
 @receipts_app.command("reconcile")
 def receipts_reconcile(
     json_output: bool = typer.Option(False, "--json"),
