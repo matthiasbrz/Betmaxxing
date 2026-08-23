@@ -221,10 +221,30 @@ class TestPlan:
         The document is read from this file's own location rather than the working
         directory: a guard that only holds when pytest happens to run from the
         repository root is a guard that stops holding without anyone noticing.
+
+        The bounds are checked before they are used, and that is the other half of
+        the same idea. Splitting on a heading that has moved returns the rest of the
+        file rather than an error, so a renamed step 2 would silently widen this
+        section from a paragraph to the remainder of the document — and the two
+        assertions below would still hold, on text that has nothing to do with step 1.
+        A guard whose scope can quietly grow is a guard that stops guarding. Each
+        bound must therefore appear exactly once, and in the right order.
         """
         runbook = Path(__file__).resolve().parents[1] / "docs" / "provider-activation.md"
         text = runbook.read_text(encoding="utf-8")
-        step = text.split("### 1. `plan`", 1)[1].split("### 2. `discover`", 1)[0]
+
+        debut = "### 1. `plan`"
+        fin = "### 2. `discover`"
+        assert text.count(debut) == 1, (
+            "la borne initiale de l'étape plan doit apparaître exactement une fois"
+        )
+        assert text.count(fin) == 1, (
+            "la borne finale de l'étape plan doit apparaître exactement une fois"
+        )
+        debut_index = text.index(debut) + len(debut)
+        fin_index = text.index(fin)
+        assert debut_index < fin_index, "les bornes de l'étape plan sont inversées"
+        step = text[debut_index:fin_index]
 
         published = json.loads(run(*self.ARGS, "--json").stdout)["status"]
         assert published == "PLAN_ONLY", published
