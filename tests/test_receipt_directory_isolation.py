@@ -57,6 +57,12 @@ SUITES_THE_REAUDIT_CAUGHT = ("test_qualification_v6_contract", "test_provider_qu
 
 VARIABLE = "BETMAXXING_ACTIVATION_RECEIPTS"
 
+#: The value the restoration probe's child process starts from, and the value it must be
+#: back to once the child has finished. A single constant feeds both the environment
+#: handed to pytest and the assertion generated inside the child: two separate literals
+#: could drift apart silently and leave the probe green while measuring nothing.
+SENTINEL_BEFORE = "/sentinel/before"
+
 REPOSITORY = Path(act.__file__).resolve().parents[4]
 
 
@@ -179,6 +185,14 @@ class TestTheEnvironmentIsRestored:
         ``tmp_path`` would never see ``tests/conftest.py``. The local conftest below
         re-exports the genuine fixture rather than redefining it — redefining it would
         make this class test a copy, which proves nothing about the one in use.
+
+        The starting value is placed in the child's environment *before* pytest starts.
+        Setting it inside the child with an ``autouse`` fixture would look equivalent and
+        is not: that fixture re-establishes the value at the setup of every test, the
+        one checking it came back included, so the check would pass whether or not the
+        fixture under test restores anything — and its own ``monkeypatch`` teardown would
+        overwrite the leak besides, erasing the very evidence being sought. Only a value
+        pre-set in the environment lets the second test observe the first test's teardown.
         """
         (tmp_path / "conftest.py").write_text(
             # Loaded by path under a distinct module name: the local file is itself
@@ -200,21 +214,22 @@ class TestTheEnvironmentIsRestored:
             capture_output=True,
             text=True,
             cwd=str(tmp_path),
-            env=plain_environment(PYTHONPATH=str(REPOSITORY / "src")),
+            env=plain_environment(
+                PYTHONPATH=str(REPOSITORY / "src"), **{VARIABLE: SENTINEL_BEFORE}
+            ),
             check=False,
         )
 
+    #: The first test takes the real fixture and checks the variable moved off the
+    #: sentinel; the second takes no fixture touching the variable at all, so it reads
+    #: whatever the first test's teardown left behind. Both the name and the sentinel are
+    #: interpolated from this module's constants — the child cannot disagree with the
+    #: environment it was handed.
     PROBE = """
 import os
-import pytest
 
-VARIABLE = "BETMAXXING_ACTIVATION_RECEIPTS"
-BEFORE = "/sentinel/before"
-
-
-@pytest.fixture(autouse=True)
-def _preset(monkeypatch):
-    monkeypatch.setenv(VARIABLE, BEFORE)
+VARIABLE = {variable!r}
+BEFORE = {before!r}
 
 
 def test_{outcome}(isolated_receipt_directory):
@@ -226,13 +241,19 @@ def test_zz_the_variable_came_back():
     assert os.environ[VARIABLE] == BEFORE
 """
 
+    @classmethod
+    def _probe(cls, *, outcome: str, tail: str) -> str:
+        return cls.PROBE.format(
+            variable=VARIABLE, before=SENTINEL_BEFORE, outcome=outcome, tail=tail
+        )
+
     def test_the_previous_value_returns_after_a_passing_test(self, tmp_path: Path) -> None:
-        done = self._run(self.PROBE.format(outcome="passes", tail="assert True"), tmp_path)
+        done = self._run(self._probe(outcome="passes", tail="assert True"), tmp_path)
         assert "2 passed" in done.stdout, done.stdout + done.stderr
 
     def test_the_previous_value_returns_after_a_failing_test(self, tmp_path: Path) -> None:
         done = self._run(
-            self.PROBE.format(outcome="fails", tail='raise AssertionError("deliberate")'),
+            self._probe(outcome="fails", tail='raise AssertionError("deliberate")'),
             tmp_path,
         )
         assert "1 failed, 1 passed" in done.stdout, done.stdout + done.stderr
