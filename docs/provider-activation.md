@@ -418,7 +418,7 @@ python -m betmaxxing.providers.the_odds_api.activation plan \
 ```
 
 Ne lit ni la clé ni le secret de signature, ne construit aucun client HTTP,
-n'écrit aucun reçu. Affiche la séquence chiffrée et `PREPARED_NOT_EXECUTED`.
+n'écrit aucun reçu. Affiche la séquence chiffrée et `PLAN_ONLY`.
 `--json` pour la sortie machine.
 
 ### 2. `discover` — 0 crédit

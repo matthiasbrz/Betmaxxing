@@ -206,6 +206,52 @@ class TestPlan:
         run(*self.ARGS)
         assert receipts_in(workspace) == []
 
+    def test_the_runbook_announces_the_status_the_command_actually_prints(
+        self, workspace: Path
+    ) -> None:
+        """The operating document must not name a status the command no longer emits.
+
+        `plan` reported `PREPARED_NOT_EXECUTED` until E3 separated the two: a label
+        meaning « nothing has been executed », printed by a command that has no idea
+        what has been executed, is a claim it cannot support. The code moved to
+        `PLAN_ONLY`; the runbook's step 1 kept the old word, so an operator following
+        the document would wait for a status the program never prints — and would have
+        no way to tell a stale document from a broken command.
+
+        The document is read from this file's own location rather than the working
+        directory: a guard that only holds when pytest happens to run from the
+        repository root is a guard that stops holding without anyone noticing.
+
+        The bounds are checked before they are used, and that is the other half of
+        the same idea. Splitting on a heading that has moved returns the rest of the
+        file rather than an error, so a renamed step 2 would silently widen this
+        section from a paragraph to the remainder of the document — and the two
+        assertions below would still hold, on text that has nothing to do with step 1.
+        A guard whose scope can quietly grow is a guard that stops guarding. Each
+        bound must therefore appear exactly once, and in the right order.
+        """
+        runbook = Path(__file__).resolve().parents[1] / "docs" / "provider-activation.md"
+        text = runbook.read_text(encoding="utf-8")
+
+        debut = "### 1. `plan`"
+        fin = "### 2. `discover`"
+        assert text.count(debut) == 1, (
+            "la borne initiale de l'étape plan doit apparaître exactement une fois"
+        )
+        assert text.count(fin) == 1, (
+            "la borne finale de l'étape plan doit apparaître exactement une fois"
+        )
+        debut_index = text.index(debut) + len(debut)
+        fin_index = text.index(fin)
+        assert debut_index < fin_index, "les bornes de l'étape plan sont inversées"
+        step = text[debut_index:fin_index]
+
+        published = json.loads(run(*self.ARGS, "--json").stdout)["status"]
+        assert published == "PLAN_ONLY", published
+
+        assert f"`{published}`" in step, "l'étape 1 n'annonce pas le statut réellement publié"
+        assert "PREPARED_NOT_EXECUTED" not in step, "l'étape 1 annonce encore l'ancien statut"
+
 
 # ---------------------------------------------------------------------------
 # Network consent, keys and exact acknowledgement
