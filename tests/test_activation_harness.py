@@ -206,6 +206,32 @@ class TestPlan:
         run(*self.ARGS)
         assert receipts_in(workspace) == []
 
+    def test_the_runbook_announces_the_status_the_command_actually_prints(
+        self, workspace: Path
+    ) -> None:
+        """The operating document must not name a status the command no longer emits.
+
+        `plan` reported `PREPARED_NOT_EXECUTED` until E3 separated the two: a label
+        meaning « nothing has been executed », printed by a command that has no idea
+        what has been executed, is a claim it cannot support. The code moved to
+        `PLAN_ONLY`; the runbook's step 1 kept the old word, so an operator following
+        the document would wait for a status the program never prints — and would have
+        no way to tell a stale document from a broken command.
+
+        The document is read from this file's own location rather than the working
+        directory: a guard that only holds when pytest happens to run from the
+        repository root is a guard that stops holding without anyone noticing.
+        """
+        runbook = Path(__file__).resolve().parents[1] / "docs" / "provider-activation.md"
+        text = runbook.read_text(encoding="utf-8")
+        step = text.split("### 1. `plan`", 1)[1].split("### 2. `discover`", 1)[0]
+
+        published = json.loads(run(*self.ARGS, "--json").stdout)["status"]
+        assert published == "PLAN_ONLY", published
+
+        assert f"`{published}`" in step, "l'étape 1 n'annonce pas le statut réellement publié"
+        assert "PREPARED_NOT_EXECUTED" not in step, "l'étape 1 annonce encore l'ancien statut"
+
 
 # ---------------------------------------------------------------------------
 # Network consent, keys and exact acknowledgement
