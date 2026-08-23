@@ -223,10 +223,16 @@ appartient à l'opérateur, pas au dépôt.
 
 ### Le secret local de signature
 
-Un secret aléatoire est créé au premier besoin réseau, dans le répertoire de
-reçus, publié atomiquement en mode `0600`. Il n'est jamais affiché, jamais
-journalisé, jamais versionné. Les tests injectent un secret déterministe par
-`BETMAXXING_ACTIVATION_RECEIPT_SECRET` et ne dépendent d'aucun aléa réel.
+Un secret aléatoire est créé dans le répertoire de reçus, publié atomiquement en
+mode `0600`. Il n'est jamais affiché, jamais journalisé, jamais versionné. Les
+tests injectent un secret déterministe par `BETMAXXING_ACTIVATION_RECEIPT_SECRET`
+et ne dépendent d'aucun aléa réel.
+
+Il est créé de deux façons, et une seule est délibérée : par `receipts provision`
+(voir plus bas), ou à défaut au premier besoin réseau. Jusqu'à l'ajout de la
+commande, seule la seconde existait — la première commande qui ouvrait la
+frontière était donc `discover`, c'est-à-dire un appel fournisseur, et
+provisionner *avant* toute socket n'était pas exécutable.
 
 Sa politique, depuis D-077, en toutes lettres :
 
@@ -352,6 +358,55 @@ export BETMAXXING_THE_ODDS_API_KEY='…'     # jamais dans un fichier versionné
 ```
 
 La variable dépréciée `BETMAXXING_ODDS_API_KEY` reste acceptée et signalée.
+
+### 0 bis. `receipts provision` — ouvrir la frontière (hors ligne, 0 crédit)
+
+```bash
+export BETMAXXING_ACTIVATION_RECEIPTS="$HOME/.local/state/betmaxxing/activation-receipts"
+python -m betmaxxing.providers.the_odds_api.activation receipts provision --json
+```
+
+Crée le répertoire en `0700` s'il manque, puis publie `signing-key.secret` en
+`0600` par le même chemin atomique que toute autre publication. Aucun réseau,
+aucun crédit, aucun reçu, aucun intent, aucune promotion.
+
+Ce qu'elle exige, et pourquoi :
+
+* **`BETMAXXING_ACTIVATION_RECEIPTS` doit être définie sur un chemin absolu.**
+  C'est la seule commande qui refuse le défaut relatif. `.activation-receipts` se
+  résout contre le répertoire courant — le bon comportement pour un opérateur qui
+  lance une étape dans son projet, un piège pour une clé censée survivre à toute la
+  campagne : la frontière atterrirait là où le shell se trouvait, et une exécution
+  ultérieure depuis un cran plus haut rapporterait une ardoise vierge pendant que
+  les reçus signés dormiraient ailleurs ;
+* **un lien symbolique, un FIFO, un fichier régulier ou un composant ambigu sont
+  refusés**, sans rien suivre et sans rien créer.
+
+Ce qu'elle ne fait **jamais** : remplacer, faire tourner ou « réparer » un secret
+existant, même invalide, même trop ouvert. Le réécrire rendrait invérifiable
+chaque reçu déjà signé avec lui. Un second passage conserve donc strictement la
+clé en place — la commande est idempotente, et son idempotence est une garantie
+de conservation, pas une commodité.
+
+Si `BETMAXXING_ACTIVATION_RECEIPT_SECRET` est **positionnée et valide**, elle est
+la configuration : la commande ouvre le répertoire mais n'écrit aucun fichier de
+clé, puisqu'un fichier doublant la variable serait une seconde source de vérité.
+**Positionnée et invalide**, c'est un échec fermé — jamais un repli sur le
+fichier. Le contenu d'une valeur valide n'est ni affiché ni journalisé.
+
+Rien de ce que la commande écrit ne permet de reconstituer la clé : ni sa valeur,
+ni sa longueur, ni un préfixe ou un suffixe, ni une empreinte.
+
+Le succès n'est acquis qu'après relecture de la frontière :
+
+```text
+receipt_boundary_state     = "AVAILABLE"
+receipt_boundary_reason    = ""
+unresolved_attempt_intents = 0
+```
+
+**Conserver cette clé jusqu'à la fin de la campagne.** Sa perte rendrait
+invérifiables tous les reçus signés avec elle.
 
 ### 1. `plan` — hors ligne, 0 crédit
 
