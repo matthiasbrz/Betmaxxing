@@ -158,7 +158,7 @@ from .receipt_store import AuditResult, BoundaryState, CountInvalid, require_aud
 #: instant changes. Results computed under one version are not comparable with
 #: another, which is the whole reason the number exists: a criterion quietly
 #: relaxed after the fact is not a criterion.
-PROVIDER_VALIDATION_PROTOCOL_VERSION = 7
+PROVIDER_VALIDATION_PROTOCOL_VERSION = 8
 
 #: Bump this when the parser, the mapping, the freshness reading or the cost
 #: logic changes in a way that invalidates an earlier proof. A receipt stamped
@@ -177,7 +177,7 @@ PROTOCOL_MAX_ODDS_AGE_SECONDS = 900
 #: D-077 and `docs/provider-validation-protocol.md`. Evidence recorded before it
 #: is history, never qualification. Never recomputed at runtime, never read from
 #: the environment: a date that moves is not an effective date.
-QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC = "2026-08-11T14:20:00+00:00"
+QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC = "2026-08-25T00:00:00+00:00"
 
 #: Only v4 receipts carry the two version stamps, so only v4 can qualify. v2 and
 #: v3 stay readable, honoured as authority for chaining, and reported in the
@@ -338,6 +338,82 @@ PROJECTIONS: dict[str, tuple[str, ...]] = {
 #: requests per invocation, so invocations and requests are simply not the same
 #: number.
 CAMPAIGN_INVOCATIONS: dict[str, int] = {"discover": 4, "core": 6, "additional": 2}
+
+#: The same three numbers under the name the guard and the published report use.
+#: One definition, two readings: :func:`campaign_budget` turns them into traffic,
+#: :func:`campaign_ledger` compares them with what is on disk.
+CAMPAIGN_INVOCATION_LIMITS: dict[str, int] = dict(CAMPAIGN_INVOCATIONS)
+
+#: The single bookmaker of the protocol 8 campaign, chosen from the provider's own
+#: public bookmaker list on 2026-08-24 and dated in `docs/source-matrix.md`. Under v7
+#: this choice was deferred — « ce document ne nomme pas encore ce bookmaker » — and
+#: the one real discovery went out carrying the *other* track's bookmaker. A campaign
+#: whose scope is decided after the first answer is not a pre-registered campaign.
+CAMPAIGN_BOOKMAKER = "pinnacle"
+
+#: The four competitions, two per family, fixed before any call. Two per family is
+#: not a preference: ``min_competitions = 2`` makes a single competition unable to
+#: satisfy a ``CORE_MAPPING_*`` criterion, so which two had to be named in advance.
+#: v7 named none of them, which is exactly how the second one could have been picked
+#: after seeing the first come back empty.
+CAMPAIGN_SCOPES: dict[str, tuple[str, ...]] = {
+    "soccer": ("soccer_epl", "soccer_spain_la_liga"),
+    "tennis": ("tennis_atp_us_open", "tennis_wta_us_open"),
+}
+
+#: Flattened in manifest order, so two reports list the scopes the same way.
+CAMPAIGN_COMPETITIONS: tuple[str, ...] = tuple(
+    sport for scopes in CAMPAIGN_SCOPES.values() for sport in scopes
+)
+
+#: ``additional`` is football-only, as the budget table has always said: five markets
+#: per event at five credits, on the two football competitions and nowhere else.
+CAMPAIGN_ADDITIONAL_SCOPES: tuple[str, ...] = CAMPAIGN_SCOPES["soccer"]
+
+#: The per-scope ceilings, from which the three totals above are derived rather than
+#: retyped. Three ``core`` per family is what ``min_events = 3`` asks for; one
+#: discovery per competition and one ``additional`` per football competition are what
+#: « aucune substitution, aucune relance » means once it is a number.
+CAMPAIGN_CORE_PER_FAMILY = 3
+CAMPAIGN_DISCOVER_PER_COMPETITION = 1
+CAMPAIGN_ADDITIONAL_PER_COMPETITION = 1
+
+#: The status each campaign command must publish to have succeeded. Two of the three
+#: are derived from :data:`ADMISSIBLE_STATUSES_BY_COMMAND` so the two tables cannot
+#: drift apart; ``discover`` has no entry there because no criterion reads a discovery.
+CAMPAIGN_SUCCESS_STATUSES: dict[str, frozenset[str]] = {
+    "discover": frozenset({str(ActivationStatus.DISCOVERY_VERIFIED)}),
+    "core": ADMISSIBLE_STATUSES_BY_COMMAND["core"],
+    "additional": ADMISSIBLE_STATUSES_BY_COMMAND["additional"],
+}
+
+#: The commands the campaign counts. ``plan`` is not one: it opens no socket, spends
+#: nothing and persists no receipt.
+CAMPAIGN_COMMANDS: tuple[str, ...] = ("discover", "core", "additional")
+
+
+def campaign_family(sport_key: object) -> str:
+    """Which manifest family this competition belongs to, or ``""`` for none.
+
+    Exact membership, never a prefix: ``soccer_france_ligue_one`` starts with
+    ``soccer_`` and is still outside this campaign. The criteria read the family
+    prefix — that is a question about the parser — while the campaign reads the
+    manifest, which is a question about what we authorised.
+    """
+    if not isinstance(sport_key, str):
+        return ""
+    for family, scopes in CAMPAIGN_SCOPES.items():
+        if sport_key in scopes:
+            return family
+    return ""
+
+
+def campaign_scopes_for(command: str) -> tuple[str, ...]:
+    """The competitions this command may address."""
+    if command == "additional":
+        return CAMPAIGN_ADDITIONAL_SCOPES
+    return CAMPAIGN_COMPETITIONS
+
 
 #: Every way a receipt can fail to be current evidence, aggregated. Counts only —
 #: no path, no receipt, no tag, no identifier ever appears in a reason.
@@ -515,6 +591,35 @@ class QualificationState(StrEnum):
     INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
     EVIDENCE_CONFLICT = "EVIDENCE_CONFLICT"
     CRITERIA_MET_AWAITING_HUMAN_REVIEW = "CRITERIA_MET_AWAITING_HUMAN_REVIEW"
+
+
+class CampaignCountsState(StrEnum):
+    """Whether the campaign's invocation counts mean anything at all.
+
+    Two values, and the second is the point. A count that could not be taken must
+    not be published as a zero: « I cannot tell how many calls were made » and
+    « no call was made » are opposite facts, and the second one authorises spending.
+    """
+
+    ESTABLISHED = "ESTABLISHED"
+    UNESTABLISHED = "UNESTABLISHED"
+
+
+class CampaignExecutionState(StrEnum):
+    """How far the pre-registered campaign got, read from its own receipts.
+
+    ``ABORTED`` and ``CONFLICT`` are different answers on purpose. A campaign that
+    stopped on an honest failure consumed its invocation and may not continue; a
+    corpus that disagrees with the manifest says something worse — that what is on
+    disk was never the campaign we authorised.
+    """
+
+    NOT_STARTED = "NOT_STARTED"
+    IN_PROGRESS = "IN_PROGRESS"
+    ABORTED = "ABORTED"
+    COMPLETE = "COMPLETE"
+    CONFLICT = "CONFLICT"
+    UNESTABLISHED = "UNESTABLISHED"
 
 
 def campaign_budget() -> dict[str, int]:
@@ -1644,6 +1749,242 @@ def _exact_qualification_count(value: object, field: str) -> int:
     return value
 
 
+# ---------------------------------------------------------------------------
+# The campaign ledger — what was really spent, against what was authorised
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class CampaignLedger:
+    """What the receipts on this boundary say about the pre-registered campaign.
+
+    The static audit 03C-2D bis measured why this type exists. Until protocol 8 the
+    campaign's bounds were a prose table and :func:`campaign_budget`, a pure
+    derivation of constants that read no receipt: nine discoveries and a conforming
+    nine-receipt corpus published *identical* values in every field that could have
+    separated them. Nothing counted, so nothing could refuse.
+
+    Every field is derived from verified receipts of **this** protocol. A receipt
+    stamped with an earlier one — the empty Ligue 1 discovery of protocol 7, for
+    instance — is history: it stays on disk, stays signed, and counts here in nothing.
+    """
+
+    counts_state: CampaignCountsState
+    #: ``None`` whenever ``counts_state`` is ``UNESTABLISHED``. Never a zero standing
+    #: in for a count nobody could take.
+    counts: dict[str, int] | None
+    execution_state: CampaignExecutionState
+    #: Empty unless the campaign stopped; then, which command and which status.
+    abort_reason: str
+    #: Ways the corpus disagrees with the manifest. Each one is an evidence conflict.
+    conflicts: tuple[str, ...]
+    #: Why no count could be taken. Deliberately **not** an evidence conflict: « the
+    #: count is not established » is already published as ``UNESTABLISHED``, and the
+    #: pre-network guard refuses on it. Turning it into a conflict as well would make
+    #: one unreadable file in a directory rewrite the verdict on every other receipt.
+    unestablished_reason: str
+    #: The scopes already consumed, so the guard can refuse a repeat without
+    #: re-reading the directory.
+    discovered: tuple[str, ...]
+    core_by_family: dict[str, int]
+    additional_by_competition: dict[str, int]
+    used_event_tags: dict[str, tuple[str, ...]]
+
+    @property
+    def established(self) -> bool:
+        return self.counts_state is CampaignCountsState.ESTABLISHED and self.counts is not None
+
+    @property
+    def stopped(self) -> bool:
+        """Whether no further network command may be authorised on this boundary."""
+        return self.execution_state in (
+            CampaignExecutionState.ABORTED,
+            CampaignExecutionState.CONFLICT,
+            CampaignExecutionState.UNESTABLISHED,
+        )
+
+
+def _unestablished_ledger(reason: str) -> CampaignLedger:
+    return CampaignLedger(
+        counts_state=CampaignCountsState.UNESTABLISHED,
+        counts=None,
+        execution_state=CampaignExecutionState.UNESTABLISHED,
+        abort_reason="",
+        conflicts=(),
+        unestablished_reason=reason,
+        discovered=(),
+        core_by_family={},
+        additional_by_competition={},
+        used_event_tags={},
+    )
+
+
+def campaign_receipts(receipts: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The deduplicated receipts of **this** protocol that name a campaign command.
+
+    ``currency_reason`` is what separates them from history: it checks the schema, the
+    protocol, the adapter-evidence version and the effective instant in one place, so
+    the campaign and the criteria agree on which receipts belong to this campaign.
+    """
+    return [
+        receipt
+        for receipt in canonical(receipts)
+        if currency_reason(receipt) == ""
+        and (_text(receipt.get("command")) or "") in CAMPAIGN_COMMANDS
+    ]
+
+
+def campaign_ledger(audit: AuditResult, *, unresolved_intents: int = 0) -> CampaignLedger:
+    """Count the campaign from its receipts, or say honestly that it cannot be counted.
+
+    Pure: it reads the audit result it is given and nothing else — no clock, no
+    environment, no file, no HMAC. The boundary state travels inside the result, so an
+    unreadable directory produces ``UNESTABLISHED`` here rather than a confident zero.
+    """
+    receipts = require_audited(audit)
+    unresolved_intents = _exact_qualification_count(unresolved_intents, "unresolved_intents")
+    if audit.boundary is BoundaryState.UNAVAILABLE:
+        return _unestablished_ledger(
+            "La frontière du répertoire de reçus n'a pas pu être lue sans ambiguïté : "
+            "aucune invocation de campagne n'est comptée, ni à la hausse ni à la baisse."
+        )
+    if audit.unverifiable:
+        return _unestablished_ledger(
+            f"{audit.unverifiable} fichier(s) du répertoire n'ont pas pu être vérifiés : "
+            "le compte des invocations de campagne n'est pas établi."
+        )
+    if unresolved_intents:
+        return _unestablished_ledger(
+            f"{unresolved_intents} intent(s) de tentative non résolu(s) : une invocation a "
+            "pu partir sans laisser de reçu, donc le compte n'est pas établi."
+        )
+
+    mine = campaign_receipts(receipts)
+    unreadable = [receipt for receipt in mine if classify(receipt)]
+    if unreadable:
+        return _unestablished_ledger(
+            f"{len(unreadable)} reçu(s) du protocole courant portent une commande de "
+            "campagne sans être lisibles : le compte des invocations n'est pas établi."
+        )
+
+    counts = dict.fromkeys(CAMPAIGN_COMMANDS, 0)
+    discovered: list[str] = []
+    core_by_family: dict[str, int] = {}
+    additional_by_competition: dict[str, int] = {}
+    used: dict[str, list[str]] = {command: [] for command in CAMPAIGN_COMMANDS}
+    conflicts: list[str] = []
+    abort_reason = ""
+    abort_at: datetime | None = None
+
+    ordered = sorted(mine, key=lambda receipt: str(receipt.get("recorded_at") or ""))
+    for receipt in ordered:
+        command = _text(receipt.get("command")) or ""
+        sport = _text(receipt.get("sport_key")) or ""
+        status = _text(receipt.get("status")) or ""
+        counts[command] += 1
+
+        if (_text(receipt.get("bookmaker")) or "") != CAMPAIGN_BOOKMAKER:
+            conflicts.append(
+                f"reçu {command} hors manifeste : la campagne v8 n'autorise que le "
+                f"bookmaker {CAMPAIGN_BOOKMAKER}"
+            )
+        if sport not in campaign_scopes_for(command):
+            conflicts.append(
+                f"reçu {command} hors manifeste : {sport} n'est pas une compétition "
+                f"autorisée pour cette commande"
+            )
+
+        if command == "discover":
+            if sport in discovered:
+                conflicts.append(
+                    f"deuxième découverte de {sport} : une compétition ne se découvre "
+                    "qu'une fois, et un échec ne rouvre pas sa place"
+                )
+            discovered.append(sport)
+        elif command == "core":
+            family = campaign_family(sport)
+            core_by_family[family] = core_by_family.get(family, 0) + 1
+            if family and core_by_family[family] > CAMPAIGN_CORE_PER_FAMILY:
+                conflicts.append(
+                    f"{core_by_family[family]} appels core pour la famille {family} : "
+                    f"le plafond préenregistré est {CAMPAIGN_CORE_PER_FAMILY}"
+                )
+        else:
+            additional_by_competition[sport] = additional_by_competition.get(sport, 0) + 1
+            if additional_by_competition[sport] > CAMPAIGN_ADDITIONAL_PER_COMPETITION:
+                conflicts.append(
+                    f"{additional_by_competition[sport]} appels additional sur {sport} : "
+                    f"le plafond préenregistré est {CAMPAIGN_ADDITIONAL_PER_COMPETITION}"
+                )
+
+        tag = _text(receipt.get("event_tag"))
+        if tag is not None and command in ("core", "additional"):
+            if tag in used[command]:
+                conflicts.append(
+                    f"deux appels {command} sur le même événement : un événement déjà "
+                    "utilisé ne rapproche d'aucun seuil et n'était pas autorisé deux fois"
+                )
+            used[command].append(tag)
+
+        moment = _instant(receipt.get("recorded_at"))
+        if abort_at is not None and moment is not None and moment.astimezone(UTC) > abort_at:
+            conflicts.append(
+                "reçu de campagne postérieur à l'abandon : la campagne v8 était arrêtée "
+                "et aucune commande réseau ne pouvait plus être autorisée"
+            )
+        if status not in CAMPAIGN_SUCCESS_STATUSES[command] and not abort_reason:
+            abort_reason = (
+                f"la commande {command} a publié {status} au lieu du statut de succès "
+                f"attendu ; la campagne v8 est abandonnée et ne se relance pas"
+            )
+            abort_at = moment.astimezone(UTC) if moment is not None else None
+
+    for command, limit in CAMPAIGN_INVOCATION_LIMITS.items():
+        if counts[command] > limit:
+            conflicts.append(
+                f"{counts[command]} invocations {command} : le plafond préenregistré est "
+                f"{limit}, et un dépassement n'est pas un détail comptable"
+            )
+
+    if conflicts:
+        execution = CampaignExecutionState.CONFLICT
+    elif abort_reason:
+        execution = CampaignExecutionState.ABORTED
+    elif counts == CAMPAIGN_INVOCATION_LIMITS:
+        execution = CampaignExecutionState.COMPLETE
+    elif any(counts.values()):
+        execution = CampaignExecutionState.IN_PROGRESS
+    else:
+        execution = CampaignExecutionState.NOT_STARTED
+
+    return CampaignLedger(
+        counts_state=CampaignCountsState.ESTABLISHED,
+        counts=counts,
+        execution_state=execution,
+        abort_reason=abort_reason,
+        conflicts=tuple(dict.fromkeys(conflicts)),
+        unestablished_reason="",
+        discovered=tuple(discovered),
+        core_by_family=core_by_family,
+        additional_by_competition=additional_by_competition,
+        used_event_tags={command: tuple(tags) for command, tags in used.items()},
+    )
+
+
+def campaign_block(ledger: CampaignLedger) -> dict[str, Any]:
+    """The eight published fields, in one place so two reports cannot disagree."""
+    return {
+        "campaign_protocol_version": PROVIDER_VALIDATION_PROTOCOL_VERSION,
+        "campaign_counts_state": str(ledger.counts_state),
+        "campaign_invocation_counts": dict(ledger.counts) if ledger.counts is not None else None,
+        "campaign_invocation_limits": dict(CAMPAIGN_INVOCATION_LIMITS),
+        "campaign_execution_state": str(ledger.execution_state),
+        "campaign_abort_reason": ledger.abort_reason,
+        "campaign_required_bookmaker": CAMPAIGN_BOOKMAKER,
+        "campaign_required_scopes": {
+            family: list(scopes) for family, scopes in CAMPAIGN_SCOPES.items()
+        },
+    }
+
+
 def evaluate(
     audit: AuditResult,
     *,
@@ -1769,6 +2110,13 @@ def evaluate(
             "incomplet d'une manière que rien sur ce disque ne permet de chiffrer"
         )
 
+    #: The campaign is evidence about itself. A corpus that exceeds a pre-registered
+    #: ceiling, names a bookmaker nobody authorised or files a receipt after the
+    #: campaign stopped is not weak evidence to be discounted: it disagrees with what
+    #: we said we would do, and v7 could not even see it.
+    ledger = campaign_ledger(audit, unresolved_intents=unresolved_intents)
+    conflicts.extend(ledger.conflicts)
+
     results: list[dict[str, Any]] = []
     for criterion in CRITERIA:
         if criterion is COST_CONFORMITY:
@@ -1828,6 +2176,13 @@ def evaluate(
             "exclus pour identifiant divergent + invérifiables + copies exactes"
         ),
         "qualification_reasons": reasons,
+        **campaign_block(ledger),
+        "campaign_note": (
+            "Les plafonds de la campagne v8 sont désormais comptés à partir des reçus "
+            "vérifiés du protocole courant, et refusés avant réseau. Aucun compte n'est "
+            "publié tant qu'il n'est pas établi ; un dépassement est un conflit de preuve, "
+            "pas un détail comptable. Rien ici ne promeut l'adaptateur."
+        ),
         "qualification_note": (
             "Aucun statut n'est promu ici. Le maximum atteignable est "
             "CRITERIA_MET_AWAITING_HUMAN_REVIEW ; la promotion de l'adaptateur reste "

@@ -43,6 +43,7 @@ from helpers_activation import (
     BOOKMAKER,
     EVENT_ID,
     FAKE_RECEIPT_SECRET,
+    NOW,
     OTHER_BOOKMAKER,
     OTHER_EVENT_ID,
     OTHER_SPORT,
@@ -426,10 +427,19 @@ class TestCoreDemandsADiscoveryReceipt:
     def test_a_receipt_for_another_bookmaker_is_refused(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        do_discover(monkeypatch, bookmaker=OTHER_BOOKMAKER)
+        """Tampered rather than produced: since protocol 8 the harness cannot make one.
+
+        This used to run ``discover`` with another bookmaker and hand the resulting
+        receipt to ``core``. The campaign guard now refuses that discovery before any
+        socket exists, so the only way such a parent can reach ``load_parent`` at all is
+        if something edited it on disk — which is exactly the case worth testing.
+        """
+        do_discover(monkeypatch)
+        path = receipt_path(keyed, "discover")
+        tamper(path, bookmaker=OTHER_BOOKMAKER)
         recorder = Recorder({"/odds": odds_payload()})
         install(monkeypatch, recorder)
-        result = run(*core_args(discovery_receipt=str(receipt_path(keyed, "discover"))))
+        result = run(*core_args(discovery_receipt=str(path)))
         assert result.exit_code != 0
         assert recorder.requests == []
 
@@ -726,9 +736,33 @@ class TestLegacyReceiptsAreRefusedNotPromoted:
     def test_the_refusal_says_to_rerun_discover(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
+        """The remedy is named by the reader that refuses the file, not by the CLI path.
+
+        Since protocol 8 a v1 file on the boundary is one the audit cannot verify, so
+        the campaign guard refuses *earlier* — the counts are not established, and an
+        unestablished count never reads as a nil one. Both refusals matter, so both are
+        asserted: the command stops, and the reader that judges the file still tells the
+        operator what to do about it.
+        """
         install(monkeypatch, Recorder({"/events/": event_odds_payload()}))
-        result = run(*additional_args(core_receipt=str(self._v1(keyed))))
-        assert "discover" in result.stdout.lower()
+        path = self._v1(keyed)
+        result = run(*additional_args(core_receipt=str(path)))
+        assert result.exit_code != 0
+        assert "unestablished" in result.stdout.lower()
+
+        from betmaxxing.providers.the_odds_api import activation
+
+        with pytest.raises(activation.Refused) as refusal:
+            activation.load_parent(
+                str(path),
+                signing=FAKE_RECEIPT_SECRET,
+                command="core",
+                status=activation.ActivationStatus.CORE_LIVE_VERIFIED,
+                sport=SPORT,
+                bookmaker=BOOKMAKER,
+                now=NOW,
+            )
+        assert "discover" in refusal.value.message.lower()
 
     def test_an_unknown_schema_is_refused(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None

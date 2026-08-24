@@ -30,11 +30,14 @@ from helpers_activation import FAKE_RECEIPT_SECRET
 #: close the qualification gate for the whole module — see the fixture's docstring.
 pytestmark = pytest.mark.usefixtures("isolated_receipt_directory")
 
-FOOTBALL = "soccer_france_ligue_one"
-FOOTBALL_2 = "soccer_epl"
-TENNIS = "tennis_atp_paris"
-TENNIS_2 = "tennis_wta_madrid"
-BOOK = "unibet"
+#: The protocol 8 manifest. A corpus that is meant to reach the human-review gate
+#: has to be inside the pre-registered campaign since v8: a receipt naming another
+#: competition or another bookmaker is an evidence conflict, not weak evidence.
+FOOTBALL = "soccer_epl"
+FOOTBALL_2 = "soccer_spain_la_liga"
+TENNIS = "tennis_atp_us_open"
+TENNIS_2 = "tennis_wta_us_open"
+BOOK = "pinnacle"
 #: Positioned relative to the protocol's own effective instant rather than to dates
 #: invented here: a receipt recorded before the protocol took effect is history, never
 #: qualification, so hard-coded days silently turn the whole corpus historical the next

@@ -262,9 +262,16 @@ def workspace(
     directory deterministically, instead of whichever fixture pytest happened to
     instantiate last.
     """
-    from helpers_activation import FAKE_RECEIPT_SECRET
+    from helpers_activation import BOOKMAKER, FAKE_RECEIPT_SECRET
 
     monkeypatch.setenv("BETMAXXING_MODE", "paper")
+    # The harness parses a paid response with the adapter's own parser, and that parser
+    # keeps only the bookmakers `settings.bookmaker_list` names — not the one passed on
+    # the command line. The two agreed by accident while `--bookmaker` and the shipped
+    # default were both `winamax_fr`; under the protocol 8 manifest they do not, and a
+    # mismatch turns a perfectly good response into `SCHEMA_MISMATCH`. Stated here so
+    # the suites configure what an operator must also configure — see the runbook.
+    monkeypatch.setenv("BETMAXXING_BOOKMAKERS", BOOKMAKER)
     monkeypatch.setenv("BETMAXXING_DATABASE_URL", db_settings.database_url)
     monkeypatch.setenv("BETMAXXING_NOTIFICATIONS_ENABLED", "false")
     monkeypatch.setenv("BETMAXXING_ACTIVATION_RECEIPTS", str(tmp_path / "receipts"))

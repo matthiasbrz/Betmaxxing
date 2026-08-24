@@ -23,9 +23,12 @@ from typing import Any
 from betmaxxing.providers.the_odds_api import activation as act
 from betmaxxing.providers.the_odds_api import qualification as qual
 
-BOOKMAKER = "corpusbook"
-SOCCER = ("soccer_corpus_one", "soccer_corpus_two")
-TENNIS = ("tennis_corpus_one", "tennis_corpus_two")
+#: The protocol 8 manifest, restated. A corpus meant to satisfy every threshold has
+#: to be inside the pre-registered campaign: outside it, every receipt below would
+#: be an evidence conflict and the corpus would prove the opposite of its purpose.
+BOOKMAKER = "pinnacle"
+SOCCER = ("soccer_epl", "soccer_spain_la_liga")
+TENNIS = ("tennis_atp_us_open", "tennis_wta_us_open")
 FIVE = list(act.ADDITIONAL_MARKETS)
 
 

@@ -23,7 +23,7 @@ from __future__ import annotations
 import json as jsonlib
 import os
 import re
-from datetime import UTC, datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -40,14 +40,22 @@ from helpers_activation import FAKE_RECEIPT_SECRET
 #: same thing, and would say nothing extra about v3.
 D073_EFFECTIVE_INSTANT = "2026-08-10T07:19:48+00:00"
 
-FOOTBALL = "soccer_france_ligue_one"
-FOOTBALL_2 = "soccer_epl"
-TENNIS = "tennis_atp_paris"
-TENNIS_2 = "tennis_wta_madrid"
-BOOK = "unibet"
-D1 = datetime(2026, 8, 13, 12, tzinfo=UTC)
-D2 = datetime(2026, 8, 14, 12, tzinfo=UTC)
-D3 = datetime(2026, 8, 15, 12, tzinfo=UTC)
+#: The protocol 8 manifest. A corpus that is meant to reach the human-review gate
+#: has to be inside the pre-registered campaign since v8: a receipt naming another
+#: competition or another bookmaker is an evidence conflict, not weak evidence.
+FOOTBALL = "soccer_epl"
+FOOTBALL_2 = "soccer_spain_la_liga"
+TENNIS = "tennis_atp_us_open"
+TENNIS_2 = "tennis_wta_us_open"
+BOOK = "pinnacle"
+#: Three consecutive UTC days inside the current evidence window. Derived rather
+#: than typed: they were three literals until protocol 8, so moving the effective
+#: instant silently turned every corpus below into history and made the whole suite
+#: assert nothing about the closures it guards.
+_NOT_BEFORE = datetime.fromisoformat(qual.QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC)
+D1 = _NOT_BEFORE + timedelta(days=1)
+D2 = _NOT_BEFORE + timedelta(days=2)
+D3 = _NOT_BEFORE + timedelta(days=3)
 MARKETS = list(act.ADDITIONAL_MARKETS)
 
 
@@ -329,13 +337,18 @@ class TestAMalformedCurrentReceiptProvesNothing:
     def test_the_reason_is_named_without_leaking_anything(
         self, label: str, over: dict[str, Any]
     ) -> None:
-        document = _evaluate([core(**over)], 0)
+        # A bookmaker of its own, not the manifest's: since protocol 8 the report
+        # publishes `campaign_required_bookmaker`, a *constant* it is meant to state,
+        # so asserting the manifest's name is absent would confuse « nothing of this
+        # receipt is echoed » with « the campaign is not described ».
+        sentinel = "leak-sentinel-book"
+        document = _evaluate([core(**{"bookmaker": sentinel, **over})], 0)
         reasons = document["qualification_reasons"]
         assert sum(reasons.values()) == 1
         assert reasons["malformed_current_schema"] + reasons["unusable_recorded_at"] == 1
         rendered = jsonlib.dumps(document, ensure_ascii=False)
         assert "a" * 32 not in rendered
-        assert BOOK not in rendered
+        assert sentinel not in rendered
 
     def test_status_survives_a_directory_of_malformed_receipts(self, workspace: Path) -> None:
         from helpers_activation import run

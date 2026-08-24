@@ -780,8 +780,9 @@ class TestTheDocumentsPublishOneThreatModel:
         assert "hmac" in text, f"{relative} does not name the boundary that carries origin"
         assert "d 078" in text, f"{relative} does not name the decision that bounds it"
 
-    def test_the_protocol_keeps_version_seven_and_its_instant(self) -> None:
-        assert qual.PROVIDER_VALIDATION_PROTOCOL_VERSION == 7
+    def test_the_protocol_keeps_its_versions_and_its_instant(self) -> None:
+        """The threat model of D-078 is unchanged by the campaign boundary of D-082."""
+        assert qual.PROVIDER_VALIDATION_PROTOCOL_VERSION == 8
         assert qual.PROVIDER_ADAPTER_EVIDENCE_VERSION == 1
         assert qual.QUALIFYING_SCHEMA_VERSION == 4
-        assert qual.QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC == "2026-08-11T14:20:00+00:00"
+        assert qual.QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC == "2026-08-25T00:00:00+00:00"

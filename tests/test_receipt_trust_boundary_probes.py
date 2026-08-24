@@ -25,6 +25,7 @@ import os
 import stat as statmodule
 import subprocess
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -62,8 +63,11 @@ def one(**over: Any) -> dict[str, Any]:
     document = build(
         command=over.pop("command", "core"),
         status=over.pop("status", "CORE_LIVE_VERIFIED"),
-        sport=over.pop("sport", "soccer_probe"),
-        moment=over.pop("moment", effective_instant()),
+        # Inside the protocol 8 manifest, and after the threshold corpus: a receipt
+        # naming another competition is a campaign conflict since v8, and one filed
+        # *before* an abort it caused would contradict its own timeline.
+        sport=over.pop("sport", "soccer_epl"),
+        moment=over.pop("moment", effective_instant() + timedelta(days=9)),
         tag=over.pop("tag", "a1" * 16),
         markets=over.pop("markets", ["h2h"]),
         credits=over.pop("credits", 1),

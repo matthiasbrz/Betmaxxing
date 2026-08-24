@@ -502,7 +502,7 @@ class TestTheSchemaIsVersionedForTheNewContract:
             assert receipt["schema_version"] == 4
             # v4's reason to exist: the receipt names the protocol that would
             # judge it and the parser that produced it, both under the signature.
-            assert receipt["qualification_protocol_version"] == 7
+            assert receipt["qualification_protocol_version"] == 8
             assert receipt["provider_adapter_evidence_version"] == 1
 
     def test_the_reader_accepts_every_supported_version(self) -> None:
