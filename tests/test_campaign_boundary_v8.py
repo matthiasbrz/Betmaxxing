@@ -54,6 +54,9 @@ TENNIS = ("tennis_atp_us_open", "tennis_wta_us_open")
 COMPETITIONS = (*FOOTBALL, *TENNIS)
 NOT_BEFORE = "2026-08-25T00:00:00+00:00"
 LIMITS = {"discover": 4, "core": 6, "additional": 2}
+#: The variable the adapter's parser is configured from. Named here rather than
+#: imported, so a test cannot agree with a value the code happened to hold.
+BOOKMAKERS_VARIABLE = "BETMAXXING_BOOKMAKERS"
 
 
 def read(relative: str) -> str:
@@ -66,6 +69,11 @@ def boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     directory = tmp_path / "receipts"
     monkeypatch.setenv(act.RECEIPT_DIR_VARIABLE, str(directory))
     monkeypatch.setenv(act.SECRET_VARIABLE, v8.SECRET)
+    # What an operator must also configure: the parser keeps only the bookmakers this
+    # variable names, and the guard refuses before the network when it omits the
+    # campaign's. Set here so the tests below exercise the rule they are about rather
+    # than all stopping at this one.
+    monkeypatch.setenv(BOOKMAKERS_VARIABLE, BOOKMAKER)
     monkeypatch.delenv("BETMAXXING_THE_ODDS_API_KEY", raising=False)
     monkeypatch.delenv("BETMAXXING_ODDS_API_KEY", raising=False)
     reset_settings_cache()
@@ -430,11 +438,22 @@ class TestAnOutOfManifestCorpusConflicts:
 # 11-13, 19 — the guard, before the key, the intent and the socket
 # ---------------------------------------------------------------------------
 class Tripwire:
-    """Records whether a forbidden step was reached, and stops it if it was."""
+    """Records whether a forbidden step was reached, and stops it if it was.
+
+    The three engaging steps, in the order the harness performs them: reading the
+    provider key, publishing the durable intent, building the HTTP client. Sockets
+    are blocked for the whole session by ``conftest``, so a client that is never
+    built is a request that could never have left.
+    """
 
     def __init__(self) -> None:
         self.key_reads = 0
         self.intents = 0
+        self.clients = 0
+
+    @property
+    def engaged(self) -> dict[str, int]:
+        return {"clé": self.key_reads, "intent": self.intents, "client": self.clients}
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def key(*_: Any, **__: Any) -> str:
@@ -445,8 +464,13 @@ class Tripwire:
             self.intents += 1
             raise AssertionError("un intent a été publié malgré le refus de la garde")
 
+        def client(*_: Any, **__: Any) -> Any:
+            self.clients += 1
+            raise AssertionError("un client HTTP a été construit malgré le refus de la garde")
+
         monkeypatch.setattr(act, "_require_key", key)
         monkeypatch.setattr(act, "publish_intent", intent)
+        monkeypatch.setattr(act, "_client", client)
 
 
 @pytest.mark.usefixtures("boundary")
@@ -749,3 +773,207 @@ class TestNothingHerePromotesAnything:
     def test_a_complete_campaign_still_leaves_the_adapter_unverified(self, boundary: Path) -> None:
         plant(boundary, v8.nominal_campaign())
         assert published(boundary)["adapter_state"] == "IMPLEMENTED_UNVERIFIED"
+
+
+# ---------------------------------------------------------------------------
+# The parser's own configuration, guarded before anything is engaged
+# ---------------------------------------------------------------------------
+class TestTheCampaignBookmakerMustBeConfiguredForTheParser:
+    """The precondition that used to cost a credit and the whole campaign.
+
+    The final re-audit measured it on the shipped default. The harness parses a paid
+    response with the adapter's own parser, and that parser keeps only the bookmakers
+    named by ``BETMAXXING_BOOKMAKERS`` — not the one passed on the command line. The two
+    agreed by accident while both were ``winamax_fr``; under the protocol 8 manifest they
+    do not. A `core` call made exactly as the manifest requires, with the variable simply
+    absent, reached the paid endpoint, kept no selection, published ``SCHEMA_MISMATCH``,
+    spent one credit and put the campaign in ``ABORTED`` — irreversibly, since restarting
+    needs a new protocol. It was written in three documents and enforced by nothing.
+
+    So the configuration is now read *by name* and checked before the provider key, the
+    intent and the client. A refusal here consumes no invocation, aborts nothing and
+    conflicts nothing: the campaign stays exactly as reusable as it was.
+    """
+
+    REFUSEES = (
+        pytest.param(None, id="variable-absente"),
+        pytest.param("", id="variable-vide"),
+        pytest.param("winamax_fr", id="le-defaut-livre"),
+        pytest.param("unibet", id="un-autre-bookmaker"),
+        pytest.param("PINNACLE", id="casse-differente"),
+    )
+    ACCEPTEES = (
+        pytest.param(BOOKMAKER, id="pinnacle-seul"),
+        pytest.param(f"winamax_fr,{BOOKMAKER}", id="pinnacle-parmi-d-autres"),
+    )
+
+    def configure(self, monkeypatch: pytest.MonkeyPatch, value: str | None) -> None:
+        if value is None:
+            monkeypatch.delenv(BOOKMAKERS_VARIABLE, raising=False)
+        else:
+            monkeypatch.setenv(BOOKMAKERS_VARIABLE, value)
+        reset_settings_cache()
+
+    def plant_reachable(self, boundary: Path) -> tuple[str, str]:
+        """A corpus that reaches this guard and nothing else, plus its two parents.
+
+        Three discoveries and one `core`, so no ceiling, no duplicate scope, no abort
+        and no conflict can refuse first — the fourth scope is deliberately left free so
+        that a `discover` has somewhere to go. The parents named on the
+        command line are files *of that corpus*: an extra receipt written beside it
+        would be a second discovery of one competition, and the campaign would be in
+        CONFLICT before this guard was ever consulted.
+
+        Neither parent is ever read on these paths — the provider key, and therefore the
+        tripwire, comes first — but the corpus has to be genuinely complete for the
+        refusal to be attributable to this rule alone.
+        """
+        receipts = [
+            v8.discovery(sport=sport, moment=v8.instant(index), rid=f"d{index:015x}")
+            for index, sport in enumerate(COMPETITIONS[:3])
+        ]
+        receipts.append(
+            v8.core(sport=FOOTBALL[0], moment=v8.instant(10), rid="c" * 16, tag="parent-tag")
+        )
+        plant(boundary, receipts)
+        found: dict[str, str] = {}
+        for path in boundary.glob("*.json"):
+            document = json.loads(path.read_text(encoding="utf-8"))
+            if document.get("sport_key") == FOOTBALL[0]:
+                found[str(document["command"])] = str(path)
+        return found["discover"], found["core"]
+
+    def argv(self, command: str, boundary: Path) -> list[str]:
+        discovery, core = self.plant_reachable(boundary)
+        common = ["--sport", FOOTBALL[0], "--bookmaker", BOOKMAKER, "--allow-network"]
+        if command == "discover":
+            # The one scope the corpus above leaves undiscovered.
+            return [
+                "discover",
+                "--sport",
+                COMPETITIONS[3],
+                "--bookmaker",
+                BOOKMAKER,
+                "--allow-network",
+            ]
+        if command == "core":
+            return [
+                "core",
+                *common,
+                "--event-id",
+                "EV-GUARD-1",
+                "--discovery-receipt",
+                discovery,
+                "--max-credits",
+                "1",
+                "--acknowledge-credits",
+                "1",
+            ]
+        return [
+            "additional",
+            *common,
+            "--event-id",
+            "EV-GUARD-2",
+            "--core-receipt",
+            core,
+            "--max-credits",
+            "5",
+            "--acknowledge-credits",
+            "5",
+        ]
+
+    @pytest.mark.parametrize("configured", REFUSEES)
+    @pytest.mark.parametrize("command", ("discover", "core", "additional"))
+    def test_a_configuration_without_the_campaign_bookmaker_is_refused(
+        self,
+        boundary: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        command: str,
+        configured: str | None,
+    ) -> None:
+        argv = self.argv(command, boundary)
+        before = sorted(p.name for p in boundary.iterdir())
+        etat_avant = published(boundary)
+
+        self.configure(monkeypatch, configured)
+        wire = Tripwire()
+        wire.install(monkeypatch)
+        result = runner.invoke(act.app, argv)
+
+        assert result.exit_code != 0, result.output
+        assert wire.engaged == {"clé": 0, "intent": 0, "client": 0}, wire.engaged
+        assert sorted(p.name for p in boundary.iterdir()) == before, (
+            "la garde a laissé une trace sur la frontière"
+        )
+        # The reason names this rule, not a ceiling, a missing lineage or a credit flag.
+        sortie = result.output.lower()
+        assert "bookmaker de campagne non configuré pour le parser" in sortie, result.output
+        assert f"bookmaker requis = {BOOKMAKER}" in sortie, result.output
+        for etranger in ("plafond", "lignée", "acknowledge", "expiré"):
+            assert etranger not in sortie, f"refus attribué à {etranger!r} : {result.output}"
+
+        # Nothing was consumed: the campaign is exactly as reusable as before.
+        self.configure(monkeypatch, BOOKMAKER)
+        etat_apres = published(boundary)
+        assert etat_apres["campaign_invocation_counts"] == etat_avant["campaign_invocation_counts"]
+        assert etat_apres["campaign_execution_state"] == etat_avant["campaign_execution_state"]
+        assert etat_apres["campaign_execution_state"] != "ABORTED"
+        assert etat_apres["qualification_state"] != "EVIDENCE_CONFLICT"
+        assert etat_apres["accounted_credits_total"] == etat_avant["accounted_credits_total"]
+
+    @pytest.mark.parametrize("configured", ACCEPTEES)
+    @pytest.mark.parametrize("command", ("discover", "core", "additional"))
+    def test_a_configuration_naming_the_campaign_bookmaker_passes_this_guard(
+        self,
+        boundary: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        command: str,
+        configured: str,
+    ) -> None:
+        """It must reach the key tripwire — otherwise the test above proves nothing.
+
+        Without this, every refusal above would be satisfied by *any* earlier guard, and
+        a check that never runs would look exactly like a check that always passes.
+        """
+        argv = self.argv(command, boundary)
+        self.configure(monkeypatch, configured)
+        wire = Tripwire()
+        wire.install(monkeypatch)
+        result = runner.invoke(act.app, argv)
+        assert wire.key_reads == 1, (
+            f"la commande n'a pas atteint la lecture de clé : {result.output}"
+        )
+        assert wire.intents == 0 and wire.clients == 0
+
+    def test_the_refusal_never_echoes_the_configured_value(
+        self, boundary: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Naming the requirement is the job; reflecting the environment is not."""
+        self.argv("discover", boundary)
+        sentinelle = "sentinelle_de_configuration_a_ne_pas_refleter"
+        self.configure(monkeypatch, sentinelle)
+        Tripwire().install(monkeypatch)
+        result = runner.invoke(
+            act.app,
+            ["discover", "--sport", COMPETITIONS[3], "--bookmaker", BOOKMAKER, "--allow-network"],
+        )
+        assert result.exit_code != 0
+        # Asserted together, deliberately: without the second line the test passes on a
+        # build that has no guard at all — nothing is echoed because nothing refuses.
+        assert "bookmaker de campagne non configuré pour le parser" in result.output.lower()
+        assert sentinelle not in result.output
+
+    def test_the_documents_promise_a_guard_and_not_a_habit(self) -> None:
+        for relative in (
+            "docs/provider-validation-protocol.md",
+            "docs/provider-activation.md",
+            "docs/decisions.md",
+        ):
+            text = read(relative)
+            assert BOOKMAKERS_VARIABLE in text, f"{relative} ne nomme pas la variable"
+            # The guarantee itself, in the words that state it: the check happens before
+            # the provider key. A document that only says « exportez la variable » is a
+            # habit, and a habit is what cost a credit and the campaign.
+            assert "avant la lecture de la clé fournisseur" in text, (
+                f"{relative} présente encore la précondition comme opératoire"
+            )

@@ -2351,15 +2351,33 @@ Le harnais devient aussi plus strict qu'avant sur son propre corpus de test : un
 nomme une autre compétition ou un autre bookmaker est désormais un conflit, ce qui a
 demandé d'aligner les corpus synthétiques de sept suites sur le manifeste.
 
-**Une précondition d'exploitation, découverte en alignant ces suites.** Le harnais
-analyse une réponse payante avec le parser de l'adaptateur, et ce parser ne retient que
-les bookmakers de `settings.bookmaker_list` — **pas** celui passé en argument. Les deux
-coïncidaient tant que `--bookmaker` et le défaut livré valaient tous deux `winamax_fr`.
-Sous le manifeste v8 ils divergent : un `core` lancé avec `--bookmaker pinnacle` alors que
-`BETMAXXING_BOOKMAKERS` vaut encore `winamax_fr` reçoit une réponse valide, n'en retient
-aucune sélection, publie `SCHEMA_MISMATCH` et **abandonne la campagne**, pour un crédit
-dépensé. La logique de parsing n'est pas modifiée ici ; la précondition est écrite dans le
-protocole et dans le runbook, et la suite la configure comme un opérateur devra le faire.
+**La configuration du parser est gardée par la machine, pas par une consigne.** Le
+harnais analyse une réponse payante avec le parser de l'adaptateur, et ce parser ne
+retient que les bookmakers nommés par `BETMAXXING_BOOKMAKERS` — **pas** celui passé en
+argument. Les deux coïncidaient tant que `--bookmaker` et le défaut livré valaient tous
+deux `winamax_fr` ; sous le manifeste v8 ils divergent, et le défaut livré n'a pas changé.
+
+La première rédaction de cette décision se contentait de l'écrire. Le réaudit final a
+mesuré ce que cela coûtait : un `core` conforme au manifeste, **la variable simplement
+absente**, atteignait l'endpoint payant, ne retenait aucune sélection, publiait
+`SCHEMA_MISMATCH`, dépensait un crédit et plaçait la campagne en `ABORTED` — sans retour
+possible, puisque recommencer exige un nouveau protocole. Une campagne dont chaque
+plafond est opposable restait ainsi exposée à une perte irréversible causée par une
+variable d'environnement que la garde ne lisait pas, et dont la valeur par défaut était
+précisément celle qui déclenchait la perte.
+
+`campaign_preflight` vérifie donc que `pinnacle` figure dans `BETMAXXING_BOOKMAKERS`,
+pour les trois commandes réseau, avant la lecture de la clé fournisseur, avant tout
+intent et avant toute socket. La variable est lue par son nom via
+`config.configured_bookmakers()` : instancier `Settings` peuplerait tous les champs
+depuis l'environnement, la clé fournisseur comprise. La casse est exacte — `PINNACLE`
+n'est pas `pinnacle` — parce qu'accepter une autre graphie ferait passer pour correcte
+une configuration que le parser ne reconnaîtra pas. Ce refus ne consomme aucune
+invocation, ne dépense aucun crédit, n'abandonne pas la campagne et ne crée aucun conflit
+de preuve.
+
+La logique de parsing n'est pas modifiée : c'est sa **configuration** qui est vérifiée
+avant tout engagement.
 
 **Ce que cette décision ne change pas.** Ni le schéma de reçu (**4**), ni la version de
 preuve adaptateur (**1**), ni le HMAC, ni les marchés, ni les tarifs, ni les bornes

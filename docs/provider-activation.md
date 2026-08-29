@@ -245,7 +245,8 @@ la lecture de la clé fournisseur, la publication d'un intent et toute socket. E
 - un quatrième `core` dans une famille, un second `additional` sur une compétition ;
 - un événement déjà utilisé par la même commande ;
 - **toute** commande si la campagne est `ABORTED` ou `CONFLICT` ;
-- **toute** commande si les comptes ne sont pas établis.
+- **toute** commande si les comptes ne sont pas établis ;
+- **toute** commande si `BETMAXXING_BOOKMAKERS` ne nomme pas `pinnacle`.
 
 Un refus laisse exactement : 0 socket, 0 lecture de clé fournisseur, 0 intent, 0 reçu,
 0 crédit.
@@ -257,18 +258,27 @@ abandonne définitivement la campagne. `status` et `plan` restent lisibles ; `di
 `core` et `additional` sont refusés avant réseau. Recommencer exige un **nouveau
 protocole** — pas une relance de la v8.
 
-### Avant le premier appel payant
+### Avant le premier appel
 
 ```bash
 export BETMAXXING_BOOKMAKERS=pinnacle
 ```
 
 Le harnais analyse une réponse payante avec le parser de l'adaptateur, et ce parser ne
-retient que les bookmakers de `settings.bookmaker_list` — **pas** celui passé en
-argument. Les deux coïncidaient tant que les deux valaient `winamax_fr`. Sous le
-manifeste v8 ils divergent, et un `core` lancé sans cette variable reçoit une réponse
-valide, n'en retient aucune sélection, publie `SCHEMA_MISMATCH` et **abandonne la
-campagne** — pour un crédit dépensé. À vérifier plutôt qu'à supposer.
+retient que les bookmakers nommés par `BETMAXXING_BOOKMAKERS` — **pas** celui passé en
+argument. Les deux coïncidaient tant que les deux valaient `winamax_fr`, qui reste le
+défaut livré ; sous le manifeste v8 ils divergent.
+
+Ce n'est plus une consigne à retenir : la garde le vérifie. `pinnacle` doit figurer dans
+`BETMAXXING_BOOKMAKERS`, et toute autre configuration — variable absente, vide, ou
+nommant d'autres bookmakers — est **refusée avant la lecture de la clé fournisseur,
+avant tout intent et avant toute socket**, pour `discover`, `core` et `additional`. La
+casse est exacte : `PINNACLE` n'est pas `pinnacle`.
+
+Ce refus ne consomme aucune invocation, ne dépense aucun crédit et n'abandonne pas la
+campagne. Sans lui, un `core` conforme au manifeste avec la variable simplement absente
+atteignait l'endpoint payant, publiait `SCHEMA_MISMATCH`, dépensait un crédit et plaçait
+la campagne en `ABORTED` sans retour possible.
 
 ### Ce que `status --json` publie
 
@@ -893,6 +903,7 @@ dans `docs/provider-validation-protocol.md` §8. Résumé opérationnel :
 | Substitution | **aucune**, ni de bookmaker, ni d'événement, ni de compétition |
 | Manifeste v8 | `pinnacle` · `soccer_epl`, `soccer_spain_la_liga`, `tennis_atp_us_open`, `tennis_wta_us_open` |
 | Plafonds opposables | comptés depuis les reçus vérifiés, refusés **avant** réseau |
+| Configuration du parser | `BETMAXXING_BOOKMAKERS` doit contenir `pinnacle` ; sinon refusé avant clé, intent et socket |
 
 Aucune de ces commandes n'a été exécutée par les tranches 03C-1 ni 03C-1 ter :
 elles n'écrivent que le protocole, l'évaluateur et leurs tests.

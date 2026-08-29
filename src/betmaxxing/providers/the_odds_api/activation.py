@@ -103,7 +103,12 @@ from typing import Any
 import httpx
 import typer
 
-from betmaxxing.config import Settings, get_settings
+from betmaxxing.config import (
+    BOOKMAKERS_VARIABLE,
+    Settings,
+    configured_bookmakers,
+    get_settings,
+)
 from betmaxxing.domain.enums import Sport
 from betmaxxing.domain.timeutil import ensure_utc, utc_now
 from betmaxxing.providers.base import CollectionBatch, ProviderError, QuotaInfo
@@ -1419,6 +1424,34 @@ def campaign_preflight(
         refuse(
             f"{sport} n'est pas une compétition préenregistrée pour {command}. La campagne "
             f"v8 n'autorise que {', '.join(allowed)}. Aucune substitution n'est faite."
+        )
+
+    # The parser's own configuration, checked here because a mismatch is not a parsing
+    # problem the operator can see coming. The harness runs a paid response through the
+    # adapter's parser, and that parser keeps only the bookmakers named by
+    # `BETMAXXING_BOOKMAKERS` — not the one on the command line. The two agreed by
+    # accident while both were `winamax_fr`, which is still the shipped default; under
+    # this manifest they do not. The final re-audit measured the cost of leaving that
+    # documentary: a `core` call made exactly as the manifest requires, with the variable
+    # simply absent, reached the paid endpoint, kept no selection, published
+    # SCHEMA_MISMATCH, spent one credit and put the campaign in ABORTED — and restarting
+    # an aborted campaign needs a new protocol.
+    #
+    # Read by name rather than through `get_settings()`: instantiating `Settings` fills
+    # every field from the environment, the provider key included, and this must run
+    # before the key may be read at all. It applies to `discover` too, which parses no
+    # odds: stopping at the free step costs nothing, while discovering first and failing
+    # on the first paid call costs the campaign.
+    if CAMPAIGN_BOOKMAKER not in configured_bookmakers():
+        refuse(
+            "Bookmaker de campagne non configuré pour le parser : "
+            f"bookmaker requis = {CAMPAIGN_BOOKMAKER}. Le parseur de l'adaptateur ne "
+            f"retient que les bookmakers nommés par {BOOKMAKERS_VARIABLE}, et celui de la "
+            "campagne v8 n'y figure pas — une réponse payante parfaitement valide serait "
+            "vidée de toute sélection, publierait SCHEMA_MISMATCH et abandonnerait la "
+            f"campagne. Configurez `export {BOOKMAKERS_VARIABLE}={CAMPAIGN_BOOKMAKER}` "
+            "(la casse exacte compte) puis relancez. Aucune requête n'est émise, aucun "
+            "crédit n'est engagé, aucune invocation n'est consommée."
         )
 
     ledger = campaign_ledger(audit_receipts(), unresolved_intents=len(unresolved_intents()))

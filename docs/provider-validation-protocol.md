@@ -963,21 +963,42 @@ Elle ne promeut rien. `QualificationState` conserve exactement ses trois valeurs
 `INSUFFICIENT_EVIDENCE`, `EVIDENCE_CONFLICT`, `CRITERIA_MET_AWAITING_HUMAN_REVIEW` — et
 `adapter_state` reste `IMPLEMENTED_UNVERIFIED` dans tous les cas.
 
-### Une précondition d'exploitation, à ne pas découvrir en cours de campagne
+### La configuration du parser, garantie par la machine
 
 Le harnais analyse une réponse payante avec le parser de l'adaptateur, et ce parser ne
-retient que les bookmakers nommés par `settings.bookmaker_list` — **pas** celui passé en
+retient que les bookmakers nommés par `BETMAXXING_BOOKMAKERS` — **pas** celui passé en
 argument de la commande. Les deux coïncidaient tant que `--bookmaker` et le défaut livré
-valaient tous deux `winamax_fr` ; sous le manifeste v8 ils divergent. Un `core` lancé
-avec `--bookmaker pinnacle` alors que `BETMAXXING_BOOKMAKERS` vaut encore `winamax_fr`
-reçoit une réponse parfaitement valide, n'en retient aucune sélection, publie
-`SCHEMA_MISMATCH` — et **abandonne la campagne**, pour un crédit dépensé.
+valaient tous deux `winamax_fr` ; sous le manifeste v8 ils divergent, et le défaut livré
+reste `winamax_fr`.
+
+Ce que cela coûtait tant que ce n'était qu'une consigne, mesuré par le réaudit final :
+un `core` conforme au manifeste, **la variable simplement absente**, atteignait
+l'endpoint payant, ne retenait aucune sélection, publiait `SCHEMA_MISMATCH`, dépensait
+un crédit et plaçait la campagne en `ABORTED` — irréversiblement, puisque recommencer
+exige un nouveau protocole. Une précondition écrite dans trois documents et gardée par
+rien.
+
+`campaign_preflight` vérifie donc que `pinnacle` figure dans `BETMAXXING_BOOKMAKERS`,
+pour `discover`, `core` **et** `additional`, avant la lecture de la clé fournisseur,
+avant tout intent et avant toute socket. La variable est lue **par son nom** : instancier
+`Settings` peuplerait tous les champs depuis l'environnement, la clé fournisseur
+comprise, et « avant » doit vouloir dire avant.
+
+La casse est exacte : `PINNACLE` n'est pas `pinnacle`. Les clés du fournisseur sont des
+identifiants minuscules, et accepter silencieusement une autre graphie ferait passer pour
+correcte une configuration que le parser ne reconnaîtra pas.
+
+Ce refus **ne consomme aucune invocation**, ne dépense aucun crédit, n'abandonne pas la
+campagne et ne crée aucun conflit de preuve : la campagne reste exactement aussi
+réutilisable qu'avant.
 
 ```bash
 export BETMAXXING_BOOKMAKERS=pinnacle
 ```
 
-À faire avant le premier appel payant, et à vérifier plutôt qu'à supposer.
+Le contrôle s'applique aussi à `discover`, qui n'analyse pourtant aucune cote :
+s'arrêter à l'étape gratuite ne coûte rien, tandis que découvrir d'abord et échouer au
+premier appel payant coûte la campagne.
 
 ### Budget maximal
 
