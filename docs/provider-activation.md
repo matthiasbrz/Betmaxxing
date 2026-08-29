@@ -276,7 +276,16 @@ avant tout intent et avant toute socket**, pour `discover`, `core` et `additiona
 casse est exacte : `PINNACLE` n'est pas `pinnacle`.
 
 Ce refus ne consomme aucune invocation, ne dépense aucun crédit et n'abandonne pas la
-campagne. Sans lui, un `core` conforme au manifeste avec la variable simplement absente
+campagne.
+
+**`.env` ne suffit pas pour cette variable.** `Settings` lit normalement `.env`, et
+`.env.example` livre d'ailleurs `BETMAXXING_BOOKMAKERS`. Mais la garde la lit
+directement dans l'environnement du processus, par son nom, sans instancier `Settings` :
+instancier le modèle peuplerait tous les champs depuis l'environnement **et depuis
+`.env`**, la clé fournisseur comprise, alors que cette garde doit précéder toute
+lecture de secret. Une entrée présente seulement dans `.env` est donc refusée —
+fail-closed et gratuitement. Exportez la variable plutôt que de sourcer `.env` en bloc,
+qui répandrait vos secrets dans l'environnement du shell. Sans lui, un `core` conforme au manifeste avec la variable simplement absente
 atteignait l'endpoint payant, publiait `SCHEMA_MISMATCH`, dépensait un crédit et plaçait
 la campagne en `ABORTED` sans retour possible.
 

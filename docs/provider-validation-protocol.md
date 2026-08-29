@@ -992,6 +992,15 @@ Ce refus **ne consomme aucune invocation**, ne dépense aucun crédit, n'abandon
 campagne et ne crée aucun conflit de preuve : la campagne reste exactement aussi
 réutilisable qu'avant.
 
+**La variable doit exister dans l'environnement du processus, et pas seulement dans `.env`.**
+`Settings` accepte normalement `.env` — c'est le canal de configuration de tout le
+reste, et `.env.example` y livre cette variable. La garde, elle, la lit directement par
+son nom, sans instancier `Settings` : instancier le modèle peuplerait tous les champs
+depuis l'environnement **et depuis `.env`**, la clé fournisseur comprise, alors que ce
+contrôle doit précéder toute lecture de secret. Le prix de cette pureté est explicite :
+une entrée présente seulement dans `.env` est refusée, fail-closed et sans coût. Ne
+sourcez pas `.env` en bloc pour contourner cela — ce fichier contient des secrets.
+
 ```bash
 export BETMAXXING_BOOKMAKERS=pinnacle
 ```

@@ -31,6 +31,7 @@ needed, one is built from synthetic values.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ import pytest
 from typer.testing import CliRunner, Result
 
 import helpers_campaign_v8 as v8
+from betmaxxing import config as cfg
 from betmaxxing.config import reset_settings_cache
 from betmaxxing.providers.the_odds_api import activation as act
 from betmaxxing.providers.the_odds_api import qualification as qual
@@ -977,3 +979,192 @@ class TestTheCampaignBookmakerMustBeConfiguredForTheParser:
             assert "avant la lecture de la clé fournisseur" in text, (
                 f"{relative} présente encore la précondition comme opératoire"
             )
+
+
+# ---------------------------------------------------------------------------
+# The reader itself, guarded so the two ways of losing it cannot come back
+# ---------------------------------------------------------------------------
+#: Every file that must state the process-environment rule. `.env` is the project's
+#: documented configuration channel and ships this very variable, so an operator who
+#: sets it there and nowhere else is refused — cheaply and fail-closed, but silently
+#: unless each of these says so.
+FICHIERS_REGLE_ENV = (
+    ".env.example",
+    "docs/deployment.md",
+    "docs/provider-activation.md",
+    "docs/provider-validation-protocol.md",
+    "docs/decisions.md",
+)
+#: The normative phrase all five carry, and the command an operator actually runs.
+REGLE_ENV = "environnement du processus"
+EXPORT = f"export {BOOKMAKERS_VARIABLE}={BOOKMAKER}"
+
+#: Variables whose *name* alone marks them as a credential. The reader must consult
+#: none of them; the test never uses a real value for any.
+SENTINELLES_SECRETES = (
+    "BETMAXXING_THE_ODDS_API_KEY",
+    "BETMAXXING_ODDS_API_KEY",
+    "BETMAXXING_SPORTSDATA_API_KEY",
+    "BETMAXXING_TELEGRAM_BOT_TOKEN",
+    "BETMAXXING_SMTP_PASSWORD",
+    "BETMAXXING_API_TOKEN",
+)
+
+
+class _Espion:
+    """Records every environment name the code under test looks at."""
+
+    def __init__(self) -> None:
+        self.noms: list[str] = []
+
+    def installer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        classe = type(os.environ)
+        vrai_gi, vrai_get, vrai_in = (
+            classe.__getitem__,
+            classe.get,
+            classe.__contains__,
+        )
+
+        def noter(cle: object) -> None:
+            if isinstance(cle, str):
+                self.noms.append(cle)
+
+        def gi(soi: Any, cle: Any) -> Any:
+            noter(cle)
+            return vrai_gi(soi, cle)
+
+        def get(soi: Any, cle: Any, defaut: Any = None) -> Any:
+            noter(cle)
+            return vrai_get(soi, cle, defaut)
+
+        def contient(soi: Any, cle: Any) -> bool:
+            noter(cle)
+            return bool(vrai_in(soi, cle))
+
+        monkeypatch.setattr(classe, "__getitem__", gi)
+        monkeypatch.setattr(classe, "get", get)
+        monkeypatch.setattr(classe, "__contains__", contient)
+
+
+class TestTheReaderStaysDedicatedAndShared:
+    """Two ways to lose the guard silently, and one document rule, all pinned.
+
+    The final re-audit ran ten mutations against the guard. Eight were killed by the
+    suite; two were not, and both were security-relevant:
+
+    * swapping the dedicated reader for ``get_settings().bookmaker_list`` yields the
+      *same list* and leaves every test green, while reading the provider key before
+      the guard has decided anything — the exact ordering the guard exists to hold;
+    * letting ``Settings.bookmaker_list`` re-implement its own splitting leaves every
+      test green and reopens the failure the guard prevents: with
+      ``"winamax_fr , pinnacle"`` the guard reads ``pinnacle`` and admits the call
+      while the parser reads ``" pinnacle"`` and drops it — one paid request, one
+      credit, ``SCHEMA_MISMATCH``, campaign aborted.
+
+    The audit's own probes killed both. Probes are not regression guards, so they are
+    committed here.
+    """
+
+    def test_the_reader_consults_its_own_variable_and_nothing_else(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only ``BETMAXXING_BOOKMAKERS``, and no name that marks a credential."""
+        for nom in SENTINELLES_SECRETES:
+            monkeypatch.setenv(nom, "SENTINELLE-SYNTHETIQUE-SANS-VALEUR-REELLE")
+        monkeypatch.setenv(BOOKMAKERS_VARIABLE, BOOKMAKER)
+        reset_settings_cache()
+
+        espion = _Espion()
+        espion.installer(monkeypatch)
+        espion.noms.clear()
+        lu = cfg.configured_bookmakers()
+
+        assert lu == [BOOKMAKER]
+        assert sorted(set(espion.noms)) == [BOOKMAKERS_VARIABLE], espion.noms
+        fuites = [n for n in espion.noms if n in SENTINELLES_SECRETES]
+        assert fuites == [], f"le lecteur a consulté une variable de forme secrète : {fuites}"
+
+    def test_the_reader_instantiates_no_general_configuration(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Tripwires on both doors into ``Settings``; neither may be opened.
+
+        ``Settings`` is a pydantic-settings model: constructing it populates every
+        field from the environment and from ``.env``, the provider key included. This
+        is what makes « before the key » true rather than merely intended.
+        """
+        atteints: list[str] = []
+
+        def piege(nom: str) -> Any:
+            def _f(*_: Any, **__: Any) -> Any:
+                atteints.append(nom)
+                raise AssertionError(f"le lecteur a atteint {nom}")
+
+            # ``reset_settings_cache`` empties the singleton through this same name;
+            # a tripwire without the attribute would fail the test with an
+            # ``AttributeError`` of its own making rather than with a real reading.
+            _f.cache_clear = lambda: None  # type: ignore[attr-defined]
+            return _f
+
+        # The cache is emptied for real once, before the doors are wired shut.
+        monkeypatch.setenv(BOOKMAKERS_VARIABLE, BOOKMAKER)
+        reset_settings_cache()
+
+        monkeypatch.setattr(cfg, "get_settings", piege("get_settings"))
+        monkeypatch.setattr(cfg.Settings, "__init__", piege("Settings.__init__"))
+        monkeypatch.setattr(act, "get_settings", piege("activation.get_settings"))
+
+        # The reader itself.
+        assert cfg.configured_bookmakers() == [BOOKMAKER]
+
+        # And the guard's own call site, which is where the ordering actually holds.
+        # Asserting only the reader lets a mutation swap `configured_bookmakers()` for
+        # `get_settings().bookmaker_list` *at the call site*: the list is identical, the
+        # reader stays pure, and the guard reads the provider key anyway.
+        monkeypatch.setenv(BOOKMAKERS_VARIABLE, "winamax_fr")
+        with pytest.raises(act.Refused) as refus:
+            act.campaign_preflight("discover", sport=FOOTBALL[0], bookmaker=BOOKMAKER)
+        assert "bookmaker de campagne non configuré pour le parser" in refus.value.message.lower()
+        assert atteints == [], atteints
+
+    def test_both_readers_delegate_to_the_one_splitting_function(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Structurally the same function, not two implementations that agree today.
+
+        A spy rather than a comparison of outputs: two independent splitters can agree
+        on every value a test happens to try and still diverge on a spaced list, which
+        is precisely the case that costs a credit and the campaign.
+        """
+        vus: list[str] = []
+        SENTINELLE = ["sentinelle-de-decoupage"]
+
+        def espion(brut: str) -> list[str]:
+            vus.append(brut)
+            return list(SENTINELLE)
+
+        monkeypatch.setattr(cfg, "split_bookmakers", espion)
+        brut = "winamax_fr , pinnacle"
+        monkeypatch.setenv(BOOKMAKERS_VARIABLE, brut)
+        reset_settings_cache()
+
+        assert cfg.configured_bookmakers() == SENTINELLE
+        assert cfg.get_settings().bookmaker_list == SENTINELLE
+        assert vus == [brut, brut], (
+            "les deux lecteurs doivent passer la chaîne brute exacte à la même fonction"
+        )
+
+    def test_every_document_states_the_process_environment_rule(self) -> None:
+        """`.env` alone is refused, and each document that configures says so."""
+        for relative in FICHIERS_REGLE_ENV:
+            texte = read(relative)
+            assert BOOKMAKERS_VARIABLE in texte, f"{relative} ne nomme pas la variable"
+            assert REGLE_ENV in texte, (
+                f"{relative} n'énonce pas que la campagne v8 exige la variable dans "
+                f"l'{REGLE_ENV}, et non seulement dans .env"
+            )
+            assert ".env" in texte, f"{relative} ne situe pas la règle par rapport à .env"
+        for relative in FICHIERS_REGLE_ENV:
+            if relative == "docs/decisions.md":
+                continue
+            assert EXPORT in read(relative), f"{relative} ne montre pas la commande {EXPORT}"

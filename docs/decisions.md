@@ -2379,6 +2379,17 @@ de preuve.
 La logique de parsing n'est pas modifiée : c'est sa **configuration** qui est vérifiée
 avant tout engagement.
 
+**Ce que cette pureté coûte, écrit plutôt que découvert.** `Settings` accepte `.env`, et
+`.env.example` y livre `BETMAXXING_BOOKMAKERS`. La garde ne le peut pas : elle lit la
+variable dans l'environnement du processus, par son nom, précisément pour ne pas instancier
+un modèle qui peuplerait tous les champs depuis l'environnement **et depuis `.env`**, la
+clé fournisseur comprise. Une entrée présente seulement dans `.env` est donc refusée.
+Ce refus est fail-closed, antérieur à la clé, à l'intent et à la socket, et ne consomme
+ni invocation ni crédit — mais un opérateur qui configure ce projet comme les documents
+le lui disent serait autrement refusé sans comprendre pourquoi, alors les cinq fichiers
+qui configurent le disent. L'alternative — sourcer `.env` en bloc — répandrait les
+secrets dans l'environnement du shell et n'est pas recommandée.
+
 **Ce que cette décision ne change pas.** Ni le schéma de reçu (**4**), ni la version de
 preuve adaptateur (**1**), ni le HMAC, ni les marchés, ni les tarifs, ni les bornes
 locales, ni le vocabulaire de `QualificationState`, ni le plafond machine
