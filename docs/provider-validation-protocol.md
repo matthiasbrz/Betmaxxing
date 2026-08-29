@@ -1,4 +1,4 @@
-# Protocole de qualification du fournisseur — `PROVIDER_VALIDATION_PROTOCOL_VERSION = 7`
+# Protocole de qualification du fournisseur — `PROVIDER_VALIDATION_PROTOCOL_VERSION = 8`
 
 Ce document dit, **avant** les appels, combien de preuve live justifierait de
 *demander* à un humain de promouvoir l'adaptateur The Odds API. Il ne promeut rien
@@ -186,6 +186,38 @@ prétendait avoir fermée. Un intent divergent sous un identifiant déjà pris �
 en silence, une cible vide comptait comme publication réussie, et le contenu hostile d'un
 intent était réfléchi verbatim dans `unresolved_attempt_intent_details`.
 
+## 0 quater. Ce que la v8 ferme, et ce qu'elle abandonne
+
+La v7 a été exécutée une fois. Une seule commande réseau est partie — une découverte
+sur `soccer_france_ligue_one` chez `winamax_fr` — et elle est revenue
+`COVERAGE_MISSING`, `events_admissible = 0`, deux requêtes, zéro crédit. Le reçu de
+cet appel est conservé, signé, **historique non qualifiant**. Il ne doit être ni
+supprimé, ni mis en quarantaine, ni réutilisé.
+
+La campagne v7 est **abandonnée**, et pas parce qu'elle a échoué : parce qu'une de ses
+quatre invocations `discover` a été consommée sans événement, et que les trois places
+restantes ne permettent plus d'établir les deux compétitions exigées dans chaque
+famille. Aucun réessai, aucun élargissement de fenêtre, aucun changement opportuniste
+de bookmaker n'ouvre de porte de sortie.
+
+L'audit statique 03C-2D bis a mesuré pourquoi la v8 existe. Les bornes de la campagne
+v7 — quatre `discover`, six `core`, deux `additional`, seize crédits — vivaient dans
+une table de prose et dans `campaign_budget()`, une dérivation pure de constantes qui
+**ne lisait aucun reçu**. Deux corpus ont été comparés champ par champ : neuf
+découvertes, soit plus du double des quatre allouées, et un corpus conforme de neuf
+reçus. Ils publiaient des valeurs **identiques** dans chaque champ susceptible de les
+distinguer. Un opérateur pouvait relancer `discover` jusqu'à en trouver une non vide et
+présenter le résultat comme la campagne prévue ; `activation status` ne l'aurait pas
+contredit.
+
+| Défaut v7 | Correction v8 |
+| --- | --- |
+| aucune compétition préenregistrée : les deux compétitions par famille étaient exigées par `min_competitions = 2` sans que lesquelles soit écrit nulle part | manifeste fermé : `pinnacle`, et exactement `soccer_epl`, `soccer_spain_la_liga`, `tennis_atp_us_open`, `tennis_wta_us_open`, choisis et datés **avant** tout appel |
+| bookmaker de la piste A jamais choisi — « ce document ne nomme pas encore ce bookmaker » — et la seule découverte réelle partie sous le bookmaker de la piste B | `pinnacle`, nommé ici et dans `docs/source-matrix.md` avec ses sources publiques et leur date de consultation |
+| plafonds documentaires : rien ne comptait les invocations, rien n'en publiait le compte | `campaign_ledger` compte les invocations à partir des reçus vérifiés du protocole courant, et `campaign_preflight` refuse **avant réseau** |
+| un dépassement était indiscernable d'un corpus conforme | un dépassement est un `EVIDENCE_CONFLICT`, et `campaign_execution_state` le nomme |
+| un compte impossible à prendre pouvait se lire comme un compte nul | `campaign_counts_state = UNESTABLISHED` et `campaign_invocation_counts = null` ; aucun chiffre n'est publié avant d'avoir été pris |
+
 **Ce que la v7 change**, point par point, avec la décision D-077 :
 
 | Défaut v6 | Correction v7 |
@@ -243,7 +275,7 @@ Portée commune à tous : provider `the_odds_api`, un seul bookmaker par
 observation **et `bookmaker_state = OBSERVED`**, âge du marché ≤ **900 s**, reçu
 **v4** portant `qualification_protocol_version = 5` et
 `provider_adapter_evidence_version = 1`, `recorded_at`
-**≥ `2026-08-11T14:20:00+00:00`**, **atteinte du fournisseur établie** au sens du §2.4,
+**≥ `2026-08-25T00:00:00+00:00`**, **atteinte du fournisseur établie** au sens du §2.4,
 et **contrat structurel du §2.0 satisfait**.
 
 Le 900 est un littéral du protocole. Le produit a par ailleurs un réglage runtime
@@ -591,7 +623,7 @@ Une observation compte si, et seulement si, elle est :
 
 1. portée par un reçu **v4** dont la **signature se vérifie localement**, portant
    `qualification_protocol_version = 5` et `provider_adapter_evidence_version = 1` ;
-2. **postérieure ou égale** à `2026-08-11T14:20:00+00:00`, `recorded_at` étant un
+2. **postérieure ou égale** à `2026-08-25T00:00:00+00:00`, `recorded_at` étant un
    ISO 8601 avec timezone, normalisé en UTC pour la comparaison ;
 3. rattachée à une **tentative confirmée dont le fournisseur a réellement été
    atteint** : `network_attempted is true`, `attempts ≥ 1` **et**
@@ -846,38 +878,136 @@ conversation, pas une porte.
 Supprimer le répertoire de reçus remet la preuve à zéro (D-062). C'est voulu : la
 preuve est locale, et une machine réinstallée n'a rien observé.
 
-## 8. Campagne préparée — non exécutée
+## 8. Campagne protocole 8 — préenregistrée, non exécutée
 
 Aucune commande `discover`, `core` ou `additional` n'est lancée par cette tranche.
-Chaque appel exigera une autorisation humaine distincte.
+Chaque appel exigera une autorisation humaine distincte, et la machine refuse
+désormais tout ce que ce manifeste n'autorise pas.
 
-### Piste A — vérifier le parser
+### Le manifeste, fermé avant le premier appel
 
-Objet : établir `CORE_MAPPING_*` et `ADDITIONAL_MAPPING_*` avec un bookmaker
-**raisonnablement susceptible d'être couvert**, choisi sur la documentation
-publique officielle du fournisseur, **datée dans `docs/source-matrix.md` au moment
-du choix**. Ce document ne nomme pas encore ce bookmaker : le faire maintenant
-serait transformer une disponibilité théorique en preuve de couverture. Le choix,
-sa source et sa date seront écrits avant le premier appel.
+**Bookmaker unique : `pinnacle`.** Choisi sur la liste publique des bookmakers du
+fournisseur, consultée le **2026-08-24** et inscrite dans `docs/source-matrix.md` avec
+son URL. C'est un préenregistrement, pas une affirmation de couverture live.
 
-Règles :
+**Quatre compétitions, deux par famille :**
 
-- football puis tennis, **séparément** ;
-- un sport, une compétition, un événement, un bookmaker **par autorisation** ;
-- `discover` (0 crédit) puis `core` (1 crédit) ;
-- `additional` (5 crédits) **uniquement après** un `CORE_LIVE_VERIFIED` pertinent ;
-- **arrêt immédiat** sur `COVERAGE_MISSING`, `COST_MISMATCH` ou mapping rejeté ;
-- **aucune substitution automatique** de bookmaker ou d'événement.
+| Famille | Compétitions préenregistrées |
+| --- | --- |
+| football | `soccer_epl`, `soccer_spain_la_liga` |
+| tennis | `tennis_atp_us_open`, `tennis_wta_us_open` |
 
-Cette piste valide le parser pour le bookmaker réellement observé. Elle **ne
-remplace pas Winamax** dans le produit.
+Deux par famille n'est pas une préférence : `min_competitions = 2` rend une seule
+compétition incapable de satisfaire un critère `CORE_MAPPING_*`. Lesquelles devait donc
+être écrit à l'avance, et la v7 ne l'écrivait pas — c'est exactement ainsi que la
+seconde aurait pu être choisie après avoir vu la première revenir vide.
 
-### Piste B — couverture Winamax
+`additional` est réservé au football : deux appels, un par compétition football.
 
-Indépendante de la piste A. Le constat acquis reste **borné** : `winamax_fr` était
-absent des deux événements SPL testés le **2026-08-07**. Cela ne se généralise ni
-au fournisseur, ni à la SPL, ni à une autre date. Toute nouvelle vérification
-exige une autorisation par appel, et ne déclenche **aucun** repli vers la démo.
+Si une compétition est inactive, vide ou non couverte au moment autorisé, **la campagne
+v8 échoue sans substitution**.
+
+`winamax_fr` et la piste B sont exclus de la campagne v8. Les vérifier exigerait un
+protocole ultérieur distinct.
+
+### Les plafonds, comptés par la machine
+
+| Commande | Plafond | Répartition |
+| --- | --- | --- |
+| `discover` : 4 invocations | une par compétition | 1 × 4 compétitions |
+| `core` : 6 invocations | trois par famille | 3 × 2 familles |
+| `additional` : 2 invocations | une par compétition football | 1 × 2 compétitions |
+
+`campaign_preflight` vérifie tout cela **avant** la lecture de la clé fournisseur,
+**avant** la publication d'un intent et **avant** toute socket. Un refus laisse zéro
+socket, zéro lecture de clé, zéro intent, zéro reçu, zéro crédit. Le secret de signature
+local est lu avant ce contrôle, parce qu'auditer nos propres reçus est ce qui rend le
+compte possible — et cela ne coûte rien chez le fournisseur.
+
+**Un échec consomme son invocation.** Il ne crée aucun droit de remplacement ni de
+relance.
+
+### L'abandon
+
+Une commande réseau v8 dont le reçu vérifié ne porte pas le statut de succès de cette
+commande abandonne définitivement la campagne :
+
+| Commande | Statut de succès | Tout autre statut |
+| --- | --- | --- |
+| `discover` | `DISCOVERY_VERIFIED` | campagne `ABORTED` |
+| `core` | `CORE_LIVE_VERIFIED` | campagne `ABORTED` |
+| `additional` | `ADDITIONAL_LIVE_VERIFIED` ou `ADDITIONAL_PARTIAL_COVERAGE` | campagne `ABORTED` |
+
+Après abandon, `status` et `plan` restent lisibles hors réseau ; `discover`, `core` et
+`additional` sont refusés avant réseau. Recommencer exige un **nouveau protocole**, pas
+une relance de la v8. Un reçu v8 postérieur à l'instant d'abandon est un
+`EVIDENCE_CONFLICT` : le corpus contredirait son propre arrêt.
+
+### Corpus hors manifeste ou forgé
+
+Dans l'évaluation, un `EVIDENCE_CONFLICT` est produit par un reçu v8 signé mais hors
+bookmaker, hors compétition ou hors plafond ; par une cinquième découverte, un septième
+`core` ou un troisième `additional` ; par deux découvertes d'une même compétition ; par
+deux appels d'une même commande sur un même événement. Les doublons et les lignées
+contradictoires restent des conflits comme avant.
+
+Un audit qui ne peut pas établir les comptes ne publie **aucun faux zéro** : il publie
+`campaign_counts_state = UNESTABLISHED` et `campaign_invocation_counts = null`, et la
+garde refuse tout appel réseau sur cette base.
+
+Le reçu réel v7 demeure historique et ne compte dans aucun compteur v8.
+
+### Ce que la campagne v8 ne peut toujours pas faire
+
+Elle ne promeut rien. `QualificationState` conserve exactement ses trois valeurs —
+`INSUFFICIENT_EVIDENCE`, `EVIDENCE_CONFLICT`, `CRITERIA_MET_AWAITING_HUMAN_REVIEW` — et
+`adapter_state` reste `IMPLEMENTED_UNVERIFIED` dans tous les cas.
+
+### La configuration du parser, garantie par la machine
+
+Le harnais analyse une réponse payante avec le parser de l'adaptateur, et ce parser ne
+retient que les bookmakers nommés par `BETMAXXING_BOOKMAKERS` — **pas** celui passé en
+argument de la commande. Les deux coïncidaient tant que `--bookmaker` et le défaut livré
+valaient tous deux `winamax_fr` ; sous le manifeste v8 ils divergent, et le défaut livré
+reste `winamax_fr`.
+
+Ce que cela coûtait tant que ce n'était qu'une consigne, mesuré par le réaudit final :
+un `core` conforme au manifeste, **la variable simplement absente**, atteignait
+l'endpoint payant, ne retenait aucune sélection, publiait `SCHEMA_MISMATCH`, dépensait
+un crédit et plaçait la campagne en `ABORTED` — irréversiblement, puisque recommencer
+exige un nouveau protocole. Une précondition écrite dans trois documents et gardée par
+rien.
+
+`campaign_preflight` vérifie donc que `pinnacle` figure dans `BETMAXXING_BOOKMAKERS`,
+pour `discover`, `core` **et** `additional`, avant la lecture de la clé fournisseur,
+avant tout intent et avant toute socket. La variable est lue **par son nom** : instancier
+`Settings` peuplerait tous les champs depuis l'environnement, la clé fournisseur
+comprise, et « avant » doit vouloir dire avant.
+
+La casse est exacte : `PINNACLE` n'est pas `pinnacle`. Les clés du fournisseur sont des
+identifiants minuscules, et accepter silencieusement une autre graphie ferait passer pour
+correcte une configuration que le parser ne reconnaîtra pas.
+
+Ce refus **ne consomme aucune invocation**, ne dépense aucun crédit, n'abandonne pas la
+campagne et ne crée aucun conflit de preuve : la campagne reste exactement aussi
+réutilisable qu'avant.
+
+**La variable doit exister dans l'environnement du processus, et pas seulement dans `.env`.**
+`Settings` accepte normalement `.env` — c'est le canal de configuration de tout le
+reste, et `.env.example` y livre cette variable. La garde, elle, la lit directement par
+son nom, sans instancier `Settings` : instancier le modèle peuplerait tous les champs
+depuis l'environnement **et depuis `.env`**, la clé fournisseur comprise, alors que ce
+contrôle doit précéder toute lecture de secret. Le prix de cette pureté est explicite :
+une entrée présente seulement dans `.env` est refusée, fail-closed et sans coût. Ne
+sourcez pas `.env` en bloc pour contourner cela — ce fichier contient des secrets.
+
+```bash
+export BETMAXXING_BOOKMAKERS=pinnacle
+```
+
+Le contrôle s'applique aussi à `discover`, qui n'analyse pourtant aucune cote :
+s'arrêter à l'étape gratuite ne coûte rien, tandis que découvrir d'abord et échouer au
+premier appel payant coûte la campagne.
 
 ### Budget maximal
 
@@ -891,8 +1021,8 @@ total valent seize par coïncidence.
 
 | Étape | Invocations CLI | Requêtes HTTP maximales | Crédits/appel | Crédits max |
 | --- | --- | --- | --- | --- |
-| `discover` football (2 jours) | 2 | 4 | 0 | 0 |
-| `discover` tennis (2 jours) | 2 | 4 | 0 | 0 |
+| `discover` football (`soccer_epl`, `soccer_spain_la_liga`) | 2 | 4 | 0 | 0 |
+| `discover` tennis (`tennis_atp_us_open`, `tennis_wta_us_open`) | 2 | 4 | 0 | 0 |
 | `core` football | 3 | 3 | 1 | 3 |
 | `core` tennis | 3 | 3 | 1 | 3 |
 | `additional` football | 2 | 2 | 5 | 10 |
@@ -910,11 +1040,18 @@ Ces cinq totaux sont dérivés de `CAMPAIGN_INVOCATIONS`, `LOCAL_BOUNDS` et
 dérivation à ce document ligne par ligne : une nouvelle confusion entre invocations
 et requêtes fait échouer la suite au lieu de passer inaperçue.
 
+Depuis la v8 ces bornes ne sont plus seulement documentaires : `campaign_ledger` les
+confronte aux reçus vérifiés présents sur la frontière, `campaign_preflight` refuse
+avant réseau ce qui les dépasserait, et `status --json` publie
+`campaign_invocation_counts` à côté de `campaign_invocation_limits`. Le dépassement
+qu'aucun champ ne distinguait d'un corpus conforme est maintenant un
+`EVIDENCE_CONFLICT` nommé.
+
 ### Arrêts anticipés qui réduisent le coût
 
 | Constat | Effet |
 | --- | --- |
-| `discover` sans événement admissible | 0 crédit dépensé, campagne suspendue |
+| `discover` sans événement admissible | 0 crédit dépensé, invocation consommée, campagne `ABORTED` — voir §8 |
 | `COVERAGE_MISSING` au premier `core` | 1 crédit, pas de `additional` |
 | `COST_MISMATCH` sur un appel | arrêt immédiat, `COST_CONFORMITY` échoue |
 | mapping rejeté sur `core` | arrêt : `additional` n'est pas tenté |

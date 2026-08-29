@@ -73,12 +73,19 @@ def receipts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return directory
 
 
+#: Inside the protocol 8 manifest. These were a scope of their own until v8, when
+#: a receipt naming another competition or another bookmaker became a campaign
+#: conflict — which would have made every corpus here assert the wrong thing.
+_SPORT = "soccer_epl"
+_BOOKMAKER = "pinnacle"
+
+
 def attempt(**over: Any) -> act.Attempt:
     now = ensure_utc(act._clock())
     fields: dict[str, Any] = {
         "command": "core",
-        "sport": "soccer_probe",
-        "bookmaker": "probebook",
+        "sport": _SPORT,
+        "bookmaker": _BOOKMAKER,
         "window": (now, now + timedelta(hours=24)),
         "ceiling": 1,
         "now": now,
@@ -105,8 +112,8 @@ def receipt_of(**over: Any) -> dict[str, Any]:
         "status": "CORE_LIVE_VERIFIED",
         "recorded_at": now.isoformat(),
         "expires_at": (now + timedelta(hours=6)).isoformat(),
-        "sport_key": "soccer_probe",
-        "bookmaker": "probebook",
+        "sport_key": _SPORT,
+        "bookmaker": _BOOKMAKER,
         "event_tag": act.event_tag("EV-PROBE-1", LOCAL),
         "network_attempted": True,
         "may_have_reached_provider": True,
@@ -319,7 +326,7 @@ class TestNoForgeryResolvesAnIntent:
         ("label", "over"),
         [
             ("an earlier protocol", {"qualification_protocol_version": 6}),
-            ("a later protocol", {"qualification_protocol_version": 8}),
+            ("a later protocol", {"qualification_protocol_version": 9}),
             ("an earlier schema", {"schema_version": 3}),
             ("another adapter evidence version", {"provider_adapter_evidence_version": 0}),
         ],

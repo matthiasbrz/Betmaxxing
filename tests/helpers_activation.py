@@ -30,9 +30,14 @@ NOW = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
 FAKE_KEY = "FAKEKEY0000deadbeef0000FAKEKEY00"
 #: A deterministic signing secret, injected so no test depends on real randomness.
 FAKE_RECEIPT_SECRET = "0011223344556677889900aabbccddeeff00112233445566778899aabbccddee"
-SPORT = "soccer_france_ligue_one"
-OTHER_SPORT = "soccer_epl"
-BOOKMAKER = "winamax_fr"
+#: The two football competitions of the protocol 8 manifest. The harness only
+#: serves the pre-registered campaign since v8, so a fixture outside it is
+#: refused before the network by `campaign_preflight` — which is the point.
+SPORT = "soccer_epl"
+OTHER_SPORT = "soccer_spain_la_liga"
+BOOKMAKER = "pinnacle"
+#: Payload-only: a bookmaker the provider returned and we did not ask for. Never
+#: passed as a CLI argument — the guard would refuse it before anything happened.
 OTHER_BOOKMAKER = "unibet"
 EVENT_ID = "evt-fixture-0001"
 OTHER_EVENT_ID = "evt-fixture-0002"

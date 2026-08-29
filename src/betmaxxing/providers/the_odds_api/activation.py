@@ -103,7 +103,12 @@ from typing import Any
 import httpx
 import typer
 
-from betmaxxing.config import Settings, get_settings
+from betmaxxing.config import (
+    BOOKMAKERS_VARIABLE,
+    Settings,
+    configured_bookmakers,
+    get_settings,
+)
 from betmaxxing.domain.enums import Sport
 from betmaxxing.domain.timeutil import ensure_utc, utc_now
 from betmaxxing.providers.base import CollectionBatch, ProviderError, QuotaInfo
@@ -1378,6 +1383,133 @@ def _signing_secret() -> str:
         ) from exc
 
 
+def campaign_preflight(
+    command: str, *, sport: str, bookmaker: str, event_tag_value: str | None = None
+) -> None:
+    """Refuse a network command the pre-registered campaign does not authorise.
+
+    Called **before** the provider key is read, before an intent is published and
+    before any socket exists, so a refusal here leaves nothing behind: no request,
+    no receipt, no intent, no credit. It reads the local boundary and the signing
+    secret, which the caller has already obtained — auditing our own receipts is what
+    makes the count possible, and it costs nothing at the provider.
+
+    Until protocol 8 this function did not exist, and the campaign's bounds lived in
+    a prose table nothing consulted. The static audit 03C-2D bis showed the
+    consequence by measurement: an overrun of the four allocated discoveries was
+    indistinguishable, in every published field, from a conforming corpus.
+    """
+    from .qualification import (
+        CAMPAIGN_ADDITIONAL_PER_COMPETITION,
+        CAMPAIGN_BOOKMAKER,
+        CAMPAIGN_CORE_PER_FAMILY,
+        CAMPAIGN_INVOCATION_LIMITS,
+        CampaignExecutionState,
+        campaign_family,
+        campaign_ledger,
+        campaign_scopes_for,
+    )
+
+    def refuse(message: str) -> None:
+        raise Refused(ActivationStatus.PREPARED_NOT_EXECUTED, message)
+
+    if bookmaker != CAMPAIGN_BOOKMAKER:
+        refuse(
+            f"La campagne v8 est préenregistrée sur le bookmaker {CAMPAIGN_BOOKMAKER} ; "
+            f"{bookmaker!r} n'est pas autorisé. Aucune requête n'est émise, aucun crédit "
+            "n'est engagé. Changer de bookmaker après coup exigerait un nouveau protocole."
+        )
+    allowed = campaign_scopes_for(command)
+    if sport not in allowed:
+        refuse(
+            f"{sport} n'est pas une compétition préenregistrée pour {command}. La campagne "
+            f"v8 n'autorise que {', '.join(allowed)}. Aucune substitution n'est faite."
+        )
+
+    # The parser's own configuration, checked here because a mismatch is not a parsing
+    # problem the operator can see coming. The harness runs a paid response through the
+    # adapter's parser, and that parser keeps only the bookmakers named by
+    # `BETMAXXING_BOOKMAKERS` — not the one on the command line. The two agreed by
+    # accident while both were `winamax_fr`, which is still the shipped default; under
+    # this manifest they do not. The final re-audit measured the cost of leaving that
+    # documentary: a `core` call made exactly as the manifest requires, with the variable
+    # simply absent, reached the paid endpoint, kept no selection, published
+    # SCHEMA_MISMATCH, spent one credit and put the campaign in ABORTED — and restarting
+    # an aborted campaign needs a new protocol.
+    #
+    # Read by name rather than through `get_settings()`: instantiating `Settings` fills
+    # every field from the environment, the provider key included, and this must run
+    # before the key may be read at all. It applies to `discover` too, which parses no
+    # odds: stopping at the free step costs nothing, while discovering first and failing
+    # on the first paid call costs the campaign.
+    if CAMPAIGN_BOOKMAKER not in configured_bookmakers():
+        refuse(
+            "Bookmaker de campagne non configuré pour le parser : "
+            f"bookmaker requis = {CAMPAIGN_BOOKMAKER}. Le parseur de l'adaptateur ne "
+            f"retient que les bookmakers nommés par {BOOKMAKERS_VARIABLE}, et celui de la "
+            "campagne v8 n'y figure pas — une réponse payante parfaitement valide serait "
+            "vidée de toute sélection, publierait SCHEMA_MISMATCH et abandonnerait la "
+            f"campagne. Configurez `export {BOOKMAKERS_VARIABLE}={CAMPAIGN_BOOKMAKER}` "
+            "(la casse exacte compte) puis relancez. Aucune requête n'est émise, aucun "
+            "crédit n'est engagé, aucune invocation n'est consommée."
+        )
+
+    ledger = campaign_ledger(audit_receipts(), unresolved_intents=len(unresolved_intents()))
+    if not ledger.established or ledger.counts is None:
+        refuse(
+            "Le compte des invocations de la campagne v8 est UNESTABLISHED : "
+            f"{ledger.unestablished_reason} Un compte non établi ne s'interprète pas comme "
+            "un compte nul, donc aucune requête n'est émise."
+        )
+        return
+    if ledger.execution_state is CampaignExecutionState.CONFLICT:
+        refuse(
+            "La campagne v8 est en CONFLICT : le corpus de reçus contredit le manifeste "
+            "préenregistré. Aucune nouvelle commande réseau n'est autorisée ; reprendre "
+            "exigerait un nouveau protocole."
+        )
+    if ledger.execution_state is CampaignExecutionState.ABORTED:
+        refuse(
+            f"La campagne v8 est ABORTED : {ledger.abort_reason} Aucune nouvelle commande "
+            "réseau n'est autorisée, et un échec ne crée aucun droit de relance."
+        )
+
+    limit = CAMPAIGN_INVOCATION_LIMITS[command]
+    if ledger.counts[command] >= limit:
+        refuse(
+            f"Le plafond préenregistré de {limit} invocation(s) {command} est déjà atteint "
+            f"({ledger.counts[command]}). Un échec consomme sa place et n'ouvre aucun "
+            "remplacement."
+        )
+
+    if command == "discover":
+        if sport in ledger.discovered:
+            refuse(
+                f"{sport} a déjà été découverte. Une compétition ne se découvre qu'une "
+                "fois : ni réessai, ni élargissement de fenêtre, ni seconde chance."
+            )
+        return
+
+    if command == "core":
+        family = campaign_family(sport)
+        if ledger.core_by_family.get(family, 0) >= CAMPAIGN_CORE_PER_FAMILY:
+            refuse(
+                f"La famille {family} a déjà consommé ses {CAMPAIGN_CORE_PER_FAMILY} appels "
+                "core préenregistrés."
+            )
+    else:
+        if ledger.additional_by_competition.get(sport, 0) >= CAMPAIGN_ADDITIONAL_PER_COMPETITION:
+            refuse(
+                f"{sport} a déjà consommé son appel additional. La campagne v8 en autorise "
+                f"{CAMPAIGN_ADDITIONAL_PER_COMPETITION} par compétition football."
+            )
+    if event_tag_value is not None and event_tag_value in ledger.used_event_tags.get(command, ()):
+        refuse(
+            f"Cet événement a déjà fait l'objet d'un appel {command}. Rejouer un événement "
+            "ne rapproche d'aucun seuil et n'était pas autorisé deux fois."
+        )
+
+
 def _persist_or_report(
     document: dict[str, Any],
     *,
@@ -2179,6 +2311,38 @@ def _none(value: object) -> str:
 # ---------------------------------------------------------------------------
 # plan
 # ---------------------------------------------------------------------------
+def _campaign_plan() -> dict[str, Any]:
+    """The pre-registered campaign, priced beside the local sequence and never merged.
+
+    ``plan --max-credits 6`` prices one event through two paid steps. Reading that as
+    the campaign's budget is a mistake the protocol document has warned about in prose
+    since v1; since v8 the two numbers are published side by side so the reader does
+    not have to hold the distinction in their head.
+    """
+    from .qualification import (
+        CAMPAIGN_BOOKMAKER,
+        CAMPAIGN_INVOCATION_LIMITS,
+        CAMPAIGN_SCOPES,
+        PROVIDER_VALIDATION_PROTOCOL_VERSION,
+        campaign_budget,
+    )
+
+    return {
+        "protocol_version": PROVIDER_VALIDATION_PROTOCOL_VERSION,
+        "bookmaker": CAMPAIGN_BOOKMAKER,
+        "scopes": {family: list(scopes) for family, scopes in CAMPAIGN_SCOPES.items()},
+        "invocation_limits": dict(CAMPAIGN_INVOCATION_LIMITS),
+        **campaign_budget(),
+        "note": (
+            "La séquence locale ci-dessus coûte "
+            f"{TOTAL_MAX_CREDITS} crédits et porte sur un seul événement : elle ne "
+            "satisfait aucun critère. La campagne préenregistrée en coûte "
+            f"{campaign_budget()['contractual_credits']} et exige une autorisation "
+            "humaine distincte par invocation."
+        ),
+    }
+
+
 def build_plan(
     *, sport: str, bookmaker: str, window_hours: int, generated_at: str
 ) -> dict[str, Any]:
@@ -2244,6 +2408,11 @@ def build_plan(
         "window_hours": window_hours,
         "effective_region_units": units,
         "total_max_credits": TOTAL_MAX_CREDITS,
+        # The two figures a reader used to conflate. `total_max_credits` prices the
+        # **local sequence** — one event through `core` then `additional`, six credits
+        # — and satisfies no criterion on its own. The block below prices the
+        # **pre-registered campaign**, which is a different thing and costs sixteen.
+        "campaign": _campaign_plan(),
         "steps": steps,
         "cost_model": {
             "local_bound": (
@@ -2312,6 +2481,22 @@ def plan(
         f"Fenêtre         : {hours} h",
         f"Unités région   : {document['effective_region_units']}",
         f"Plafond total   : {TOTAL_MAX_CREDITS} crédits (tarif publié)",
+        "",
+    ]
+    campaign = document["campaign"]
+    lines += [
+        f"Campagne v{campaign['protocol_version']} préenregistrée — à ne pas confondre "
+        f"avec la séquence locale ci-dessus :",
+        f"  bookmaker    : {campaign['bookmaker']}",
+        "  compétitions : "
+        + " · ".join(
+            f"{family} {', '.join(scopes)}" for family, scopes in campaign["scopes"].items()
+        ),
+        f"  invocations  : {campaign['cli_invocations']} ({campaign['invocation_limits']})",
+        f"  requêtes HTTP: {campaign['http_requests']}, dont "
+        f"{campaign['paid_http_requests']} payantes",
+        f"  budget       : {campaign['contractual_credits']} crédits contractuels, "
+        f"contre {TOTAL_MAX_CREDITS} crédits pour la séquence locale d'un seul événement",
         "",
     ]
     for step in document["steps"]:
@@ -2450,9 +2635,13 @@ def discover(
         one_book = _single(bookmaker, "--bookmaker")
         hours = _check_window(window_hours)
         _require_network(allow_network)
+        # The signing secret first, then the campaign guard, and only then the
+        # provider key: auditing our own receipts is what makes the count possible,
+        # and it must happen while a refusal still costs nothing.
+        signing = _signing_secret()
+        campaign_preflight("discover", sport=one_sport, bookmaker=one_book)
         settings = get_settings()
         secret = _require_key(settings)
-        signing = _signing_secret()
 
         now = _clock()
         attempt = Attempt(
@@ -2654,9 +2843,15 @@ def core(
         hours = _check_window(window_hours)
         ceiling = _check_ceiling("core", max_credits, acknowledge_credits)
         _require_network(allow_network)
+        signing = _signing_secret()
+        campaign_preflight(
+            "core",
+            sport=one_sport,
+            bookmaker=one_book,
+            event_tag_value=event_tag(one_event, signing),
+        )
         settings = get_settings()
         secret = _require_key(settings)
-        signing = _signing_secret()
 
         now = _clock()
         parent = load_parent(
@@ -2869,9 +3064,15 @@ def additional(
         hours = _check_window(window_hours)
         ceiling = _check_ceiling("additional", max_credits, acknowledge_credits)
         _require_network(allow_network)
+        signing = _signing_secret()
+        campaign_preflight(
+            "additional",
+            sport=one_sport,
+            bookmaker=one_book,
+            event_tag_value=event_tag(one_event, signing),
+        )
         settings = get_settings()
         secret = _require_key(settings)
-        signing = _signing_secret()
 
         now = _clock()
         parent = load_parent(
@@ -3303,6 +3504,18 @@ def build_activation_state(audit: receipt_store.AuditResult) -> dict[str, Any]:
         ],
         "qualification_population_equation": qualification["qualification_population_equation"],
         "qualification_reasons": qualification["qualification_reasons"],
+        # 7. The pre-registered campaign, counted from the receipts on this boundary.
+        # Every key is listed rather than spread, so adding one to the evaluator can
+        # never silently overwrite one here.
+        "campaign_protocol_version": qualification["campaign_protocol_version"],
+        "campaign_counts_state": qualification["campaign_counts_state"],
+        "campaign_invocation_counts": qualification["campaign_invocation_counts"],
+        "campaign_invocation_limits": qualification["campaign_invocation_limits"],
+        "campaign_execution_state": qualification["campaign_execution_state"],
+        "campaign_abort_reason": qualification["campaign_abort_reason"],
+        "campaign_required_bookmaker": qualification["campaign_required_bookmaker"],
+        "campaign_required_scopes": qualification["campaign_required_scopes"],
+        "campaign_note": qualification["campaign_note"],
         "qualification_note": qualification["qualification_note"],
         "scope_note": (
             "Chaque observation de couverture vaut pour un fournisseur, un bookmaker, "

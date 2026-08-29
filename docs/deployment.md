@@ -10,6 +10,26 @@ alembic upgrade head
 betmaxxing scan
 ```
 
+### Une variable que `.env` ne suffit pas à configurer
+
+`Settings` lit normalement `.env`, et c'est le canal de configuration de tout le
+reste. **Une exception, et une seule** : la garde pré-réseau de la campagne
+d'activation v8 lit `BETMAXXING_BOOKMAKERS` directement dans l'environnement du processus,
+par son nom. C'est délibéré : instancier `Settings` peuplerait tous les champs
+depuis l'environnement **et depuis `.env`**, la clé fournisseur comprise, alors que
+cette garde doit s'exécuter avant toute lecture de secret.
+
+Conséquence pour l'opérateur : une entrée présente seulement dans `.env` est
+**refusée** — avant la clé, avant tout intent, avant toute socket, sans crédit et
+sans consommer d'invocation. Exportez-la :
+
+```bash
+export BETMAXXING_BOOKMAKERS=pinnacle
+```
+
+N'exportez pas `.env` en bloc : ce fichier contient des secrets, et les répandre
+dans l'environnement du shell est précisément ce que la lecture ciblée évite.
+
 `constraints.txt` fige la résolution utilisée par la CI. `pyproject.toml` garde des
 bornes basses lâches pour rester installable ailleurs. Régénérez le fichier
 **délibérément** lors d'une montée de version, jamais par effet de bord.

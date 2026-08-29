@@ -214,6 +214,105 @@ aucun autre bookmaker n'est substitué.
 
 ---
 
+## La campagne protocole 8, et la garde qui la fait respecter
+
+Depuis le protocole 8, les bornes de la campagne ne sont plus seulement écrites : elles
+sont comptées à partir des reçus vérifiés présents sur la frontière, et opposées à
+chaque commande réseau **avant** qu'elle ne coûte quoi que ce soit.
+
+### Le manifeste
+
+| | |
+|---|---|
+| Bookmaker | `pinnacle` — et lui seul |
+| Football | `soccer_epl`, `soccer_spain_la_liga` |
+| Tennis | `tennis_atp_us_open`, `tennis_wta_us_open` |
+| Instant d'effet | `2026-08-25T00:00:00+00:00` |
+| Plafonds | `discover` 4 · `core` 6 (3 par famille) · `additional` 2 (football seulement) |
+
+Sources publiques du choix, consultées le **2026-08-24**, dans `docs/source-matrix.md`.
+`winamax_fr` et la piste B sont exclus de cette campagne.
+
+### Ce que la garde refuse, et ce qu'elle laisse derrière elle
+
+`campaign_preflight` s'exécute après la lecture du secret de signature local et **avant**
+la lecture de la clé fournisseur, la publication d'un intent et toute socket. Elle refuse :
+
+- un bookmaker qui n'est pas `pinnacle` ;
+- une compétition hors manifeste, ou un `additional` sur une compétition de tennis ;
+- un plafond déjà atteint — 4 découvertes, 6 `core`, 2 `additional` ;
+- une seconde découverte d'une compétition déjà découverte ;
+- un quatrième `core` dans une famille, un second `additional` sur une compétition ;
+- un événement déjà utilisé par la même commande ;
+- **toute** commande si la campagne est `ABORTED` ou `CONFLICT` ;
+- **toute** commande si les comptes ne sont pas établis ;
+- **toute** commande si `BETMAXXING_BOOKMAKERS` ne nomme pas `pinnacle`.
+
+Un refus laisse exactement : 0 socket, 0 lecture de clé fournisseur, 0 intent, 0 reçu,
+0 crédit.
+
+### Un échec consomme sa place
+
+Une commande réseau v8 dont le reçu ne porte pas le statut de succès de sa commande
+abandonne définitivement la campagne. `status` et `plan` restent lisibles ; `discover`,
+`core` et `additional` sont refusés avant réseau. Recommencer exige un **nouveau
+protocole** — pas une relance de la v8.
+
+### Avant le premier appel
+
+```bash
+export BETMAXXING_BOOKMAKERS=pinnacle
+```
+
+Le harnais analyse une réponse payante avec le parser de l'adaptateur, et ce parser ne
+retient que les bookmakers nommés par `BETMAXXING_BOOKMAKERS` — **pas** celui passé en
+argument. Les deux coïncidaient tant que les deux valaient `winamax_fr`, qui reste le
+défaut livré ; sous le manifeste v8 ils divergent.
+
+Ce n'est plus une consigne à retenir : la garde le vérifie. `pinnacle` doit figurer dans
+`BETMAXXING_BOOKMAKERS`, et toute autre configuration — variable absente, vide, ou
+nommant d'autres bookmakers — est **refusée avant la lecture de la clé fournisseur,
+avant tout intent et avant toute socket**, pour `discover`, `core` et `additional`. La
+casse est exacte : `PINNACLE` n'est pas `pinnacle`.
+
+Ce refus ne consomme aucune invocation, ne dépense aucun crédit et n'abandonne pas la
+campagne.
+
+**`.env` ne suffit pas pour cette variable.** `Settings` lit normalement `.env`, et
+`.env.example` livre d'ailleurs `BETMAXXING_BOOKMAKERS`. Mais la garde la lit
+directement dans l'environnement du processus, par son nom, sans instancier `Settings` :
+instancier le modèle peuplerait tous les champs depuis l'environnement **et depuis
+`.env`**, la clé fournisseur comprise, alors que cette garde doit précéder toute
+lecture de secret. Une entrée présente seulement dans `.env` est donc refusée —
+fail-closed et gratuitement. Exportez la variable plutôt que de sourcer `.env` en bloc,
+qui répandrait vos secrets dans l'environnement du shell. Sans lui, un `core` conforme au manifeste avec la variable simplement absente
+atteignait l'endpoint payant, publiait `SCHEMA_MISMATCH`, dépensait un crédit et plaçait
+la campagne en `ABORTED` sans retour possible.
+
+### Ce que `status --json` publie
+
+| Champ | Sens |
+|---|---|
+| `campaign_protocol_version` | `8` |
+| `campaign_counts_state` | `ESTABLISHED` ou `UNESTABLISHED` |
+| `campaign_invocation_counts` | `{"discover": …, "core": …, "additional": …}`, ou `null` si non établi |
+| `campaign_invocation_limits` | `{"discover": 4, "core": 6, "additional": 2}` |
+| `campaign_execution_state` | `NOT_STARTED` · `IN_PROGRESS` · `ABORTED` · `COMPLETE` · `CONFLICT` · `UNESTABLISHED` |
+| `campaign_abort_reason` | vide, sinon la commande et le statut qui ont arrêté la campagne |
+| `campaign_required_bookmaker` | `pinnacle` |
+| `campaign_required_scopes` | les quatre compétitions, par famille |
+
+**Aucun compteur numérique n'est publié avant d'avoir été établi.** « Je ne peux pas
+compter » et « rien n'a été dépensé » sont des faits opposés, et le second autorise à
+dépenser.
+
+Le reçu réel du protocole 7 — la découverte vide de `soccer_france_ligue_one` chez
+`winamax_fr` — reste sur la frontière, signé, **historique non qualifiant**. Il ne
+compte dans aucun compteur v8 et ne doit être ni supprimé, ni mis en quarantaine, ni
+réutilisé.
+
+---
+
 ## Les reçus (schéma v2, signés)
 
 Chaque **tentative réseau** écrit un reçu JSON local sous `.activation-receipts/`
@@ -810,7 +909,10 @@ dans `docs/provider-validation-protocol.md` §8. Résumé opérationnel :
 | Crédits contractuels maximaux | **16** — borne tarifaire relue, pas une garantie de facture |
 | Autorisations humaines | **12**, une par invocation |
 | Arrêt immédiat | `COVERAGE_MISSING`, `COST_MISMATCH`, mapping rejeté |
-| Substitution automatique | **aucune**, ni de bookmaker ni d'événement |
+| Substitution | **aucune**, ni de bookmaker, ni d'événement, ni de compétition |
+| Manifeste v8 | `pinnacle` · `soccer_epl`, `soccer_spain_la_liga`, `tennis_atp_us_open`, `tennis_wta_us_open` |
+| Plafonds opposables | comptés depuis les reçus vérifiés, refusés **avant** réseau |
+| Configuration du parser | `BETMAXXING_BOOKMAKERS` doit contenir `pinnacle` ; sinon refusé avant clé, intent et socket |
 
 Aucune de ces commandes n'a été exécutée par les tranches 03C-1 ni 03C-1 ter :
 elles n'écrivent que le protocole, l'évaluateur et leurs tests.

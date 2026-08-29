@@ -10,12 +10,44 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from enum import StrEnum
 from functools import lru_cache
 from typing import Any
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: The variable the adapter's parser is configured from. Named once, because the
+#: activation guard has to read it *without* instantiating :class:`Settings` — see
+#: :func:`configured_bookmakers`.
+BOOKMAKERS_VARIABLE = "BETMAXXING_BOOKMAKERS"
+
+
+def split_bookmakers(raw: str) -> list[str]:
+    """The bookmaker keys a comma-separated setting names, exactly as written.
+
+    No case folding and no aliasing: ``PINNACLE`` is not ``pinnacle``. The provider's
+    keys are lowercase identifiers, and quietly accepting another spelling would make
+    a configuration look correct that the parser will not match.
+    """
+    return [b.strip() for b in raw.split(",") if b.strip()]
+
+
+def configured_bookmakers() -> list[str]:
+    """The configured bookmaker keys, read from their own variable and nothing else.
+
+    Deliberately **not** ``get_settings().bookmaker_list``. ``Settings`` is a pydantic
+    settings model, so instantiating it populates every field from the environment —
+    including ``the_odds_api_key``. The activation guard runs *before* the provider key
+    may be read, and « before » has to mean it: this reads one variable by name, falls
+    back to the model's declared default without instantiating it, and touches nothing
+    else.
+    """
+    raw = os.environ.get(BOOKMAKERS_VARIABLE)
+    if raw is None:
+        raw = str(Settings.model_fields["bookmakers"].default)
+    return split_bookmakers(raw)
 
 
 class RunMode(StrEnum):
@@ -189,7 +221,7 @@ class Settings(BaseSettings):
 
     @property
     def bookmaker_list(self) -> list[str]:
-        return [b.strip() for b in self.bookmakers.split(",") if b.strip()]
+        return split_bookmakers(self.bookmakers)
 
     @property
     def the_odds_api_sport_key_list(self) -> list[str]:

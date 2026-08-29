@@ -34,6 +34,7 @@ exactly what drifted.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -65,7 +66,7 @@ from helpers_activation import (
 #: close the qualification gate for the whole module — see the fixture's docstring.
 pytestmark = pytest.mark.usefixtures("isolated_receipt_directory")
 
-EFFECTIVE_INSTANT = "2026-08-11T14:20:00+00:00"
+EFFECTIVE_INSTANT = "2026-08-25T00:00:00+00:00"
 FREE = {"x-requests-last": "0", "x-requests-remaining": "487"}
 PAID = {"x-requests-last": "1", "x-requests-remaining": "486"}
 FIVE = {"x-requests-last": "5", "x-requests-remaining": "482"}
@@ -93,8 +94,11 @@ def receipt(**over: Any) -> dict[str, Any]:
     document = build(
         command=over.pop("command", "core"),
         status=over.pop("status", "CORE_LIVE_VERIFIED"),
-        sport=over.pop("sport", "soccer_v6_one"),
-        moment=over.pop("moment", effective_instant()),
+        # Inside the protocol 8 manifest, and after the threshold corpus: a receipt
+        # naming another competition is a campaign conflict since v8, and one filed
+        # *before* an abort it caused would contradict its own timeline.
+        sport=over.pop("sport", "soccer_epl"),
+        moment=over.pop("moment", effective_instant() + timedelta(days=9)),
         tag=over.pop("tag", "a1" * 16),
         markets=over.pop("markets", ["h2h"]),
         credits=over.pop("credits", 1),
@@ -163,9 +167,9 @@ NEVER_SENT = {
 # ---------------------------------------------------------------------------
 # D1 — the protocol this suite pins
 # ---------------------------------------------------------------------------
-class TestTheProtocolIsVersionSeven:
+class TestTheProtocolIsVersionEight:
     def test_the_three_version_numbers(self) -> None:
-        assert qual.PROVIDER_VALIDATION_PROTOCOL_VERSION == 7
+        assert qual.PROVIDER_VALIDATION_PROTOCOL_VERSION == 8
         assert qual.PROVIDER_ADAPTER_EVIDENCE_VERSION == 1
         assert qual.QUALIFYING_SCHEMA_VERSION == 4
         assert act.RECEIPT_SCHEMA_VERSION == 4
@@ -175,6 +179,7 @@ class TestTheProtocolIsVersionSeven:
         source = Path(qual.__file__).read_text(encoding="utf-8")
         assert source.count(EFFECTIVE_INSTANT) == 1
         for stale in (
+            "2026-08-11T14:20:00+00:00",
             "2026-08-11T04:50:40+00:00",
             "2026-08-10T14:00:37+00:00",
             "2026-08-10T09:11:48+00:00",
@@ -587,7 +592,18 @@ class TestTheGateRequiresBothAxes:
         )
         state = state_of([*corpus, never])
         assert state["paid_call_cost_census"]["confirmed_attempts_not_sent"] == 1
-        assert state["eligible_for_human_promotion_review"] is True
+        # D-075's property, stated on the criterion it is about rather than on the gate.
+        # A seventh `core` overruns the protocol 8 campaign, so the gate now closes for a
+        # second and entirely different reason — the ceiling — and asserting the gate
+        # would silently stop testing whether an unsent attempt invalidates the six calls
+        # that really were served.
+        cost = next(
+            entry
+            for entry in state["criteria_results"]
+            if entry["criterion_id"] == "COST_CONFORMITY"
+        )
+        assert cost["passed"] is True
+        assert cost["observed"]["provider_reached_conforming_cost"] == 8
 
     def test_cost_conformity_needs_six_established_conforming_calls(self) -> None:
         from helpers_qualification_corpus import threshold_corpus
@@ -864,12 +880,18 @@ class TestTheDocumentsPublishOneNorm:
     def _read(self, name: str) -> str:
         return (self.ROOT / "docs" / name).read_text(encoding="utf-8")
 
-    def test_the_protocol_document_is_version_seven(self) -> None:
+    def test_the_protocol_document_announces_the_current_version(self) -> None:
         text = self._read("provider-validation-protocol.md")
-        assert "PROVIDER_VALIDATION_PROTOCOL_VERSION = 7" in text.splitlines()[0]
-        assert "PROVIDER_VALIDATION_PROTOCOL_VERSION = 6" not in text.splitlines()[0]
+        title = text.splitlines()[0]
+        assert (
+            f"PROVIDER_VALIDATION_PROTOCOL_VERSION = {qual.PROVIDER_VALIDATION_PROTOCOL_VERSION}"
+            in title
+        )
+        for retired in (6, 7):
+            assert f"PROVIDER_VALIDATION_PROTOCOL_VERSION = {retired}" not in title
         assert EFFECTIVE_INSTANT in text
-        assert "2026-08-11T04:50:40+00:00" not in text, "the retired instant is history, not norm"
+        for stale in ("2026-08-11T04:50:40+00:00", "2026-08-11T14:20:00+00:00"):
+            assert stale not in text, "a retired instant is history, not norm"
 
     def test_the_decision_d077_exists_and_supersedes_only_what_it_replaces(self) -> None:
         text = self._read("decisions.md")

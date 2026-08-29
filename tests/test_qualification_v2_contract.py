@@ -40,11 +40,14 @@ from helpers_activation import FAKE_RECEIPT_SECRET
 #: close the qualification gate for the whole module — see the fixture's docstring.
 pytestmark = pytest.mark.usefixtures("isolated_receipt_directory")
 
-FOOTBALL = "soccer_france_ligue_one"
-FOOTBALL_2 = "soccer_epl"
-TENNIS = "tennis_atp_paris"
-TENNIS_2 = "tennis_wta_madrid"
-BOOK = "unibet"
+#: The protocol 8 manifest. A corpus that is meant to reach the human-review gate
+#: has to be inside the pre-registered campaign since v8: a receipt naming another
+#: competition or another bookmaker is an evidence conflict, not weak evidence.
+FOOTBALL = "soccer_epl"
+FOOTBALL_2 = "soccer_spain_la_liga"
+TENNIS = "tennis_atp_us_open"
+TENNIS_2 = "tennis_wta_us_open"
+BOOK = "pinnacle"
 
 #: The protocol's own effective instant, parsed once here so the tests position
 #: themselves relative to the constant rather than to a date they invent.
@@ -53,6 +56,9 @@ DAY_ONE = NOT_BEFORE + timedelta(days=1)
 DAY_TWO = NOT_BEFORE + timedelta(days=2)
 DAY_THREE = NOT_BEFORE + timedelta(days=3)
 BEFORE_EFFECT = NOT_BEFORE - timedelta(days=20)
+#: One UTC day well inside the evidence window, and the calendar day after it.
+_ONE_UTC_DAY = (NOT_BEFORE + timedelta(days=2)).date().isoformat()
+_ONE_DAY_LATER = (NOT_BEFORE + timedelta(days=3)).date().isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -701,14 +707,13 @@ class TestUtcDaysAreNormalisedToUtc:
             signed(receipt_id=f"{i:016x}", sport_key=key, recorded_at=stamp, event_tag=tag * 32)
             for i, (key, stamp, tag) in enumerate(
                 [
-                    # Two days later than they were written: D-076 moved the effective
-                    # instant to 2026-08-11T04:50:40Z, and evidence recorded before it is
-                    # historical. The property under test is untouched — the same three
-                    # clock times, the same offset, and all three still land on one UTC
-                    # day (2026-08-12).
-                    (FOOTBALL, "2026-08-13T00:30:00+02:00", "a"),
-                    (FOOTBALL_2, "2026-08-12T23:30:00+00:00", "b"),
-                    (FOOTBALL, "2026-08-12T23:45:00+00:00", "c"),
+                    # Derived from the effective instant rather than typed: these were
+                    # three literals, so every protocol bump quietly turned them into
+                    # history and the test asserted nothing. The property is untouched —
+                    # the same three clock times, the same offset, all on one UTC day.
+                    (FOOTBALL, f"{_ONE_DAY_LATER}T00:30:00+02:00", "a"),
+                    (FOOTBALL_2, f"{_ONE_UTC_DAY}T23:30:00+00:00", "b"),
+                    (FOOTBALL, f"{_ONE_UTC_DAY}T23:45:00+00:00", "c"),
                 ],
                 start=1,
             )
@@ -820,11 +825,19 @@ class TestTheAuditCounterIsNotOverwritten:
     def test_the_qualification_keys_are_all_prefixed(self) -> None:
         document = _evaluate([], 0)
         for key in document:
-            assert key.startswith("qualification_") or key in {
-                "criteria_results",
-                "eligible_for_human_promotion_review",
-                "evidence_conflicts",
-            }, key
+            # Two prefixed blocks since protocol 8: the qualification verdict and the
+            # campaign ledger. Both are prefixed for the same reason — a bare key can be
+            # overwritten by another block's spread without anyone noticing.
+            assert (
+                key.startswith("qualification_")
+                or key.startswith("campaign_")
+                or key
+                in {
+                    "criteria_results",
+                    "eligible_for_human_promotion_review",
+                    "evidence_conflicts",
+                }
+            ), key
 
 
 # ---------------------------------------------------------------------------

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import json as jsonlib
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -43,14 +43,22 @@ from betmaxxing.providers.the_odds_api import receipt_store as _store
 #: Pinned literally, exactly as D-075 and the protocol publish it.
 EFFECTIVE_INSTANT = "2026-08-10T14:00:37+00:00"
 
-FOOTBALL = "soccer_france_ligue_one"
-FOOTBALL_2 = "soccer_epl"
-TENNIS = "tennis_atp_paris"
-TENNIS_2 = "tennis_wta_madrid"
-BOOK = "unibet"
-D1 = datetime(2026, 8, 13, 12, tzinfo=UTC)
-D2 = datetime(2026, 8, 14, 12, tzinfo=UTC)
-D3 = datetime(2026, 8, 15, 12, tzinfo=UTC)
+#: The protocol 8 manifest. A corpus that is meant to reach the human-review gate
+#: has to be inside the pre-registered campaign since v8: a receipt naming another
+#: competition or another bookmaker is an evidence conflict, not weak evidence.
+FOOTBALL = "soccer_epl"
+FOOTBALL_2 = "soccer_spain_la_liga"
+TENNIS = "tennis_atp_us_open"
+TENNIS_2 = "tennis_wta_us_open"
+BOOK = "pinnacle"
+#: Three consecutive UTC days inside the current evidence window. Derived rather
+#: than typed: they were three literals until protocol 8, so moving the effective
+#: instant silently turned every corpus below into history and made the whole suite
+#: assert nothing about the closures it guards.
+_NOT_BEFORE = datetime.fromisoformat(qual.QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC)
+D1 = _NOT_BEFORE + timedelta(days=1)
+D2 = _NOT_BEFORE + timedelta(days=2)
+D3 = _NOT_BEFORE + timedelta(days=3)
 MARKETS = list(act.ADDITIONAL_MARKETS)
 WINDOW = (D1, D1 + timedelta(hours=24))
 SCRUB_SECRET = "ab" * 32
@@ -1555,7 +1563,14 @@ class TestTheTableIsFullyExercised:
         payload = jsonlib.loads(result.stdout)
         assert payload["qualification_current_malformed_receipts"] == 0
         assert payload["qualification_unknown_pair_receipts"] == 0
-        assert payload["qualification_state"] != str(qual.QualificationState.EVIDENCE_CONFLICT)
+        # Since protocol 8 this corpus — one receipt per producible pair — necessarily
+        # breaks the campaign's own ceilings, and that is a deliberate conflict rather
+        # than a structural one. The property under test is unchanged: none of the
+        # harness's honest outputs is malformed, an unknown pair, or a conflict of its
+        # own. So the assertion is exact instead of global: every conflict here is one
+        # the campaign ledger raised, and none of them came from the phase contract.
+        ledger = qual.campaign_ledger(act.audit_receipts())
+        assert set(payload["evidence_conflicts"]) == set(ledger.conflicts)
         assert run("status").exit_code == 0
 
 

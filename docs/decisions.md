@@ -2288,3 +2288,114 @@ d'appariement, ni la lignée de versions, ni un critère, un seuil ou un tarif, 
 
 **Ce que cette décision n'autorise pas.** Aucun provisionnement de secret, aucun `plan`,
 `discover`, `core` ni `additional`, aucun appel fournisseur, aucun crédit, aucune promotion.
+
+---
+
+### D-082 — Une campagne qui ne se compte pas n'est pas préenregistrée
+
+**Contexte.** Le protocole 7 a été exécuté une fois. Une seule commande réseau est
+partie — `discover --sport soccer_france_ligue_one --bookmaker winamax_fr` — et elle est
+revenue `COVERAGE_MISSING`, `events_admissible = 0`, deux requêtes, zéro crédit. L'audit
+statique 03C-2D bis a ensuite cherché, sans réseau ni mutation, si la campagne pouvait
+reprendre. Il a trouvé trois faits qui se composent.
+
+**La compétition n'était préenregistrée nulle part.** Les critères sont indexés par
+famille de sport — `sport_key.startswith("soccer_")` — et `min_competitions = 2` rend une
+seule compétition incapable de satisfaire `CORE_MAPPING_FOOTBALL`. Deux compétitions
+football étaient donc obligatoires dès l'origine, mais **lesquelles** n'était écrit dans
+aucun document. Le protocole imposait ce niveau d'exigence au bookmaker — « le choix, sa
+source et sa date seront écrits avant le premier appel » — et rien d'équivalent à la
+compétition. Choisir la seconde après avoir vu la première revenir vide aurait été une
+sélection sur donnée observée, sans garde-fou écrit.
+
+**Le bookmaker de la piste A n'avait jamais été choisi.** Le protocole disait « ce
+document ne nomme pas encore ce bookmaker », et le premier appel réel est parti sous
+`winamax_fr`, celui de la piste B. Sur `discover` cet argument ne sélectionne rien sur le
+fil — `/events` ne renvoie aucun bookmaker — mais il **lie** le reçu : `load_parent`
+exige que `sport_key` **et** `bookmaker` correspondent exactement, donc une découverte
+faite sous piste B ne peut alimenter aucun `core` de piste A.
+
+**L'enveloppe n'était comptée par rien.** `campaign_budget()` est une dérivation pure de
+constantes qui ne lit aucun reçu, et ses seuls consommateurs sont deux tests
+documentaires. L'audit l'a mesuré plutôt que déduit : deux corpus synthétiques signés,
+l'un de neuf découvertes — plus du double des quatre allouées — l'autre de neuf reçus
+conformes, publient des valeurs **identiques** dans les 43 champs de `status --json`.
+Les trois seuls compteurs qui bougent sont aveugles à la commande. Un opérateur pouvait
+relancer `discover` jusqu'à en trouver une non vide et présenter le résultat comme la
+campagne prévue.
+
+**Décision.** Le protocole 7 est clos sans qualification. Son reçu est conservé, signé,
+**historique non qualifiant** : ni supprimé, ni mis en quarantaine, ni réutilisé. Le
+protocole 8 préenregistre une campagne fermée — `pinnacle`, `soccer_epl`,
+`soccer_spain_la_liga`, `tennis_atp_us_open`, `tennis_wta_us_open`, instant d'effet
+`2026-08-25T00:00:00+00:00` — et, surtout, la rend **exécutable** :
+
+- `campaign_ledger` compte les invocations à partir des reçus vérifiés du protocole
+  courant, et refuse de publier un chiffre qu'il n'a pas pu prendre ;
+- `campaign_preflight` oppose le manifeste et les plafonds à chaque commande réseau,
+  **avant** la lecture de la clé fournisseur, avant la publication d'un intent et avant
+  toute socket ;
+- un dépassement, un bookmaker étranger, une compétition hors manifeste, une seconde
+  découverte d'une même compétition ou un reçu postérieur à l'abandon sont des
+  `EVIDENCE_CONFLICT` nommés ;
+- un échec consomme son invocation et abandonne la campagne ; recommencer exige un
+  nouveau protocole, pas une relance.
+
+**Ce que cette décision coûte.** La campagne v8 est à usage unique et n'a aucune marge :
+une compétition inactive au moment autorisé la fait échouer sans substitution, et seize
+crédits contractuels sont engagés sur quatre compétitions choisies sur documentation, pas
+sur observation. C'est le prix assumé du préenregistrement — la seule alternative étant de
+choisir après avoir vu, ce que cette décision interdit.
+
+Le harnais devient aussi plus strict qu'avant sur son propre corpus de test : un reçu qui
+nomme une autre compétition ou un autre bookmaker est désormais un conflit, ce qui a
+demandé d'aligner les corpus synthétiques de sept suites sur le manifeste.
+
+**La configuration du parser est gardée par la machine, pas par une consigne.** Le
+harnais analyse une réponse payante avec le parser de l'adaptateur, et ce parser ne
+retient que les bookmakers nommés par `BETMAXXING_BOOKMAKERS` — **pas** celui passé en
+argument. Les deux coïncidaient tant que `--bookmaker` et le défaut livré valaient tous
+deux `winamax_fr` ; sous le manifeste v8 ils divergent, et le défaut livré n'a pas changé.
+
+La première rédaction de cette décision se contentait de l'écrire. Le réaudit final a
+mesuré ce que cela coûtait : un `core` conforme au manifeste, **la variable simplement
+absente**, atteignait l'endpoint payant, ne retenait aucune sélection, publiait
+`SCHEMA_MISMATCH`, dépensait un crédit et plaçait la campagne en `ABORTED` — sans retour
+possible, puisque recommencer exige un nouveau protocole. Une campagne dont chaque
+plafond est opposable restait ainsi exposée à une perte irréversible causée par une
+variable d'environnement que la garde ne lisait pas, et dont la valeur par défaut était
+précisément celle qui déclenchait la perte.
+
+`campaign_preflight` vérifie donc que `pinnacle` figure dans `BETMAXXING_BOOKMAKERS`,
+pour les trois commandes réseau, avant la lecture de la clé fournisseur, avant tout
+intent et avant toute socket. La variable est lue par son nom via
+`config.configured_bookmakers()` : instancier `Settings` peuplerait tous les champs
+depuis l'environnement, la clé fournisseur comprise. La casse est exacte — `PINNACLE`
+n'est pas `pinnacle` — parce qu'accepter une autre graphie ferait passer pour correcte
+une configuration que le parser ne reconnaîtra pas. Ce refus ne consomme aucune
+invocation, ne dépense aucun crédit, n'abandonne pas la campagne et ne crée aucun conflit
+de preuve.
+
+La logique de parsing n'est pas modifiée : c'est sa **configuration** qui est vérifiée
+avant tout engagement.
+
+**Ce que cette pureté coûte, écrit plutôt que découvert.** `Settings` accepte `.env`, et
+`.env.example` y livre `BETMAXXING_BOOKMAKERS`. La garde ne le peut pas : elle lit la
+variable dans l'environnement du processus, par son nom, précisément pour ne pas instancier
+un modèle qui peuplerait tous les champs depuis l'environnement **et depuis `.env`**, la
+clé fournisseur comprise. Une entrée présente seulement dans `.env` est donc refusée.
+Ce refus est fail-closed, antérieur à la clé, à l'intent et à la socket, et ne consomme
+ni invocation ni crédit — mais un opérateur qui configure ce projet comme les documents
+le lui disent serait autrement refusé sans comprendre pourquoi, alors les cinq fichiers
+qui configurent le disent. L'alternative — sourcer `.env` en bloc — répandrait les
+secrets dans l'environnement du shell et n'est pas recommandée.
+
+**Ce que cette décision ne change pas.** Ni le schéma de reçu (**4**), ni la version de
+preuve adaptateur (**1**), ni le HMAC, ni les marchés, ni les tarifs, ni les bornes
+locales, ni le vocabulaire de `QualificationState`, ni le plafond machine
+`CRITERIA_MET_AWAITING_HUMAN_REVIEW`. `adapter_state` reste `IMPLEMENTED_UNVERIFIED`.
+
+**Ce que cette décision n'autorise pas.** Aucun `plan` opérateur, aucun `discover`,
+`core` ni `additional`, aucun appel fournisseur, aucun crédit, aucune promotion. Les
+douze invocations de la campagne v8 resteront soumises à des autorisations ultérieures,
+explicites et séparées.

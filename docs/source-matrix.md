@@ -76,6 +76,45 @@ Ce qui a été prouvé et ce qui ne l'a pas été est détaillé ci-dessus.
 | Sports et marchés couverts | `À vérifier` sur les pages officielles | — |
 | Présence de `winamax_fr` (zones `fr`/`eu`) | **Annoncé** par la documentation officielle (lue le 2026-08-05) ; **non confirmé** par un appel | — |
 | Winamax présent sur un événement donné | **absent** sur les 2 événements `soccer_spl` testés (`bookmaker_state = NOT_RETURNED`). Constat borné à ces événements et ces instants ; aucune généralisation | 2026-08-07 |
+
+### Le manifeste de la campagne protocole 8 — choisi et daté avant tout appel
+
+Le protocole 7 exigeait que le bookmaker de la piste A soit « choisi sur la
+documentation publique officielle du fournisseur, daté ici au moment du choix », et
+ajoutait : « ce document ne nomme pas encore ce bookmaker ». Le premier appel réel est
+pourtant parti sans que ce choix ait été fait, sous le bookmaker de la piste B. La
+campagne v8 ferme cela : le manifeste est écrit **avant** le premier appel, et la
+machine le fait respecter.
+
+**Sources publiques, consultées le 2026-08-24 :**
+
+| Source | URL |
+|---|---|
+| Sports et clés de compétition | <https://the-odds-api.com/sports-odds-data/sports-apis.html> |
+| Bookmakers et zones | <https://the-odds-api.com/sports-odds-data/bookmaker-apis.html> |
+| Contrat des endpoints v4 | <https://the-odds-api.com/liveapi/guides/v4/> |
+
+**Ce que ces pages disaient ce jour-là :**
+
+| Élément | Constat | Date |
+|---|---|---|
+| Bookmaker `pinnacle` | listé, zone **`eu`** uniquement, avec la note « odds are from public website which may incur a delay » | 2026-08-24 |
+| `soccer_epl` | clé publiée pour l'English Premier League | 2026-08-24 |
+| `soccer_spain_la_liga` | clé publiée pour La Liga | 2026-08-24 |
+| `tennis_atp_us_open` | clé publiée pour l'US Open ATP | 2026-08-24 |
+| `tennis_wta_us_open` | clé publiée pour l'US Open WTA | 2026-08-24 |
+
+**Ce que ce tableau n'établit pas.** Qu'une clé soit publiée ne dit ni que la
+compétition est active à une date donnée, ni que `pinnacle` cote un événement donné, ni
+qu'un marché demandé sera retourné. C'est un **préenregistrement de portée**, pas une
+preuve de couverture. Si une compétition est inactive, vide ou non couverte au moment
+autorisé, la campagne v8 échoue sans substitution.
+
+`pinnacle` étant en zone `eu` seule, `effective_region_units(bookmakers=["pinnacle"])`
+vaut 1 : le chiffrage des crédits est inchangé.
+
+`winamax_fr` et la piste B sont **exclus** de la campagne v8. Le constat du 2026-08-07
+ci-dessus reste borné à ses deux événements SPL et ne se généralise pas.
 | Accès aux marchés additionnels selon le plan | `À vérifier` | — |
 | Historique (endpoints payants) | **Non utilisé.** Interfaces et estimateur de coût seulement | — |
 | Quotas et coût par appel | En-têtes lus, reportés et **conformes** : gratuit = 0, `core` = 1, sur 6 appels réels | 2026-08-07 |
