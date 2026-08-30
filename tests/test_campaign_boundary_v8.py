@@ -1207,29 +1207,61 @@ CRITERES = (
 #: A field name is a name, not a substring of a longer one. Without the word
 #: boundaries below, ``not_qualification_protocol_version = 8`` satisfied a rule that
 #: demands ``qualification_protocol_version = 8`` — a document could rename the
-#: normative field and stay green. So each name is bounded on both sides, each value
-#: is bounded on the right (``8_alias`` is not ``8``), and the match is case
-#: sensitive: ``QUALIFICATION_PROTOCOL_VERSION`` is a different token.
+#: normative field and stay green. So each name is bounded on both sides, and the match
+#: is case sensitive: ``QUALIFICATION_PROTOCOL_VERSION`` is a different token.
 #:
-#: ``[ \t]`` around ``=`` rather than ``\s``, so a match cannot run across lines and
-#: pair a name here with a value further down. The schema is the one exception: the
-#: §2 paragraph wraps between ``reçu`` and ``**v4**``, so exactly one line break is
-#: allowed there — never a blank line.
+#: Bounding the name was not enough. The closure re-audit read the value as a numeric
+#: **prefix**: ``= 8.1``, ``= 8/9``, ``= 8-legacy``, ``= 8 extra`` and
+#: ``provider_adapter_evidence_version = 1.1`` each yielded a clean ``8`` or ``1``, and
+#: a document could therefore state a version the runtime never writes. Excluding
+#: ``.``, ``/``, ``-`` and the space one at a time would only move the hole to the next
+#: character, so the reading is inverted: the document states these two fields inside
+#: Markdown inline code, that span is taken **whole**, and the whole span must be the
+#: assignment. Nothing is read out of a longer sentence.
+#:
+#: ``[ \t]`` around ``=`` rather than ``\s``, so an assignment cannot run across lines
+#: and pair a name here with a value further down. The schema is stated in bold rather
+#: than in code and is read on the rule's own text; the §2 paragraph wraps between
+#: ``reçu`` and ``**v4**``, so exactly one line break is allowed there — never a blank
+#: line.
 NOM_A_GAUCHE = r"(?<![\w])"
 NOM_A_DROITE = r"(?![\w])"
-AFFECTATION = r"[ \t]*=[ \t]*"
-VALEUR = r"(\d+)(?![\w])"
-FORMES_DE_VERSION = {
-    "schéma": re.compile(
-        NOM_A_GAUCHE + r"reçu" + NOM_A_DROITE + r"(?:[ \t]+|[ \t]*\n[ \t]*)"
-        r"\*\*v(\d+)\*\*" + NOM_A_DROITE
+#: One Markdown inline code span. The lookarounds keep a ``` ``double`` ``` span from
+#: being read as a single one, and ``[^`\n]`` keeps a span from swallowing a line break.
+CODE_INLINE = re.compile(r"(?<!`)`([^`\n]*)`(?!`)")
+#: A version number written the one way a version number is written: no leading zero,
+#: no sign, no decimal point, no exponent. ``08`` states something else than ``8``.
+VALEUR_CANONIQUE = r"(?:0|[1-9][0-9]*)"
+
+NOTION_DU_SCHEMA = "schéma"
+CHAMPS_NORMATIFS = {
+    "protocole": "qualification_protocol_version",
+    "preuve adaptateur": "provider_adapter_evidence_version",
+}
+NOTIONS = (NOTION_DU_SCHEMA, *CHAMPS_NORMATIFS)
+
+#: How a statement is **found**. Deliberately loose on the value — a malformed
+#: assignment must be found, so that it can be refused as wrong rather than vanish and
+#: leave the rule looking silent about the field.
+NOM_DU_CHAMP = {
+    notion: re.compile(NOM_A_GAUCHE + champ + NOM_A_DROITE)
+    for notion, champ in CHAMPS_NORMATIFS.items()
+}
+ENONCE_DU_SCHEMA = re.compile(
+    NOM_A_GAUCHE + r"reçu" + NOM_A_DROITE + r"(?:[ \t]+|[ \t]*\n[ \t]*)"
+    r"\*\*v\d+\*\*" + NOM_A_DROITE
+)
+
+#: How a statement is **validated**, with ``fullmatch``: the entire statement is the
+#: assignment. ``match`` or ``search`` here would restore the prefix reading exactly.
+ENONCE_COMPLET = {
+    NOTION_DU_SCHEMA: re.compile(
+        r"reçu(?:[ \t]+|[ \t]*\n[ \t]*)\*\*v(" + VALEUR_CANONIQUE + r")\*\*"
     ),
-    "protocole": re.compile(
-        NOM_A_GAUCHE + r"qualification_protocol_version" + NOM_A_DROITE + AFFECTATION + VALEUR
-    ),
-    "preuve adaptateur": re.compile(
-        NOM_A_GAUCHE + r"provider_adapter_evidence_version" + NOM_A_DROITE + AFFECTATION + VALEUR
-    ),
+    **{
+        notion: re.compile(champ + r"[ \t]*=[ \t]*(" + VALEUR_CANONIQUE + r")")
+        for notion, champ in CHAMPS_NORMATIFS.items()
+    },
 }
 
 
@@ -1287,31 +1319,63 @@ def element_numerote(texte: str, numero: int) -> str:
 
 
 def versions_lues(texte: str) -> dict[str, list[str]]:
-    """Every version this text states, by notion — the one extraction path.
+    """Every **statement** of a version this text makes, by notion — the one path.
 
-    Both the three document checks and the field-name regression below read through
-    here, so a control that proved the boundaries on a second copy of the patterns
-    would prove nothing about the patterns actually used.
+    What is collected is the statement, verbatim, not a number pulled out of it. The
+    two normative fields are stated inside Markdown inline code, so the candidates are
+    the inline code spans that name the field — bounded, so ``not_…`` and ``…_alias``
+    are other names and not this one. The schema is stated in bold, so it is read on
+    the text itself.
+
+    A span that names the field without being a well-formed assignment stays in the
+    list. It is a *wrong* statement, not a missing one, and dropping it here would let
+    ``qualification_protocol_version = 8.1`` read as a rule that never mentions the
+    protocol version — and would let a wrong statement hide behind a right one.
+
+    Both the three document checks and the regression below read through here, so a
+    control that proved the boundaries on a second copy of the patterns would prove
+    nothing about the patterns actually used.
     """
-    return {nom: motif.findall(texte) for nom, motif in FORMES_DE_VERSION.items()}
+    codes = CODE_INLINE.findall(texte)
+    return {
+        NOTION_DU_SCHEMA: ENONCE_DU_SCHEMA.findall(texte),
+        **{
+            notion: [code for code in codes if motif.search(code)]
+            for notion, motif in NOM_DU_CHAMP.items()
+        },
+    }
+
+
+def valeur_enoncee(notion: str, enonce: str) -> str | None:
+    """The value a statement carries, or ``None`` when the statement is malformed."""
+    complet = ENONCE_COMPLET[notion].fullmatch(enonce)
+    return complet.group(1) if complet else None
 
 
 def versions_exigees(regle: str, attendues: dict[str, int], ou: str) -> None:
-    """Each version stated **once** in this rule, and equal to the running constant.
+    """Each version stated **once**, **in full**, and equal to the running constant.
 
-    Counting matters as much as matching. A rule that names the right version *and*
-    a competing one states two contradictory requirements, and a reader following it
-    can satisfy either — so two occurrences fail exactly like a wrong one.
+    Three questions, in that order, and never merged into one. Counting first is what
+    makes a wrong statement visible: a rule naming the right version *and* a competing
+    one states two contradictory requirements, and a reader following it can satisfy
+    either — so two occurrences fail exactly like a wrong one, whether or not both are
+    well formed. Then the single statement must be the assignment **entirely**: a
+    numeric prefix is not a value. Only then is the value compared to the constant.
     """
     lues = versions_lues(regle)
-    for nom in FORMES_DE_VERSION:
-        trouvees = lues[nom]
-        assert len(trouvees) == 1, (
-            f"{ou} : {len(trouvees)} occurrence(s) de « {nom} » ({trouvees}), attendu 1 — "
+    for notion in NOTIONS:
+        enonces = lues[notion]
+        assert len(enonces) == 1, (
+            f"{ou} : {len(enonces)} occurrence(s) de « {notion} » ({enonces}), attendu 1 — "
             "une règle normative ne peut pas exiger deux versions à la fois"
         )
-        assert int(trouvees[0]) == attendues[nom], (
-            f"{ou} : « {nom} » vaut {trouvees[0]}, or le runtime écrit et exige {attendues[nom]}"
+        valeur = valeur_enoncee(notion, enonces[0])
+        assert valeur is not None, (
+            f"{ou} : affectation {notion} invalide : {enonces[0]} — la totalité de "
+            "l'énoncé doit être l'affectation, un préfixe numérique ne suffit pas"
+        )
+        assert int(valeur) == attendues[notion], (
+            f"{ou} : « {notion} » vaut {valeur}, or le runtime écrit et exige {attendues[notion]}"
         )
 
 
@@ -1411,51 +1475,163 @@ class TestTheDocumentStatesTheProtocolVersionItActuallyRuns:
         regle = element_numerote(section(read(PROTOCOLE), *PREUVE_ADMISSIBLE), 1)
         versions_exigees(regle, self.versions(), "premier élément du §3")
 
-    def test_only_the_exact_field_names_are_recognised(self) -> None:
-        """A neighbouring name is not the field. Read through the same extractor.
+    def test_only_a_complete_exact_assignment_is_recognised(self) -> None:
+        """A neighbouring name is not the field, and a numeric prefix is not the value.
 
-        The final re-audit found this: the patterns matched the field name as a
+        Two re-audits landed here. The first found the field name matched as a
         **substring**, so ``not_qualification_protocol_version = 8`` satisfied a rule
-        that demands ``qualification_protocol_version = 8``. A document could rename
-        or misspell the normative field and stay green, which is the same class of
-        defect as the title that said 8 while the body required 5.
+        that demands ``qualification_protocol_version = 8``: a document could rename or
+        misspell the normative field and stay green. The second found the value matched
+        as a **prefix** — ``= 8.1``, ``= 8/9``, ``= 8-legacy``, ``= 8 extra`` and
+        ``provider_adapter_evidence_version = 1.1`` each read as a clean ``8`` or ``1``,
+        so the document could state a version the runtime never writes and nothing said
+        so. Both are the same class of defect as the title that announced 8 while the
+        body still required 5: the guard looked in the right place, at the wrong thing.
 
-        Every form below is synthetic and isolated: what is under test is the reading,
-        not the document.
+        Excluding ``.``, ``/``, ``-`` and the space one at a time would only move the
+        hole, so the statement is taken whole and must be **entirely** the assignment.
+
+        Every form runs through :func:`versions_exigees` — the same call the three
+        document checks make — inside a complete synthetic rule. What is under test is
+        the guard itself, not a second copy of its patterns, and not the document.
         """
         attendues = self.versions()
         protocole = attendues["protocole"]
         preuve = attendues["preuve adaptateur"]
         schema = attendues["schéma"]
+        tab = "\t"
 
-        exacts = {
-            "schéma": f"reçu **v{schema}**",
-            "protocole": f"qualification_protocol_version = {protocole}",
-            "preuve adaptateur": f"provider_adapter_evidence_version = {preuve}",
-        }
-        voisins = (
-            f"not_qualification_protocol_version = {protocole}",
-            f"qualification_protocol_version_alias = {protocole}",
-            f"not_provider_adapter_evidence_version = {preuve}",
-            f"provider_adapter_evidence_version_alias = {preuve}",
-            f"notreçu **v{schema}**",
-            f"qualification_protocol_version = {protocole}_alias",
-            f"QUALIFICATION_PROTOCOL_VERSION = {protocole}",
+        schema_exact = f"reçu **v{schema}**"
+        protocole_exact = f"`qualification_protocol_version = {protocole}`"
+        preuve_exacte = f"`provider_adapter_evidence_version = {preuve}`"
+
+        def regle(dit_schema: str, dit_protocole: str, dit_preuve: str) -> str:
+            return f"Portée : {dit_schema} portant {dit_protocole} et {dit_preuve}."
+
+        def par_le_protocole(enonce: str) -> str:
+            return regle(schema_exact, enonce, preuve_exacte)
+
+        def par_la_preuve(enonce: str) -> str:
+            return regle(schema_exact, protocole_exact, enonce)
+
+        # Spacing and trailing punctuation are the document's business, not the rule's:
+        # a tab, no space at all, and a full stop after the closing backtick all state
+        # the same assignment.
+        acceptees = (
+            regle(schema_exact, protocole_exact, preuve_exacte),
+            par_le_protocole(f"`qualification_protocol_version{tab}={tab}{protocole}`"),
+            par_le_protocole(f"`qualification_protocol_version={protocole}`"),
+            par_le_protocole(protocole_exact + "."),
+            par_la_preuve(preuve_exacte + ","),
+            regle(f"reçu{tab}**v{schema}**", protocole_exact, preuve_exacte),
+        )
+
+        # Each refusal is paired with a fragment its message must carry, so a form is
+        # not merely refused but refused *for the stated reason*.
+        refusees = (
+            # Sept formes voisines du nom — le réaudit quater.
+            (par_le_protocole(f"`not_qualification_protocol_version = {protocole}`"), "protocole"),
+            (
+                par_le_protocole(f"`qualification_protocol_version_alias = {protocole}`"),
+                "protocole",
+            ),
+            (
+                par_la_preuve(f"`not_provider_adapter_evidence_version = {preuve}`"),
+                "preuve adaptateur",
+            ),
+            (
+                par_la_preuve(f"`provider_adapter_evidence_version_alias = {preuve}`"),
+                "preuve adaptateur",
+            ),
+            (regle(f"notreçu **v{schema}**", protocole_exact, preuve_exacte), "schéma"),
+            (
+                par_le_protocole(f"`qualification_protocol_version = {protocole}_alias`"),
+                "protocole",
+            ),
+            (par_le_protocole(f"`QUALIFICATION_PROTOCOL_VERSION = {protocole}`"), "protocole"),
+            # Les cinq survivantes du réaudit sexies — la valeur lue comme préfixe.
+            (
+                par_le_protocole(f"`qualification_protocol_version = {protocole}.1`"),
+                f"affectation protocole invalide : qualification_protocol_version = {protocole}.1",
+            ),
+            (
+                par_le_protocole(f"`qualification_protocol_version = {protocole}/9`"),
+                "affectation protocole invalide",
+            ),
+            (
+                par_le_protocole(f"`qualification_protocol_version = {protocole}-legacy`"),
+                "affectation protocole invalide",
+            ),
+            (
+                par_le_protocole(f"`qualification_protocol_version = {protocole} extra`"),
+                "affectation protocole invalide",
+            ),
+            (
+                par_la_preuve(f"`provider_adapter_evidence_version = {preuve}.1`"),
+                "affectation preuve adaptateur invalide",
+            ),
+            # Cinq voisines de plus, de la même famille : le suffixe change la valeur.
+            (
+                par_le_protocole(f"`qualification_protocol_version = {protocole}.`"),
+                "affectation protocole invalide",
+            ),
+            (
+                par_le_protocole(f"`qualification_protocol_version = {protocole},1`"),
+                "affectation protocole invalide",
+            ),
+            (
+                par_le_protocole(f"`qualification_protocol_version = 0{protocole}`"),
+                "affectation protocole invalide",
+            ),
+            (par_le_protocole(f"`qualification_protocol_version = {protocole}e0`"), "protocole"),
+            (
+                par_le_protocole(f"`qualification_protocol_version = {protocole}{tab}legacy`"),
+                "affectation protocole invalide",
+            ),
+            # L'affectation exacte, mais hors du code inline où le document l'énonce.
+            (
+                par_le_protocole(f"qualification_protocol_version = {protocole}"),
+                "0 occurrence(s) de « protocole »",
+            ),
+            # Un candidat invalide *puis* un valide : la règle en énonce deux, et deux
+            # énoncés contradictoires se refusent avant même d'être lus.
+            (
+                par_le_protocole(
+                    f"`qualification_protocol_version = {protocole}.1` puis {protocole_exact}"
+                ),
+                "2 occurrence(s) de « protocole »",
+            ),
         )
 
         # Gathered rather than asserted one by one: every form is evaluated in the
         # same run, so a report names all the neighbours accepted, not just the first.
         ecarts: list[str] = []
-        for nom, texte in exacts.items():
-            lues = versions_lues(texte)
-            attendu = [str(attendues[nom])]
-            if lues[nom] != attendu:
-                ecarts.append(
-                    f"forme exacte {texte!r} : « {nom} » lu {lues[nom]}, attendu {attendu}"
-                )
-        for texte in voisins:
-            reconnus = {nom: lu for nom, lu in versions_lues(texte).items() if lu}
-            if reconnus:
-                ecarts.append(f"forme voisine {texte!r} reconnue à tort comme {reconnus}")
+        for acceptee in acceptees:
+            try:
+                versions_exigees(acceptee, attendues, "règle synthétique")
+            except AssertionError as echec:
+                ecarts.append(f"forme exacte refusée : {acceptee!r}\n  → {echec}")
+        for refusee, fragment in refusees:
+            try:
+                versions_exigees(refusee, attendues, "règle synthétique")
+            except AssertionError as echec:
+                if fragment not in str(echec):
+                    ecarts.append(
+                        f"forme voisine {refusee!r} refusée pour la mauvaise raison\n"
+                        f"  → {echec}\n  attendu un refus mentionnant « {fragment} »"
+                    )
+            else:
+                ecarts.append(f"forme voisine acceptée à tort : {refusee!r}")
+
+        # Read directly, once: an invalid statement must be *counted* before it is
+        # judged. Were it dropped as unreadable, the rule above would be refused for
+        # stating the protocol once, not twice — a different and much weaker complaint.
+        melange = f"`qualification_protocol_version = {protocole}.1` puis {protocole_exact}"
+        enonces = versions_lues(melange)["protocole"]
+        if len(enonces) != 2:
+            ecarts.append(
+                f"un candidat invalide disparaît avant le comptage : {melange!r} "
+                f"énonce {enonces}, attendu deux énoncés"
+            )
 
         assert not ecarts, "\n".join(ecarts)
