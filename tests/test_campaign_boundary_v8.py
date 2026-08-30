@@ -1204,13 +1204,32 @@ CRITERES = (
     "COST_CONFORMITY",
 )
 
-#: The three version statements a normative rule makes, each read from its own shape.
-#: ``reçu`` and its schema are separated by a line break in the §2 paragraph, hence
-#: ``\s+`` rather than a single space.
+#: A field name is a name, not a substring of a longer one. Without the word
+#: boundaries below, ``not_qualification_protocol_version = 8`` satisfied a rule that
+#: demands ``qualification_protocol_version = 8`` — a document could rename the
+#: normative field and stay green. So each name is bounded on both sides, each value
+#: is bounded on the right (``8_alias`` is not ``8``), and the match is case
+#: sensitive: ``QUALIFICATION_PROTOCOL_VERSION`` is a different token.
+#:
+#: ``[ \t]`` around ``=`` rather than ``\s``, so a match cannot run across lines and
+#: pair a name here with a value further down. The schema is the one exception: the
+#: §2 paragraph wraps between ``reçu`` and ``**v4**``, so exactly one line break is
+#: allowed there — never a blank line.
+NOM_A_GAUCHE = r"(?<![\w])"
+NOM_A_DROITE = r"(?![\w])"
+AFFECTATION = r"[ \t]*=[ \t]*"
+VALEUR = r"(\d+)(?![\w])"
 FORMES_DE_VERSION = {
-    "schéma": re.compile(r"reçu\s+\*\*v(\d+)\*\*"),
-    "protocole": re.compile(r"qualification_protocol_version = (\d+)"),
-    "preuve adaptateur": re.compile(r"provider_adapter_evidence_version = (\d+)"),
+    "schéma": re.compile(
+        NOM_A_GAUCHE + r"reçu" + NOM_A_DROITE + r"(?:[ \t]+|[ \t]*\n[ \t]*)"
+        r"\*\*v(\d+)\*\*" + NOM_A_DROITE
+    ),
+    "protocole": re.compile(
+        NOM_A_GAUCHE + r"qualification_protocol_version" + NOM_A_DROITE + AFFECTATION + VALEUR
+    ),
+    "preuve adaptateur": re.compile(
+        NOM_A_GAUCHE + r"provider_adapter_evidence_version" + NOM_A_DROITE + AFFECTATION + VALEUR
+    ),
 }
 
 
@@ -1267,6 +1286,16 @@ def element_numerote(texte: str, numero: int) -> str:
     return "\n".join(lignes[debuts[0] : fin])
 
 
+def versions_lues(texte: str) -> dict[str, list[str]]:
+    """Every version this text states, by notion — the one extraction path.
+
+    Both the three document checks and the field-name regression below read through
+    here, so a control that proved the boundaries on a second copy of the patterns
+    would prove nothing about the patterns actually used.
+    """
+    return {nom: motif.findall(texte) for nom, motif in FORMES_DE_VERSION.items()}
+
+
 def versions_exigees(regle: str, attendues: dict[str, int], ou: str) -> None:
     """Each version stated **once** in this rule, and equal to the running constant.
 
@@ -1274,8 +1303,9 @@ def versions_exigees(regle: str, attendues: dict[str, int], ou: str) -> None:
     a competing one states two contradictory requirements, and a reader following it
     can satisfy either — so two occurrences fail exactly like a wrong one.
     """
-    for nom, motif in FORMES_DE_VERSION.items():
-        trouvees = motif.findall(regle)
+    lues = versions_lues(regle)
+    for nom in FORMES_DE_VERSION:
+        trouvees = lues[nom]
         assert len(trouvees) == 1, (
             f"{ou} : {len(trouvees)} occurrence(s) de « {nom} » ({trouvees}), attendu 1 — "
             "une règle normative ne peut pas exiger deux versions à la fois"
@@ -1380,3 +1410,52 @@ class TestTheDocumentStatesTheProtocolVersionItActuallyRuns:
     def test_the_admissible_proof_requires_the_current_versions(self) -> None:
         regle = element_numerote(section(read(PROTOCOLE), *PREUVE_ADMISSIBLE), 1)
         versions_exigees(regle, self.versions(), "premier élément du §3")
+
+    def test_only_the_exact_field_names_are_recognised(self) -> None:
+        """A neighbouring name is not the field. Read through the same extractor.
+
+        The final re-audit found this: the patterns matched the field name as a
+        **substring**, so ``not_qualification_protocol_version = 8`` satisfied a rule
+        that demands ``qualification_protocol_version = 8``. A document could rename
+        or misspell the normative field and stay green, which is the same class of
+        defect as the title that said 8 while the body required 5.
+
+        Every form below is synthetic and isolated: what is under test is the reading,
+        not the document.
+        """
+        attendues = self.versions()
+        protocole = attendues["protocole"]
+        preuve = attendues["preuve adaptateur"]
+        schema = attendues["schéma"]
+
+        exacts = {
+            "schéma": f"reçu **v{schema}**",
+            "protocole": f"qualification_protocol_version = {protocole}",
+            "preuve adaptateur": f"provider_adapter_evidence_version = {preuve}",
+        }
+        voisins = (
+            f"not_qualification_protocol_version = {protocole}",
+            f"qualification_protocol_version_alias = {protocole}",
+            f"not_provider_adapter_evidence_version = {preuve}",
+            f"provider_adapter_evidence_version_alias = {preuve}",
+            f"notreçu **v{schema}**",
+            f"qualification_protocol_version = {protocole}_alias",
+            f"QUALIFICATION_PROTOCOL_VERSION = {protocole}",
+        )
+
+        # Gathered rather than asserted one by one: every form is evaluated in the
+        # same run, so a report names all the neighbours accepted, not just the first.
+        ecarts: list[str] = []
+        for nom, texte in exacts.items():
+            lues = versions_lues(texte)
+            attendu = [str(attendues[nom])]
+            if lues[nom] != attendu:
+                ecarts.append(
+                    f"forme exacte {texte!r} : « {nom} » lu {lues[nom]}, attendu {attendu}"
+                )
+        for texte in voisins:
+            reconnus = {nom: lu for nom, lu in versions_lues(texte).items() if lu}
+            if reconnus:
+                ecarts.append(f"forme voisine {texte!r} reconnue à tort comme {reconnus}")
+
+        assert not ecarts, "\n".join(ecarts)
