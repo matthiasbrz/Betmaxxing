@@ -1168,3 +1168,99 @@ class TestTheReaderStaysDedicatedAndShared:
             if relative == "docs/decisions.md":
                 continue
             assert EXPORT in read(relative), f"{relative} ne montre pas la commande {EXPORT}"
+
+
+#: The protocol document, and the three sections that state which receipt the
+#: qualification accepts. Named here so a test that isolates a section says which one.
+PROTOCOLE = "docs/provider-validation-protocol.md"
+PORTEE_COMMUNE = ("## 2. Matrice des critères", "### 2.0 Contrat structurel")
+PREUVE_ADMISSIBLE = ("## 3. Preuve admissible", "## 4. Déduplication")
+
+#: The eight criteria the matrix scores, in the order the table lists them. Restated
+#: as literals: a test that read the row labels out of the table it is checking would
+#: agree with a table that had lost a row.
+CRITERES = (
+    "CORE_MAPPING_FOOTBALL",
+    "CORE_MAPPING_TENNIS",
+    "ADDITIONAL_MAPPING_FOOTBALL_DRAW_NO_BET",
+    "ADDITIONAL_MAPPING_FOOTBALL_DOUBLE_CHANCE",
+    "ADDITIONAL_MAPPING_FOOTBALL_H2H_3_WAY_H1",
+    "ADDITIONAL_MAPPING_FOOTBALL_TOTALS_H1",
+    "ADDITIONAL_MAPPING_FOOTBALL_DOUBLE_CHANCE_H1",
+    "COST_CONFORMITY",
+)
+
+
+def tranche(texte: str, debut: str, fin: str) -> str:
+    """The document between two headings, so a section is checked and not the file."""
+    i = texte.index(debut)
+    j = texte.index(fin, i)
+    return texte[i:j]
+
+
+class TestTheDocumentStatesTheProtocolVersionItActuallyRuns:
+    """The normative sections must name the version the runtime writes and demands.
+
+    The guard that existed before this class read only the document's **first line**,
+    which is its title. The title said 8 while the body still required 5 in ten places:
+    the common scope of the criteria matrix, the eight rows of that matrix, and the
+    definition of admissible proof. So the document described a receipt the runtime
+    neither produces nor accepts — and the suite stayed green, because nothing read
+    past line one.
+
+    Every expected value here is **derived from the production constants**. Hard-coding
+    ``8`` would make these tests agree with a document that had frozen on whatever
+    number the test happened to carry, which is the failure being closed.
+    """
+
+    def versions(self) -> tuple[int, int, int]:
+        return (
+            act.RECEIPT_SCHEMA_VERSION,
+            qual.PROVIDER_VALIDATION_PROTOCOL_VERSION,
+            qual.PROVIDER_ADAPTER_EVIDENCE_VERSION,
+        )
+
+    def test_the_common_scope_of_the_matrix_names_the_current_versions(self) -> None:
+        _, protocole, preuve = self.versions()
+        section = tranche(read(PROTOCOLE), *PORTEE_COMMUNE)
+
+        attendu = f"qualification_protocol_version = {protocole}"
+        assert attendu in section, (
+            f"la portée commune du §2 n'exige pas « {attendu} » — elle décrit une preuve "
+            "que le runtime ne produit plus"
+        )
+        assert f"provider_adapter_evidence_version = {preuve}" in section
+
+    def test_every_criterion_row_demands_the_current_receipt(self) -> None:
+        schema, protocole, preuve = self.versions()
+        section = tranche(read(PROTOCOLE), *PORTEE_COMMUNE)
+        attendu = f"v{schema}/{protocole}/{preuve} seul"
+
+        lignes = [
+            ligne
+            for ligne in section.splitlines()
+            if ligne.startswith("| `") and any(f"`{c}`" in ligne for c in CRITERES)
+        ]
+        # Without this, a table that had lost rows would satisfy the loop vacuously.
+        assert len(lignes) == len(CRITERES), (
+            f"la table des critères a {len(lignes)} ligne(s) de données pour "
+            f"{len(CRITERES)} critères attendus"
+        )
+        for critere, ligne in zip(CRITERES, lignes, strict=True):
+            assert f"`{critere}`" in ligne, f"ligne inattendue pour {critere} : {ligne}"
+            assert attendu in ligne, (
+                f"le critère {critere} exige encore une autre version que « {attendu} » : "
+                f"{ligne.rsplit('|', 2)[-2].strip()}"
+            )
+
+    def test_the_admissible_proof_requires_the_current_versions(self) -> None:
+        schema, protocole, preuve = self.versions()
+        section = tranche(read(PROTOCOLE), *PREUVE_ADMISSIBLE)
+
+        attendu = f"qualification_protocol_version = {protocole}"
+        assert attendu in section, (
+            f"le §3 n'admet pas « {attendu} » — un reçu émis aujourd'hui serait "
+            "inadmissible selon le document"
+        )
+        assert f"provider_adapter_evidence_version = {preuve}" in section
+        assert f"**v{schema}**" in section, f"le §3 ne nomme plus le schéma v{schema}"
