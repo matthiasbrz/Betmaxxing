@@ -1171,10 +1171,24 @@ class TestTheReaderStaysDedicatedAndShared:
 
 
 #: The protocol document, and the three sections that state which receipt the
-#: qualification accepts. Named here so a test that isolates a section says which one.
+#: qualification accepts. Titles are given **in full**: they are matched as whole
+#: lines, so a second section carrying the same heading cannot stand in for the real
+#: one — it is refused as a duplicate instead.
 PROTOCOLE = "docs/provider-validation-protocol.md"
-PORTEE_COMMUNE = ("## 2. Matrice des critères", "### 2.0 Contrat structurel")
+PORTEE_COMMUNE = (
+    "## 2. Matrice des critères",
+    "### 2.0 Contrat structurel : une signature prouve des octets, pas des types",
+)
 PREUVE_ADMISSIBLE = ("## 3. Preuve admissible", "## 4. Déduplication")
+
+#: The header of the criteria table, matched whole so a reshaped table is noticed.
+ENTETE_MATRICE = (
+    "| `criterion_id` | Portée | Preuve admissible | Événements | Compétitions "
+    "| Jours UTC | Schéma |"
+)
+#: The column that states which receipt each criterion accepts.
+COLONNE_SCHEMA = 6
+COLONNES_MATRICE = 7
 
 #: The eight criteria the matrix scores, in the order the table lists them. Restated
 #: as literals: a test that read the row labels out of the table it is checking would
@@ -1190,77 +1204,179 @@ CRITERES = (
     "COST_CONFORMITY",
 )
 
+#: The three version statements a normative rule makes, each read from its own shape.
+#: ``reçu`` and its schema are separated by a line break in the §2 paragraph, hence
+#: ``\s+`` rather than a single space.
+FORMES_DE_VERSION = {
+    "schéma": re.compile(r"reçu\s+\*\*v(\d+)\*\*"),
+    "protocole": re.compile(r"qualification_protocol_version = (\d+)"),
+    "preuve adaptateur": re.compile(r"provider_adapter_evidence_version = (\d+)"),
+}
 
-def tranche(texte: str, debut: str, fin: str) -> str:
-    """The document between two headings, so a section is checked and not the file."""
-    i = texte.index(debut)
-    j = texte.index(fin, i)
-    return texte[i:j]
+
+def section(texte: str, debut: str, fin: str) -> str:
+    """The lines strictly between two heading lines, each of which must be unique.
+
+    Whole-line equality rather than ``in``: a heading is a heading, not a substring
+    of a sentence that happens to quote it. And exactly one of each, so a duplicated
+    ``## 2.`` cannot let a decorative copy answer for the normative section.
+    """
+    lignes = texte.splitlines()
+    debuts = [k for k, ligne in enumerate(lignes) if ligne == debut]
+    fins = [k for k, ligne in enumerate(lignes) if ligne == fin]
+    assert len(debuts) == 1, f"titre « {debut} » présent {len(debuts)} fois, attendu 1"
+    assert len(fins) == 1, f"titre « {fin} » présent {len(fins)} fois, attendu 1"
+    assert fins[0] > debuts[0], f"« {fin} » précède « {debut} »"
+    return "\n".join(lignes[debuts[0] + 1 : fins[0]])
+
+
+def paragraphe(texte: str, prefixe: str) -> str:
+    """The one paragraph opening with ``prefixe``, up to the first blank line."""
+    lignes = texte.splitlines()
+    debuts = [k for k, ligne in enumerate(lignes) if ligne.startswith(prefixe)]
+    assert len(debuts) == 1, f"« {prefixe} » ouvre {len(debuts)} paragraphe(s), attendu 1"
+    fin = debuts[0]
+    while fin + 1 < len(lignes) and lignes[fin + 1].strip():
+        fin += 1
+    return "\n".join(lignes[debuts[0] : fin + 1])
+
+
+def avant_sous_section(texte: str) -> str:
+    """A section's own prose, stopping at its first subheading.
+
+    The §3 rule lives in the section's own words; ``### 3.1`` and below open other
+    lists, and a rule must not be searched for among them.
+    """
+    lignes = texte.splitlines()
+    for k, ligne in enumerate(lignes):
+        if ligne.startswith("### "):
+            return "\n".join(lignes[:k])
+    return texte
+
+
+def element_numerote(texte: str, numero: int) -> str:
+    """One item of a numbered list, from ``N.`` up to but excluding ``N+1.``."""
+    lignes = avant_sous_section(texte).splitlines()
+    debuts = [k for k, ligne in enumerate(lignes) if ligne.startswith(f"{numero}. ")]
+    assert len(debuts) == 1, f"l'élément {numero}. apparaît {len(debuts)} fois, attendu 1"
+    fin = len(lignes)
+    for k in range(debuts[0] + 1, len(lignes)):
+        if lignes[k].startswith(f"{numero + 1}. "):
+            fin = k
+            break
+    return "\n".join(lignes[debuts[0] : fin])
+
+
+def versions_exigees(regle: str, attendues: dict[str, int], ou: str) -> None:
+    """Each version stated **once** in this rule, and equal to the running constant.
+
+    Counting matters as much as matching. A rule that names the right version *and*
+    a competing one states two contradictory requirements, and a reader following it
+    can satisfy either — so two occurrences fail exactly like a wrong one.
+    """
+    for nom, motif in FORMES_DE_VERSION.items():
+        trouvees = motif.findall(regle)
+        assert len(trouvees) == 1, (
+            f"{ou} : {len(trouvees)} occurrence(s) de « {nom} » ({trouvees}), attendu 1 — "
+            "une règle normative ne peut pas exiger deux versions à la fois"
+        )
+        assert int(trouvees[0]) == attendues[nom], (
+            f"{ou} : « {nom} » vaut {trouvees[0]}, or le runtime écrit et exige {attendues[nom]}"
+        )
+
+
+def cellules(ligne: str) -> list[str]:
+    """The cells of a Markdown row, outer pipes removed, contents kept verbatim."""
+    parts = ligne.split("|")
+    assert parts[0].strip() == "" and parts[-1].strip() == "", f"ligne mal formée : {ligne}"
+    return [p.strip() for p in parts[1:-1]]
+
+
+def lignes_de_la_matrice(section_texte: str) -> list[list[str]]:
+    """The table's data rows, parsed into columns — every row, filtered by nothing.
+
+    Filtering rows by the identifiers we expect would make an unknown ninth criterion
+    invisible: the loop would still see eight rows and agree. So the parse is
+    structural, and the identifiers are compared afterwards.
+    """
+    lignes = section_texte.splitlines()
+    entetes = [k for k, ligne in enumerate(lignes) if ligne == ENTETE_MATRICE]
+    assert len(entetes) == 1, f"en-tête de la matrice présent {len(entetes)} fois, attendu 1"
+    k = entetes[0]
+    separateur = set(lignes[k + 1].replace("|", "").replace(" ", ""))
+    assert separateur == {"-"}, f"ligne séparatrice inattendue : {lignes[k + 1]}"
+
+    donnees: list[list[str]] = []
+    for ligne in lignes[k + 2 :]:
+        if not ligne.startswith("|"):
+            break
+        colonnes = cellules(ligne)
+        assert len(colonnes) == COLONNES_MATRICE, (
+            f"ligne à {len(colonnes)} colonnes au lieu de {COLONNES_MATRICE} : {ligne}"
+        )
+        donnees.append(colonnes)
+    return donnees
 
 
 class TestTheDocumentStatesTheProtocolVersionItActuallyRuns:
-    """The normative sections must name the version the runtime writes and demands.
+    """The normative rules must demand the receipt the runtime actually writes.
 
-    The guard that existed before this class read only the document's **first line**,
-    which is its title. The title said 8 while the body still required 5 in ten places:
-    the common scope of the criteria matrix, the eight rows of that matrix, and the
-    definition of admissible proof. So the document described a receipt the runtime
-    neither produces nor accepts — and the suite stayed green, because nothing read
-    past line one.
+    The guard that existed before this class read the document's **first line** —
+    its title, which said 8 while the body still required 5 in ten places. The suite
+    stayed green because nothing read past line one.
 
-    Every expected value here is **derived from the production constants**. Hard-coding
-    ``8`` would make these tests agree with a document that had frozen on whatever
-    number the test happened to carry, which is the failure being closed.
+    Its first replacement read whole sections and asked whether the right version
+    appeared *somewhere* in them. An independent re-audit killed that too: a section
+    could demand version 5 in its normative sentence and mention 8 in a note, a row
+    could carry ``v4/5/1`` in its Schéma column and ``v4/8/1`` in another, and a
+    ninth unknown criterion could be appended unnoticed — five mutations survived.
+
+    So the reading is now structural. Each rule is isolated to the paragraph or the
+    list item that *is* the rule; each version must appear there exactly once and
+    equal the running constant; and the matrix is parsed into columns, every row,
+    filtered by nothing. Every expected value is derived from the production
+    constants — hard-coding ``8`` would make these tests agree with a document
+    frozen on whatever number the test happened to carry.
     """
 
-    def versions(self) -> tuple[int, int, int]:
-        return (
-            act.RECEIPT_SCHEMA_VERSION,
-            qual.PROVIDER_VALIDATION_PROTOCOL_VERSION,
-            qual.PROVIDER_ADAPTER_EVIDENCE_VERSION,
-        )
+    def versions(self) -> dict[str, int]:
+        return {
+            "schéma": act.RECEIPT_SCHEMA_VERSION,
+            "protocole": qual.PROVIDER_VALIDATION_PROTOCOL_VERSION,
+            "preuve adaptateur": qual.PROVIDER_ADAPTER_EVIDENCE_VERSION,
+        }
 
     def test_the_common_scope_of_the_matrix_names_the_current_versions(self) -> None:
-        _, protocole, preuve = self.versions()
-        section = tranche(read(PROTOCOLE), *PORTEE_COMMUNE)
-
-        attendu = f"qualification_protocol_version = {protocole}"
-        assert attendu in section, (
-            f"la portée commune du §2 n'exige pas « {attendu} » — elle décrit une preuve "
-            "que le runtime ne produit plus"
-        )
-        assert f"provider_adapter_evidence_version = {preuve}" in section
+        regle = paragraphe(section(read(PROTOCOLE), *PORTEE_COMMUNE), "Portée commune à tous")
+        versions_exigees(regle, self.versions(), "portée commune du §2")
 
     def test_every_criterion_row_demands_the_current_receipt(self) -> None:
-        schema, protocole, preuve = self.versions()
-        section = tranche(read(PROTOCOLE), *PORTEE_COMMUNE)
-        attendu = f"v{schema}/{protocole}/{preuve} seul"
-
-        lignes = [
-            ligne
-            for ligne in section.splitlines()
-            if ligne.startswith("| `") and any(f"`{c}`" in ligne for c in CRITERES)
-        ]
-        # Without this, a table that had lost rows would satisfy the loop vacuously.
-        assert len(lignes) == len(CRITERES), (
-            f"la table des critères a {len(lignes)} ligne(s) de données pour "
-            f"{len(CRITERES)} critères attendus"
+        attendues = self.versions()
+        attendu = (
+            f"**v{attendues['schéma']}/{attendues['protocole']}"
+            f"/{attendues['preuve adaptateur']} seul**"
         )
-        for critere, ligne in zip(CRITERES, lignes, strict=True):
-            assert f"`{critere}`" in ligne, f"ligne inattendue pour {critere} : {ligne}"
-            assert attendu in ligne, (
-                f"le critère {critere} exige encore une autre version que « {attendu} » : "
-                f"{ligne.rsplit('|', 2)[-2].strip()}"
+        donnees = lignes_de_la_matrice(section(read(PROTOCOLE), *PORTEE_COMMUNE))
+
+        identifiants = tuple(c[0].strip("`") for c in donnees)
+        # One comparison covers an unknown row, a duplicate, a missing one and a
+        # permutation — each of which a per-row loop would let through.
+        assert identifiants == CRITERES, f"la matrice liste {identifiants}\nau lieu de {CRITERES}"
+        for critere, colonnes in zip(CRITERES, donnees, strict=True):
+            assert colonnes[COLONNE_SCHEMA] == attendu, (
+                f"{critere} : la colonne Schéma vaut {colonnes[COLONNE_SCHEMA]}, attendu {attendu}"
+            )
+            ailleurs = [
+                k
+                for k, cellule in enumerate(colonnes)
+                if k != COLONNE_SCHEMA and attendu.strip("*") in cellule
+            ]
+            assert not ailleurs, (
+                f"{critere} : « {attendu.strip('*')} » apparaît aussi dans "
+                f"la ou les colonnes {ailleurs} — la valeur doit être dans la seule "
+                "colonne Schéma"
             )
 
     def test_the_admissible_proof_requires_the_current_versions(self) -> None:
-        schema, protocole, preuve = self.versions()
-        section = tranche(read(PROTOCOLE), *PREUVE_ADMISSIBLE)
-
-        attendu = f"qualification_protocol_version = {protocole}"
-        assert attendu in section, (
-            f"le §3 n'admet pas « {attendu} » — un reçu émis aujourd'hui serait "
-            "inadmissible selon le document"
-        )
-        assert f"provider_adapter_evidence_version = {preuve}" in section
-        assert f"**v{schema}**" in section, f"le §3 ne nomme plus le schéma v{schema}"
+        regle = element_numerote(section(read(PROTOCOLE), *PREUVE_ADMISSIBLE), 1)
+        versions_exigees(regle, self.versions(), "premier élément du §3")
