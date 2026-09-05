@@ -1168,3 +1168,470 @@ class TestTheReaderStaysDedicatedAndShared:
             if relative == "docs/decisions.md":
                 continue
             assert EXPORT in read(relative), f"{relative} ne montre pas la commande {EXPORT}"
+
+
+#: The protocol document, and the three sections that state which receipt the
+#: qualification accepts. Titles are given **in full**: they are matched as whole
+#: lines, so a second section carrying the same heading cannot stand in for the real
+#: one — it is refused as a duplicate instead.
+PROTOCOLE = "docs/provider-validation-protocol.md"
+PORTEE_COMMUNE = (
+    "## 2. Matrice des critères",
+    "### 2.0 Contrat structurel : une signature prouve des octets, pas des types",
+)
+PREUVE_ADMISSIBLE = ("## 3. Preuve admissible", "## 4. Déduplication")
+
+#: The header of the criteria table, matched whole so a reshaped table is noticed.
+ENTETE_MATRICE = (
+    "| `criterion_id` | Portée | Preuve admissible | Événements | Compétitions "
+    "| Jours UTC | Schéma |"
+)
+#: The column that states which receipt each criterion accepts.
+COLONNE_SCHEMA = 6
+COLONNES_MATRICE = 7
+
+#: The eight criteria the matrix scores, in the order the table lists them. Restated
+#: as literals: a test that read the row labels out of the table it is checking would
+#: agree with a table that had lost a row.
+CRITERES = (
+    "CORE_MAPPING_FOOTBALL",
+    "CORE_MAPPING_TENNIS",
+    "ADDITIONAL_MAPPING_FOOTBALL_DRAW_NO_BET",
+    "ADDITIONAL_MAPPING_FOOTBALL_DOUBLE_CHANCE",
+    "ADDITIONAL_MAPPING_FOOTBALL_H2H_3_WAY_H1",
+    "ADDITIONAL_MAPPING_FOOTBALL_TOTALS_H1",
+    "ADDITIONAL_MAPPING_FOOTBALL_DOUBLE_CHANCE_H1",
+    "COST_CONFORMITY",
+)
+
+#: A field name is a name, not a substring of a longer one. Without the word
+#: boundaries below, ``not_qualification_protocol_version = 8`` satisfied a rule that
+#: demands ``qualification_protocol_version = 8`` — a document could rename the
+#: normative field and stay green. So each name is bounded on both sides, and the match
+#: is case sensitive: ``QUALIFICATION_PROTOCOL_VERSION`` is a different token.
+#:
+#: Bounding the name was not enough. The closure re-audit read the value as a numeric
+#: **prefix**: ``= 8.1``, ``= 8/9``, ``= 8-legacy``, ``= 8 extra`` and
+#: ``provider_adapter_evidence_version = 1.1`` each yielded a clean ``8`` or ``1``, and
+#: a document could therefore state a version the runtime never writes. Excluding
+#: ``.``, ``/``, ``-`` and the space one at a time would only move the hole to the next
+#: character, so the reading is inverted: the document states these two fields inside
+#: Markdown inline code, that span is taken **whole**, and the whole span must be the
+#: assignment. Nothing is read out of a longer sentence.
+#:
+#: ``[ \t]`` around ``=`` rather than ``\s``, so an assignment cannot run across lines
+#: and pair a name here with a value further down. The schema is stated in bold rather
+#: than in code and is read on the rule's own text; the §2 paragraph wraps between
+#: ``reçu`` and ``**v4**``, so exactly one line break is allowed there — never a blank
+#: line.
+NOM_A_GAUCHE = r"(?<![\w])"
+NOM_A_DROITE = r"(?![\w])"
+#: One Markdown inline code span. The lookarounds keep a ``` ``double`` ``` span from
+#: being read as a single one, and ``[^`\n]`` keeps a span from swallowing a line break.
+CODE_INLINE = re.compile(r"(?<!`)`([^`\n]*)`(?!`)")
+#: A version number written the one way a version number is written: no leading zero,
+#: no sign, no decimal point, no exponent. ``08`` states something else than ``8``.
+VALEUR_CANONIQUE = r"(?:0|[1-9][0-9]*)"
+
+NOTION_DU_SCHEMA = "schéma"
+CHAMPS_NORMATIFS = {
+    "protocole": "qualification_protocol_version",
+    "preuve adaptateur": "provider_adapter_evidence_version",
+}
+NOTIONS = (NOTION_DU_SCHEMA, *CHAMPS_NORMATIFS)
+
+#: How a statement is **found**. Deliberately loose on the value — a malformed
+#: assignment must be found, so that it can be refused as wrong rather than vanish and
+#: leave the rule looking silent about the field.
+NOM_DU_CHAMP = {
+    notion: re.compile(NOM_A_GAUCHE + champ + NOM_A_DROITE)
+    for notion, champ in CHAMPS_NORMATIFS.items()
+}
+ENONCE_DU_SCHEMA = re.compile(
+    NOM_A_GAUCHE + r"reçu" + NOM_A_DROITE + r"(?:[ \t]+|[ \t]*\n[ \t]*)"
+    r"\*\*v\d+\*\*" + NOM_A_DROITE
+)
+
+#: How a statement is **validated**, with ``fullmatch``: the entire statement is the
+#: assignment. ``match`` or ``search`` here would restore the prefix reading exactly.
+ENONCE_COMPLET = {
+    NOTION_DU_SCHEMA: re.compile(
+        r"reçu(?:[ \t]+|[ \t]*\n[ \t]*)\*\*v(" + VALEUR_CANONIQUE + r")\*\*"
+    ),
+    **{
+        notion: re.compile(champ + r"[ \t]*=[ \t]*(" + VALEUR_CANONIQUE + r")")
+        for notion, champ in CHAMPS_NORMATIFS.items()
+    },
+}
+
+
+def section(texte: str, debut: str, fin: str) -> str:
+    """The lines strictly between two heading lines, each of which must be unique.
+
+    Whole-line equality rather than ``in``: a heading is a heading, not a substring
+    of a sentence that happens to quote it. And exactly one of each, so a duplicated
+    ``## 2.`` cannot let a decorative copy answer for the normative section.
+    """
+    lignes = texte.splitlines()
+    debuts = [k for k, ligne in enumerate(lignes) if ligne == debut]
+    fins = [k for k, ligne in enumerate(lignes) if ligne == fin]
+    assert len(debuts) == 1, f"titre « {debut} » présent {len(debuts)} fois, attendu 1"
+    assert len(fins) == 1, f"titre « {fin} » présent {len(fins)} fois, attendu 1"
+    assert fins[0] > debuts[0], f"« {fin} » précède « {debut} »"
+    return "\n".join(lignes[debuts[0] + 1 : fins[0]])
+
+
+def paragraphe(texte: str, prefixe: str) -> str:
+    """The one paragraph opening with ``prefixe``, up to the first blank line."""
+    lignes = texte.splitlines()
+    debuts = [k for k, ligne in enumerate(lignes) if ligne.startswith(prefixe)]
+    assert len(debuts) == 1, f"« {prefixe} » ouvre {len(debuts)} paragraphe(s), attendu 1"
+    fin = debuts[0]
+    while fin + 1 < len(lignes) and lignes[fin + 1].strip():
+        fin += 1
+    return "\n".join(lignes[debuts[0] : fin + 1])
+
+
+def avant_sous_section(texte: str) -> str:
+    """A section's own prose, stopping at its first subheading.
+
+    The §3 rule lives in the section's own words; ``### 3.1`` and below open other
+    lists, and a rule must not be searched for among them.
+    """
+    lignes = texte.splitlines()
+    for k, ligne in enumerate(lignes):
+        if ligne.startswith("### "):
+            return "\n".join(lignes[:k])
+    return texte
+
+
+def element_numerote(texte: str, numero: int) -> str:
+    """One item of a numbered list, from ``N.`` up to but excluding ``N+1.``."""
+    lignes = avant_sous_section(texte).splitlines()
+    debuts = [k for k, ligne in enumerate(lignes) if ligne.startswith(f"{numero}. ")]
+    assert len(debuts) == 1, f"l'élément {numero}. apparaît {len(debuts)} fois, attendu 1"
+    fin = len(lignes)
+    for k in range(debuts[0] + 1, len(lignes)):
+        if lignes[k].startswith(f"{numero + 1}. "):
+            fin = k
+            break
+    return "\n".join(lignes[debuts[0] : fin])
+
+
+def versions_lues(texte: str) -> dict[str, list[str]]:
+    """Every **statement** of a version this text makes, by notion — the one path.
+
+    What is collected is the statement, verbatim, not a number pulled out of it. The
+    two normative fields are stated inside Markdown inline code, so the candidates are
+    the inline code spans that name the field — bounded, so ``not_…`` and ``…_alias``
+    are other names and not this one. The schema is stated in bold, so it is read on
+    the text itself.
+
+    A span that names the field without being a well-formed assignment stays in the
+    list. It is a *wrong* statement, not a missing one, and dropping it here would let
+    ``qualification_protocol_version = 8.1`` read as a rule that never mentions the
+    protocol version — and would let a wrong statement hide behind a right one.
+
+    Both the three document checks and the regression below read through here, so a
+    control that proved the boundaries on a second copy of the patterns would prove
+    nothing about the patterns actually used.
+    """
+    codes = CODE_INLINE.findall(texte)
+    return {
+        NOTION_DU_SCHEMA: ENONCE_DU_SCHEMA.findall(texte),
+        **{
+            notion: [code for code in codes if motif.search(code)]
+            for notion, motif in NOM_DU_CHAMP.items()
+        },
+    }
+
+
+def valeur_enoncee(notion: str, enonce: str) -> str | None:
+    """The value a statement carries, or ``None`` when the statement is malformed."""
+    complet = ENONCE_COMPLET[notion].fullmatch(enonce)
+    return complet.group(1) if complet else None
+
+
+def versions_exigees(regle: str, attendues: dict[str, int], ou: str) -> None:
+    """Each version stated **once**, **in full**, and equal to the running constant.
+
+    Three questions, in that order, and never merged into one. Counting first is what
+    makes a wrong statement visible: a rule naming the right version *and* a competing
+    one states two contradictory requirements, and a reader following it can satisfy
+    either — so two occurrences fail exactly like a wrong one, whether or not both are
+    well formed. Then the single statement must be the assignment **entirely**: a
+    numeric prefix is not a value. Only then is the value compared to the constant.
+    """
+    lues = versions_lues(regle)
+    for notion in NOTIONS:
+        enonces = lues[notion]
+        assert len(enonces) == 1, (
+            f"{ou} : {len(enonces)} occurrence(s) de « {notion} » ({enonces}), attendu 1 — "
+            "une règle normative ne peut pas exiger deux versions à la fois"
+        )
+        valeur = valeur_enoncee(notion, enonces[0])
+        assert valeur is not None, (
+            f"{ou} : affectation {notion} invalide : {enonces[0]} — la totalité de "
+            "l'énoncé doit être l'affectation, un préfixe numérique ne suffit pas"
+        )
+        assert int(valeur) == attendues[notion], (
+            f"{ou} : « {notion} » vaut {valeur}, or le runtime écrit et exige {attendues[notion]}"
+        )
+
+
+def cellules(ligne: str) -> list[str]:
+    """The cells of a Markdown row, outer pipes removed, contents kept verbatim."""
+    parts = ligne.split("|")
+    assert parts[0].strip() == "" and parts[-1].strip() == "", f"ligne mal formée : {ligne}"
+    return [p.strip() for p in parts[1:-1]]
+
+
+def lignes_de_la_matrice(section_texte: str) -> list[list[str]]:
+    """The table's data rows, parsed into columns — every row, filtered by nothing.
+
+    Filtering rows by the identifiers we expect would make an unknown ninth criterion
+    invisible: the loop would still see eight rows and agree. So the parse is
+    structural, and the identifiers are compared afterwards.
+    """
+    lignes = section_texte.splitlines()
+    entetes = [k for k, ligne in enumerate(lignes) if ligne == ENTETE_MATRICE]
+    assert len(entetes) == 1, f"en-tête de la matrice présent {len(entetes)} fois, attendu 1"
+    k = entetes[0]
+    separateur = set(lignes[k + 1].replace("|", "").replace(" ", ""))
+    assert separateur == {"-"}, f"ligne séparatrice inattendue : {lignes[k + 1]}"
+
+    donnees: list[list[str]] = []
+    for ligne in lignes[k + 2 :]:
+        if not ligne.startswith("|"):
+            break
+        colonnes = cellules(ligne)
+        assert len(colonnes) == COLONNES_MATRICE, (
+            f"ligne à {len(colonnes)} colonnes au lieu de {COLONNES_MATRICE} : {ligne}"
+        )
+        donnees.append(colonnes)
+    return donnees
+
+
+class TestTheDocumentStatesTheProtocolVersionItActuallyRuns:
+    """The normative rules must demand the receipt the runtime actually writes.
+
+    The guard that existed before this class read the document's **first line** —
+    its title, which said 8 while the body still required 5 in ten places. The suite
+    stayed green because nothing read past line one.
+
+    Its first replacement read whole sections and asked whether the right version
+    appeared *somewhere* in them. An independent re-audit killed that too: a section
+    could demand version 5 in its normative sentence and mention 8 in a note, a row
+    could carry ``v4/5/1`` in its Schéma column and ``v4/8/1`` in another, and a
+    ninth unknown criterion could be appended unnoticed — five mutations survived.
+
+    So the reading is now structural. Each rule is isolated to the paragraph or the
+    list item that *is* the rule; each version must appear there exactly once and
+    equal the running constant; and the matrix is parsed into columns, every row,
+    filtered by nothing. Every expected value is derived from the production
+    constants — hard-coding ``8`` would make these tests agree with a document
+    frozen on whatever number the test happened to carry.
+    """
+
+    def versions(self) -> dict[str, int]:
+        return {
+            "schéma": act.RECEIPT_SCHEMA_VERSION,
+            "protocole": qual.PROVIDER_VALIDATION_PROTOCOL_VERSION,
+            "preuve adaptateur": qual.PROVIDER_ADAPTER_EVIDENCE_VERSION,
+        }
+
+    def test_the_common_scope_of_the_matrix_names_the_current_versions(self) -> None:
+        regle = paragraphe(section(read(PROTOCOLE), *PORTEE_COMMUNE), "Portée commune à tous")
+        versions_exigees(regle, self.versions(), "portée commune du §2")
+
+    def test_every_criterion_row_demands_the_current_receipt(self) -> None:
+        attendues = self.versions()
+        attendu = (
+            f"**v{attendues['schéma']}/{attendues['protocole']}"
+            f"/{attendues['preuve adaptateur']} seul**"
+        )
+        donnees = lignes_de_la_matrice(section(read(PROTOCOLE), *PORTEE_COMMUNE))
+
+        identifiants = tuple(c[0].strip("`") for c in donnees)
+        # One comparison covers an unknown row, a duplicate, a missing one and a
+        # permutation — each of which a per-row loop would let through.
+        assert identifiants == CRITERES, f"la matrice liste {identifiants}\nau lieu de {CRITERES}"
+        for critere, colonnes in zip(CRITERES, donnees, strict=True):
+            assert colonnes[COLONNE_SCHEMA] == attendu, (
+                f"{critere} : la colonne Schéma vaut {colonnes[COLONNE_SCHEMA]}, attendu {attendu}"
+            )
+            ailleurs = [
+                k
+                for k, cellule in enumerate(colonnes)
+                if k != COLONNE_SCHEMA and attendu.strip("*") in cellule
+            ]
+            assert not ailleurs, (
+                f"{critere} : « {attendu.strip('*')} » apparaît aussi dans "
+                f"la ou les colonnes {ailleurs} — la valeur doit être dans la seule "
+                "colonne Schéma"
+            )
+
+    def test_the_admissible_proof_requires_the_current_versions(self) -> None:
+        regle = element_numerote(section(read(PROTOCOLE), *PREUVE_ADMISSIBLE), 1)
+        versions_exigees(regle, self.versions(), "premier élément du §3")
+
+    def test_only_a_complete_exact_assignment_is_recognised(self) -> None:
+        """A neighbouring name is not the field, and a numeric prefix is not the value.
+
+        Two re-audits landed here. The first found the field name matched as a
+        **substring**, so ``not_qualification_protocol_version = 8`` satisfied a rule
+        that demands ``qualification_protocol_version = 8``: a document could rename or
+        misspell the normative field and stay green. The second found the value matched
+        as a **prefix** — ``= 8.1``, ``= 8/9``, ``= 8-legacy``, ``= 8 extra`` and
+        ``provider_adapter_evidence_version = 1.1`` each read as a clean ``8`` or ``1``,
+        so the document could state a version the runtime never writes and nothing said
+        so. Both are the same class of defect as the title that announced 8 while the
+        body still required 5: the guard looked in the right place, at the wrong thing.
+
+        Excluding ``.``, ``/``, ``-`` and the space one at a time would only move the
+        hole, so the statement is taken whole and must be **entirely** the assignment.
+
+        Every form runs through :func:`versions_exigees` — the same call the three
+        document checks make — inside a complete synthetic rule. What is under test is
+        the guard itself, not a second copy of its patterns, and not the document.
+        """
+        attendues = self.versions()
+        protocole = attendues["protocole"]
+        preuve = attendues["preuve adaptateur"]
+        schema = attendues["schéma"]
+        tab = "\t"
+
+        schema_exact = f"reçu **v{schema}**"
+        protocole_exact = f"`qualification_protocol_version = {protocole}`"
+        preuve_exacte = f"`provider_adapter_evidence_version = {preuve}`"
+
+        def regle(dit_schema: str, dit_protocole: str, dit_preuve: str) -> str:
+            return f"Portée : {dit_schema} portant {dit_protocole} et {dit_preuve}."
+
+        def par_le_protocole(enonce: str) -> str:
+            return regle(schema_exact, enonce, preuve_exacte)
+
+        def par_la_preuve(enonce: str) -> str:
+            return regle(schema_exact, protocole_exact, enonce)
+
+        # Spacing and trailing punctuation are the document's business, not the rule's:
+        # a tab, no space at all, and a full stop after the closing backtick all state
+        # the same assignment.
+        acceptees = (
+            regle(schema_exact, protocole_exact, preuve_exacte),
+            par_le_protocole(f"`qualification_protocol_version{tab}={tab}{protocole}`"),
+            par_le_protocole(f"`qualification_protocol_version={protocole}`"),
+            par_le_protocole(protocole_exact + "."),
+            par_la_preuve(preuve_exacte + ","),
+            regle(f"reçu{tab}**v{schema}**", protocole_exact, preuve_exacte),
+        )
+
+        # Each refusal is paired with a fragment its message must carry, so a form is
+        # not merely refused but refused *for the stated reason*.
+        refusees = (
+            # Sept formes voisines du nom — le réaudit quater.
+            (par_le_protocole(f"`not_qualification_protocol_version = {protocole}`"), "protocole"),
+            (
+                par_le_protocole(f"`qualification_protocol_version_alias = {protocole}`"),
+                "protocole",
+            ),
+            (
+                par_la_preuve(f"`not_provider_adapter_evidence_version = {preuve}`"),
+                "preuve adaptateur",
+            ),
+            (
+                par_la_preuve(f"`provider_adapter_evidence_version_alias = {preuve}`"),
+                "preuve adaptateur",
+            ),
+            (regle(f"notreçu **v{schema}**", protocole_exact, preuve_exacte), "schéma"),
+            (
+                par_le_protocole(f"`qualification_protocol_version = {protocole}_alias`"),
+                "protocole",
+            ),
+            (par_le_protocole(f"`QUALIFICATION_PROTOCOL_VERSION = {protocole}`"), "protocole"),
+            # Les cinq survivantes du réaudit sexies — la valeur lue comme préfixe.
+            (
+                par_le_protocole(f"`qualification_protocol_version = {protocole}.1`"),
+                f"affectation protocole invalide : qualification_protocol_version = {protocole}.1",
+            ),
+            (
+                par_le_protocole(f"`qualification_protocol_version = {protocole}/9`"),
+                "affectation protocole invalide",
+            ),
+            (
+                par_le_protocole(f"`qualification_protocol_version = {protocole}-legacy`"),
+                "affectation protocole invalide",
+            ),
+            (
+                par_le_protocole(f"`qualification_protocol_version = {protocole} extra`"),
+                "affectation protocole invalide",
+            ),
+            (
+                par_la_preuve(f"`provider_adapter_evidence_version = {preuve}.1`"),
+                "affectation preuve adaptateur invalide",
+            ),
+            # Cinq voisines de plus, de la même famille : le suffixe change la valeur.
+            (
+                par_le_protocole(f"`qualification_protocol_version = {protocole}.`"),
+                "affectation protocole invalide",
+            ),
+            (
+                par_le_protocole(f"`qualification_protocol_version = {protocole},1`"),
+                "affectation protocole invalide",
+            ),
+            (
+                par_le_protocole(f"`qualification_protocol_version = 0{protocole}`"),
+                "affectation protocole invalide",
+            ),
+            (par_le_protocole(f"`qualification_protocol_version = {protocole}e0`"), "protocole"),
+            (
+                par_le_protocole(f"`qualification_protocol_version = {protocole}{tab}legacy`"),
+                "affectation protocole invalide",
+            ),
+            # L'affectation exacte, mais hors du code inline où le document l'énonce.
+            (
+                par_le_protocole(f"qualification_protocol_version = {protocole}"),
+                "0 occurrence(s) de « protocole »",
+            ),
+            # Un candidat invalide *puis* un valide : la règle en énonce deux, et deux
+            # énoncés contradictoires se refusent avant même d'être lus.
+            (
+                par_le_protocole(
+                    f"`qualification_protocol_version = {protocole}.1` puis {protocole_exact}"
+                ),
+                "2 occurrence(s) de « protocole »",
+            ),
+        )
+
+        # Gathered rather than asserted one by one: every form is evaluated in the
+        # same run, so a report names all the neighbours accepted, not just the first.
+        ecarts: list[str] = []
+        for acceptee in acceptees:
+            try:
+                versions_exigees(acceptee, attendues, "règle synthétique")
+            except AssertionError as echec:
+                ecarts.append(f"forme exacte refusée : {acceptee!r}\n  → {echec}")
+        for refusee, fragment in refusees:
+            try:
+                versions_exigees(refusee, attendues, "règle synthétique")
+            except AssertionError as echec:
+                if fragment not in str(echec):
+                    ecarts.append(
+                        f"forme voisine {refusee!r} refusée pour la mauvaise raison\n"
+                        f"  → {echec}\n  attendu un refus mentionnant « {fragment} »"
+                    )
+            else:
+                ecarts.append(f"forme voisine acceptée à tort : {refusee!r}")
+
+        # Read directly, once: an invalid statement must be *counted* before it is
+        # judged. Were it dropped as unreadable, the rule above would be refused for
+        # stating the protocol once, not twice — a different and much weaker complaint.
+        melange = f"`qualification_protocol_version = {protocole}.1` puis {protocole_exact}"
+        enonces = versions_lues(melange)["protocole"]
+        if len(enonces) != 2:
+            ecarts.append(
+                f"un candidat invalide disparaît avant le comptage : {melange!r} "
+                f"énonce {enonces}, attendu deux énoncés"
+            )
+
+        assert not ecarts, "\n".join(ecarts)

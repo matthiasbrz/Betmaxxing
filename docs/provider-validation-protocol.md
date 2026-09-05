@@ -273,7 +273,7 @@ Deux conséquences qu'on confond vite :
 
 Portée commune à tous : provider `the_odds_api`, un seul bookmaker par
 observation **et `bookmaker_state = OBSERVED`**, âge du marché ≤ **900 s**, reçu
-**v4** portant `qualification_protocol_version = 5` et
+**v4** portant `qualification_protocol_version = 8` et
 `provider_adapter_evidence_version = 1`, `recorded_at`
 **≥ `2026-08-25T00:00:00+00:00`**, **atteinte du fournisseur établie** au sens du §2.4,
 et **contrat structurel du §2.0 satisfait**.
@@ -287,14 +287,14 @@ aucun reçu ne devient plus admissible qu'avant.
 
 | `criterion_id` | Portée | Preuve admissible | Événements | Compétitions | Jours UTC | Schéma |
 | --- | --- | --- | --- | --- | --- | --- |
-| `CORE_MAPPING_FOOTBALL` | `soccer_*`, `core`, `h2h`, `GROUPED_ODDS` | statut `CORE_LIVE_VERIFIED`, `selections_mapped > 0`, aucun rejet de mapping | **3** | **2** | **2** | **v4/5/1 seul** |
-| `CORE_MAPPING_TENNIS` | `tennis_*`, `core`, `h2h`, `GROUPED_ODDS` | idem | **3** | **2** | **2** | **v4/5/1 seul** |
-| `ADDITIONAL_MAPPING_FOOTBALL_DRAW_NO_BET` | `soccer_*`, `additional`, `draw_no_bet` | statut `ADDITIONAL_LIVE_VERIFIED` ou `ADDITIONAL_PARTIAL_COVERAGE`, `market_states[marché] = OBSERVED_MAPPED` | **2** | **2** | **1** | **v4/5/1 seul** |
-| `ADDITIONAL_MAPPING_FOOTBALL_DOUBLE_CHANCE` | idem, `double_chance` | idem | **2** | **2** | **1** | **v4/5/1 seul** |
-| `ADDITIONAL_MAPPING_FOOTBALL_H2H_3_WAY_H1` | idem, `h2h_3_way_h1` | idem | **2** | **2** | **1** | **v4/5/1 seul** |
-| `ADDITIONAL_MAPPING_FOOTBALL_TOTALS_H1` | idem, `totals_h1` | idem | **2** | **2** | **1** | **v4/5/1 seul** |
-| `ADDITIONAL_MAPPING_FOOTBALL_DOUBLE_CHANCE_H1` | idem, `double_chance_h1` | idem | **2** | **2** | **1** | **v4/5/1 seul** |
-| `COST_CONFORMITY` | tous sports, appels payants | coût **établi** au sens du §2.1, 0 appel non conforme | **6** appels au coût établi | — | — | **v4/5/1 seul** |
+| `CORE_MAPPING_FOOTBALL` | `soccer_*`, `core`, `h2h`, `GROUPED_ODDS` | statut `CORE_LIVE_VERIFIED`, `selections_mapped > 0`, aucun rejet de mapping | **3** | **2** | **2** | **v4/8/1 seul** |
+| `CORE_MAPPING_TENNIS` | `tennis_*`, `core`, `h2h`, `GROUPED_ODDS` | idem | **3** | **2** | **2** | **v4/8/1 seul** |
+| `ADDITIONAL_MAPPING_FOOTBALL_DRAW_NO_BET` | `soccer_*`, `additional`, `draw_no_bet` | statut `ADDITIONAL_LIVE_VERIFIED` ou `ADDITIONAL_PARTIAL_COVERAGE`, `market_states[marché] = OBSERVED_MAPPED` | **2** | **2** | **1** | **v4/8/1 seul** |
+| `ADDITIONAL_MAPPING_FOOTBALL_DOUBLE_CHANCE` | idem, `double_chance` | idem | **2** | **2** | **1** | **v4/8/1 seul** |
+| `ADDITIONAL_MAPPING_FOOTBALL_H2H_3_WAY_H1` | idem, `h2h_3_way_h1` | idem | **2** | **2** | **1** | **v4/8/1 seul** |
+| `ADDITIONAL_MAPPING_FOOTBALL_TOTALS_H1` | idem, `totals_h1` | idem | **2** | **2** | **1** | **v4/8/1 seul** |
+| `ADDITIONAL_MAPPING_FOOTBALL_DOUBLE_CHANCE_H1` | idem, `double_chance_h1` | idem | **2** | **2** | **1** | **v4/8/1 seul** |
+| `COST_CONFORMITY` | tous sports, appels payants | coût **établi** au sens du §2.1, 0 appel non conforme | **6** appels au coût établi | — | — | **v4/8/1 seul** |
 
 ### 2.0 Contrat structurel : une signature prouve des octets, pas des types
 
@@ -622,7 +622,7 @@ que la campagne produit déjà ; en exiger moins laisserait un ou deux appels bi
 Une observation compte si, et seulement si, elle est :
 
 1. portée par un reçu **v4** dont la **signature se vérifie localement**, portant
-   `qualification_protocol_version = 5` et `provider_adapter_evidence_version = 1` ;
+   `qualification_protocol_version = 8` et `provider_adapter_evidence_version = 1` ;
 2. **postérieure ou égale** à `2026-08-25T00:00:00+00:00`, `recorded_at` étant un
    ISO 8601 avec timezone, normalisé en UTC pour la comparaison ;
 3. rattachée à une **tentative confirmée dont le fournisseur a réellement été
