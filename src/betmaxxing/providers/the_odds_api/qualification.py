@@ -2151,11 +2151,17 @@ def campaign_next_step(ledger: CampaignLedger) -> CampaignStep | None:
     this one, and inventing a position for it would be the guard choosing on the
     operator's behalf from evidence that already contradicts the plan.
     """
+    # Two reasons, each carried by exactly one check. An allow-list of NOT_STARTED and
+    # IN_PROGRESS would have excluded ``UNESTABLISHED`` as well, and the count check
+    # above it would then have been dead: a mutation run removed it and every test
+    # stayed green, because the neighbour was answering in its place. One rule, one
+    # guard, so that disabling either is visible.
     if not ledger.established:
         return None
-    if ledger.execution_state not in (
-        CampaignExecutionState.NOT_STARTED,
-        CampaignExecutionState.IN_PROGRESS,
+    if ledger.execution_state in (
+        CampaignExecutionState.COMPLETE,
+        CampaignExecutionState.ABORTED,
+        CampaignExecutionState.CONFLICT,
     ):
         return None
     done = len(ledger.recorded)

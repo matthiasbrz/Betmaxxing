@@ -672,6 +672,103 @@ class TestTheGuardRefusesBeforeAnythingIsSpent:
             ],
         )
 
+    def test_a_wrong_event_rank_costs_no_key_read(
+        self, boundary: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The rank is opposed **before** the provider key, not after it.
+
+        The command, the competition and the ceilings are answered before the operator's
+        receipt is even opened — a ceiling breach must be reported as a ceiling breach.
+        The rank cannot be: it is only readable once that receipt is loaded. What this
+        pins is that loading it, and refusing on it, still happens on this side of
+        `get_settings` and `_require_key`. A guard moved after the key would leave this
+        refusal identical in every respect except the one that costs something.
+        """
+        tags = [act.event_tag(identifier, v8.SECRET) for identifier in ("EV-RANK-1", "EV-RANK-2")]
+        discovery = v8.discovery(sport=FOOTBALL[0], moment=v8.instant(0), rid="d" * 16)
+        discovery["event_tags"] = list(tags)
+        for field in ("events_returned", "events_in_window", "events_admissible"):
+            discovery[field] = len(tags)
+        v8.sealed_again(discovery)
+        plant(boundary, [discovery])
+        # The receipt must still be inside its six hours when `load_parent` reads it.
+        monkeypatch.setattr(act, "_clock", lambda: v8.instant(1))
+
+        parent = next(
+            str(path)
+            for path in boundary.glob("*.json")
+            if json.loads(path.read_text(encoding="utf-8")).get("command") == "discover"
+        )
+        result, wire = self.refuse(
+            boundary,
+            monkeypatch,
+            [
+                "core",
+                "--sport",
+                FOOTBALL[0],
+                "--bookmaker",
+                BOOKMAKER,
+                # Rank 2 of the discovery, where the register's step 2 is rank 1.
+                "--event-id",
+                "EV-RANK-2",
+                "--discovery-receipt",
+                parent,
+                "--max-credits",
+                "1",
+                "--acknowledge-credits",
+                "1",
+                "--allow-network",
+            ],
+        )
+        assert wire.engaged == {"clé": 0, "intent": 0, "client": 0}, wire.engaged
+        sortie = result.output.lower()
+        assert "rang 1" in sortie, result.output
+        # Attributed to the rank, not to a neighbouring rule that covers the same case.
+        for etranger in ("plafond", "bookmaker de campagne non configuré", "expiré"):
+            assert etranger not in sortie, f"refus attribué à {etranger!r} : {result.output}"
+
+    def test_the_planned_rank_reaches_the_key(
+        self, boundary: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The positive control: without it, any earlier guard satisfies the test above."""
+        tags = [act.event_tag(identifier, v8.SECRET) for identifier in ("EV-RANK-1", "EV-RANK-2")]
+        discovery = v8.discovery(sport=FOOTBALL[0], moment=v8.instant(0), rid="d" * 16)
+        discovery["event_tags"] = list(tags)
+        for field in ("events_returned", "events_in_window", "events_admissible"):
+            discovery[field] = len(tags)
+        v8.sealed_again(discovery)
+        plant(boundary, [discovery])
+        monkeypatch.setattr(act, "_clock", lambda: v8.instant(1))
+
+        parent = next(
+            str(path)
+            for path in boundary.glob("*.json")
+            if json.loads(path.read_text(encoding="utf-8")).get("command") == "discover"
+        )
+        wire = Tripwire()
+        wire.install(monkeypatch)
+        result = runner.invoke(
+            act.app,
+            [
+                "core",
+                "--sport",
+                FOOTBALL[0],
+                "--bookmaker",
+                BOOKMAKER,
+                "--event-id",
+                "EV-RANK-1",
+                "--discovery-receipt",
+                parent,
+                "--max-credits",
+                "1",
+                "--acknowledge-credits",
+                "1",
+                "--allow-network",
+            ],
+        )
+        assert wire.key_reads == 1, f"l'étape prévue n'a pas atteint la clé : {result.output}"
+        assert wire.intents == 0 and wire.clients == 0
+
     def test_counts_that_cannot_be_established_refuse_the_call(
         self, boundary: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
