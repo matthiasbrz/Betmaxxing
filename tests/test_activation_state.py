@@ -40,6 +40,7 @@ from helpers_activation import (
     FAKE_RECEIPT_SECRET,
     NOW,
     OTHER_EVENT_ID,
+    SECOND_EVENT_ID,
     SPORT,
     Recorder,
     core_args,
@@ -100,6 +101,51 @@ def discovery_receipt(receipts: Path) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # E2 — the discovery counters
 # ---------------------------------------------------------------------------
+class TestAListingTooThinForItsOwnStepsIsNotAVerification:
+    """`soccer_epl` spends two `core`; one event cannot serve them (D-083).
+
+    Driven through the real command rather than through the predicate: a campaign run
+    where `discover` reports `DISCOVERY_VERIFIED` over a single fixture is precisely the
+    run that spends a credit and then finds nothing at rank 2, and only the command path
+    can show that it no longer happens.
+    """
+
+    def test_a_single_event_is_coverage_missing(
+        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
+    ) -> None:
+        result = run_discover(monkeypatch, [event(EVENT_ID, hours_ahead=6.0)], "--json")
+        payload = json.loads(result.stdout)
+        assert payload["status"] == "COVERAGE_MISSING"
+        assert result.exit_code != 0
+        # The counters still say what really came back: the listing was not empty, and
+        # the refusal is about what the register needs, not about the provider failing.
+        receipt = discovery_receipt(keyed)
+        assert receipt["events_returned"] == 1
+        assert receipt["events_admissible"] == 1
+        assert receipt["status"] == "COVERAGE_MISSING"
+
+    def test_the_reason_names_the_shortfall_and_refuses_the_substitutions(
+        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
+    ) -> None:
+        result = run_discover(monkeypatch, [event(EVENT_ID, hours_ahead=6.0)])
+        assert "1 événement(s) exploitable(s)" in result.stdout
+        assert f"demande {2}" in result.stdout
+        for refused in ("fenêtre n'est pas élargie", "réutilisé", "substituée"):
+            assert refused in result.stdout, refused
+
+    def test_two_events_are_enough_for_this_competition(
+        self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
+    ) -> None:
+        """The positive control, without which the test above passes on a broken build."""
+        result = run_discover(
+            monkeypatch,
+            [event(EVENT_ID, hours_ahead=6.0), event(SECOND_EVENT_ID, hours_ahead=7.0)],
+            "--json",
+        )
+        assert json.loads(result.stdout)["status"] == "DISCOVERY_VERIFIED"
+        assert result.exit_code == 0
+
+
 class TestAnEmptyProviderListIsDistinguishable:
     def test_all_three_counters_are_zero(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
@@ -302,7 +348,17 @@ class TestTheCountersLeakNothing:
 # E3 — the activation state, in five separate dimensions
 # ---------------------------------------------------------------------------
 def approved(monkeypatch: pytest.MonkeyPatch, receipts: Path) -> str:
-    run_discover(monkeypatch, [event(EVENT_ID, hours_ahead=6.0)])
+    """A discovery rich enough to serve the register, in canonical rank order.
+
+    Two events, because `soccer_epl` spends two `core`: a listing of one is a real case
+    with its own suite, not the preamble to every test about something else. The later
+    kick-off is offered first, so the rank the register counts on is the canonical one
+    and not the order this list happens to be written in.
+    """
+    run_discover(
+        monkeypatch,
+        [event(SECOND_EVENT_ID, hours_ahead=7.0), event(EVENT_ID, hours_ahead=6.0)],
+    )
     return str(receipt_path(receipts, "discover"))
 
 
@@ -533,8 +589,16 @@ class TestAnExistingV2ReceiptStaysUsableAndUntouched:
     still accepted as authority, is never rewritten, and never re-signed.
     """
 
-    def _as_v2(self, path: Path) -> dict[str, Any]:
-        """Re-sign a synthetic receipt *as v2*, dropping the v3-only fields.
+    def _as_v2(self, path: Path) -> tuple[Path, dict[str, Any]]:
+        """Write a v2 *copy* of a discovery beside it, and return the copy and its body.
+
+        A copy rather than a conversion, since 03C-2F bis: a v2 receipt is not evidence
+        of the protocol 8 campaign — its schema is not the current one — so downgrading
+        the boundary's only discovery would leave the register at step 1 and the refusal
+        would be about the campaign's position rather than about this receipt. The
+        installation keeps the v8 discovery it really made, and the operator names the
+        older file. Its identifier is changed with it: two receipts sharing one is a
+        different fault, with its own suite.
 
         Signed here rather than copied from disk: a test may not depend on a real
         operational receipt, and the signature must match this installation.
@@ -542,6 +606,8 @@ class TestAnExistingV2ReceiptStaysUsableAndUntouched:
         from betmaxxing.providers.the_odds_api import activation as A
 
         payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["receipt_id"] = "0" * 16
+        path = path.with_name(f"{path.stem}-v2{path.suffix}")
         for field in (
             "events_returned",
             "events_in_window",
@@ -554,49 +620,46 @@ class TestAnExistingV2ReceiptStaysUsableAndUntouched:
         payload.pop("signature", None)
         payload["signature"] = A.sign_receipt(payload, FAKE_RECEIPT_SECRET)
         path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        return payload
+        return path, payload
 
     def test_a_valid_v2_discovery_still_authorises_core(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        discovery = approved(monkeypatch, keyed)
-        self._as_v2(Path(discovery))
+        legacy, _ = self._as_v2(Path(approved(monkeypatch, keyed)))
         recorder = Recorder(
             {"/odds": lambda _r: httpx.Response(200, json=odds_payload(), headers=PAID_HEADERS)}
         )
         install(monkeypatch, recorder)
-        result = run(*core_args(discovery_receipt=discovery))
+        result = run(*core_args(discovery_receipt=str(legacy)))
         assert result.exit_code == 0, result.stdout
         assert len(recorder.requests) == 1
 
     def test_the_child_records_the_parent_schema_it_trusted(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        discovery = approved(monkeypatch, keyed)
-        self._as_v2(Path(discovery))
+        legacy, _ = self._as_v2(Path(approved(monkeypatch, keyed)))
         install(
             monkeypatch,
             Recorder(
                 {"/odds": lambda _r: httpx.Response(200, json=odds_payload(), headers=PAID_HEADERS)}
             ),
         )
-        run(*core_args(discovery_receipt=discovery))
+        run(*core_args(discovery_receipt=str(legacy)))
         core = [r for r in receipts_in(keyed) if r["command"] == "core"][-1]
         assert core["parent_schema_version"] == 2
 
     def test_the_v2_file_is_not_rewritten_or_upgraded(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        discovery = approved(monkeypatch, keyed)
-        before = self._as_v2(Path(discovery))
+        legacy, before = self._as_v2(Path(approved(monkeypatch, keyed)))
         install(
             monkeypatch,
             Recorder(
                 {"/odds": lambda _r: httpx.Response(200, json=odds_payload(), headers=PAID_HEADERS)}
             ),
         )
-        run(*core_args(discovery_receipt=discovery))
-        after = json.loads(Path(discovery).read_text(encoding="utf-8"))
+        run(*core_args(discovery_receipt=str(legacy)))
+        after = json.loads(legacy.read_text(encoding="utf-8"))
         assert after == before, "an existing v2 receipt was modified"
         assert after["schema_version"] == 2
 

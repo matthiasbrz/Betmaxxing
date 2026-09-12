@@ -42,8 +42,8 @@ def _signed(**fields: Any) -> dict[str, Any]:
         "receipt_id": fields.pop("receipt_id", "aa00bb11cc22dd33"),
         "command": "core",
         "status": str(act.ActivationStatus.CORE_LIVE_VERIFIED),
-        "recorded_at": "2026-08-04T12:00:00+00:00",
-        "expires_at": "2026-08-04T18:00:00+00:00",
+        "recorded_at": "2026-09-01T12:00:00+00:00",
+        "expires_at": "2026-09-01T18:00:00+00:00",
         "sport_key": "soccer_france_ligue_one",
         "bookmaker": "unibet",
         "network_attempted": True,
@@ -269,8 +269,8 @@ class TestD064AFixtureNeverEarnsALiveStatus:
     def test_an_expired_receipt_is_refused_as_authority(self, workspace: Path) -> None:
         stale = _signed(
             receipt_id="beef0000beef0005",
-            recorded_at="2026-08-01T00:00:00+00:00",
-            expires_at="2026-08-01T06:00:00+00:00",
+            recorded_at="2026-08-29T00:00:00+00:00",
+            expires_at="2026-08-29T06:00:00+00:00",
         )
         path = _write(workspace, stale)
         with pytest.raises(act.Refused):

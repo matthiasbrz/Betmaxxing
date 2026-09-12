@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,7 @@ from helpers_activation import (
     OTHER_BOOKMAKER,
     OTHER_EVENT_ID,
     OTHER_SPORT,
+    SECOND_EVENT_ID,
     SPORT,
     Recorder,
     additional_args,
@@ -59,6 +61,7 @@ from helpers_activation import (
     receipt_path,
     receipts_in,
     run,
+    spend_the_second_core,
     sports_payload,
     tamper,
 )
@@ -99,6 +102,13 @@ def do_discover(
     result = run(*discover_args(sport=sport, bookmaker=bookmaker))
     assert result.exit_code == 0, result.stdout
     return result
+
+
+def do_second_core(monkeypatch: pytest.MonkeyPatch, receipts: Path) -> str:
+    """The register's rank 2 `core`, which its `additional` is the child of."""
+    return spend_the_second_core(
+        monkeypatch, receipts, str(receipt_path(receipts, "discover")), headers=PAID_HEADERS
+    )
 
 
 def do_core(
@@ -317,8 +327,8 @@ class TestDiscoverWritesEvidence:
     ) -> None:
         do_discover(monkeypatch)
         receipt = receipts_in(keyed)[-1]
-        assert receipt["window_from"] == "2026-08-04T12:00:00+00:00"
-        assert receipt["window_to"] == "2026-08-05T12:00:00+00:00"
+        assert receipt["window_from"] == NOW.isoformat()
+        assert receipt["window_to"] == (NOW + timedelta(hours=24)).isoformat()
         assert receipt["expires_at"] > receipt["recorded_at"]
 
     def test_it_records_the_admissible_events_as_tags_only(
@@ -328,7 +338,12 @@ class TestDiscoverWritesEvidence:
 
         do_discover(monkeypatch)
         receipt = receipts_in(keyed)[-1]
-        assert receipt["event_tags"] == [activation.event_tag(EVENT_ID, FAKE_RECEIPT_SECRET)]
+        # In the canonical order of the listing, which is the order the register's ranks
+        # are counted in — not the order the provider happened to answer in.
+        assert receipt["event_tags"] == [
+            activation.event_tag(identifier, FAKE_RECEIPT_SECRET)
+            for identifier in (EVENT_ID, SECOND_EVENT_ID)
+        ]
         blob = json.dumps(receipt)
         assert EVENT_ID not in blob
         for forbidden in ("Olympique", "Rennais"):
@@ -417,10 +432,19 @@ class TestCoreDemandsADiscoveryReceipt:
     def test_a_receipt_for_another_sport_is_refused(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        do_discover(monkeypatch, sport=OTHER_SPORT)
+        """Tampered rather than produced, for the same reason as the bookmaker above.
+
+        This used to run ``discover`` on the other competition first. Since 03C-2F bis
+        the register names which competition comes first, and the guard refuses the
+        second one before any socket exists — so a parent naming another sport can only
+        reach ``load_parent`` by having been edited on disk.
+        """
+        do_discover(monkeypatch)
+        path = receipt_path(keyed, "discover")
+        tamper(path, sport_key=OTHER_SPORT)
         recorder = Recorder({"/odds": odds_payload()})
         install(monkeypatch, recorder)
-        result = run(*core_args(discovery_receipt=str(receipt_path(keyed, "discover"))))
+        result = run(*core_args(discovery_receipt=str(path)))
         assert result.exit_code != 0
         assert recorder.requests == []
 
@@ -639,6 +663,7 @@ class TestAdditionalDemandsACoreReceipt:
     ) -> None:
         do_discover(monkeypatch)
         do_core(monkeypatch, keyed)
+        parent = do_second_core(monkeypatch, keyed)
         recorder = Recorder(
             {
                 "/events/": lambda _r: httpx.Response(
@@ -647,7 +672,7 @@ class TestAdditionalDemandsACoreReceipt:
             }
         )
         install(monkeypatch, recorder)
-        result = run(*additional_args(core_receipt=str(receipt_path(keyed, "core"))))
+        result = run(*additional_args(core_receipt=parent))
         assert result.exit_code == 0, result.stdout
         assert len(recorder.requests) == 1
 
@@ -656,7 +681,8 @@ class TestAdditionalDemandsACoreReceipt:
     ) -> None:
         do_discover(monkeypatch)
         do_core(monkeypatch, keyed)
-        core = [r for r in receipts_in(keyed) if r["command"] == "core"][-1]
+        parent = do_second_core(monkeypatch, keyed)
+        core = json.loads(Path(parent).read_text(encoding="utf-8"))
         recorder = Recorder(
             {
                 "/events/": lambda _r: httpx.Response(
@@ -665,7 +691,7 @@ class TestAdditionalDemandsACoreReceipt:
             }
         )
         install(monkeypatch, recorder)
-        run(*additional_args(core_receipt=str(receipt_path(keyed, "core"))))
+        run(*additional_args(core_receipt=parent))
         extra = [r for r in receipts_in(keyed) if r["command"] == "additional"][-1]
         assert extra["parent_receipt_id"] == core["receipt_id"]
 
@@ -712,7 +738,7 @@ class TestLegacyReceiptsAreRefusedNotPromoted:
                     "schema": 1,
                     "command": "core",
                     "status": "CORE_LIVE_VERIFIED",
-                    "recorded_at": "2026-08-04T12:00:00+00:00",
+                    "recorded_at": NOW.isoformat(),
                     "sport_key": SPORT,
                     "bookmaker": BOOKMAKER,
                     "event_id_hash": "abcdef0123456789",

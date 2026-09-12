@@ -25,7 +25,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 from typer.testing import CliRunner
 
-NOW = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
+NOW = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
 #: Deliberately recognisable, and deliberately not a real key shape in use.
 FAKE_KEY = "FAKEKEY0000deadbeef0000FAKEKEY00"
 #: A deterministic signing secret, injected so no test depends on real randomness.
@@ -41,6 +41,11 @@ BOOKMAKER = "pinnacle"
 OTHER_BOOKMAKER = "unibet"
 EVENT_ID = "evt-fixture-0001"
 OTHER_EVENT_ID = "evt-fixture-0002"
+#: The second event of the shared listing — rank 2 of the canonical order, and therefore
+#: the one the register spends `soccer_epl`'s second `core` and its `additional` on.
+#: Derived from the first so a test naming ``OTHER_EVENT_ID`` still names an event the
+#: discovery never listed.
+SECOND_EVENT_ID = f"{EVENT_ID}-b"
 
 HOME = "Olympique Lyonnais"
 AWAY = "Stade Rennais"
@@ -179,7 +184,7 @@ def additional_args(
     core_receipt: str,
     sport: str = SPORT,
     bookmaker: str = BOOKMAKER,
-    event_id: str = EVENT_ID,
+    event_id: str = SECOND_EVENT_ID,
     max_credits: str = "5",
     acknowledge: str | None = "5",
     allow_network: bool = True,
@@ -212,17 +217,34 @@ def sports_payload(active: bool = True, key: str = SPORT) -> list[dict[str, Any]
     return [{"key": key, "group": "Soccer", "title": "Ligue 1", "active": active}]
 
 
+#: How many events the shared listing returns. Two, because the protocol 8 register
+#: spends two ``core`` on ``soccer_epl`` and a discovery that cannot serve its own steps
+#: is not a verified discovery — a real case, covered by its own suite, and not the
+#: starting point every other test should be built on. A literal rather than a read of
+#: ``CAMPAIGN_CORE_BY_COMPETITION``: a fixture that derives from the constant it has to
+#: satisfy would keep satisfying it whatever the constant became.
+DISCOVERED_EVENTS = 2
+
+
 def events_payload(
     hours_ahead: float = 6.0, event_id: str = EVENT_ID, sport: str = SPORT
 ) -> list[dict[str, Any]]:
+    """A listing rich enough to serve the register, with ``event_id`` at rank 1.
+
+    Rank, not position in this list: the harness returns the later kick-off **first**, so
+    every consumer of this payload also exercises the canonical ordering rather than
+    agreeing with the order the fixture happened to be written in.
+    """
+    identifiers = [event_id, *(f"{event_id}-{n}" for n in "bcdefgh"[: DISCOVERED_EVENTS - 1])]
     return [
         {
-            "id": event_id,
+            "id": identifier,
             "sport_key": sport,
-            "commence_time": iso_z(NOW + timedelta(hours=hours_ahead)),
+            "commence_time": iso_z(NOW + timedelta(hours=hours_ahead + index)),
             "home_team": HOME,
             "away_team": AWAY,
         }
+        for index, identifier in reversed(list(enumerate(identifiers)))
     ]
 
 
@@ -242,7 +264,7 @@ def odds_payload(
                 {
                     "key": bookmaker,
                     "title": "Winamax (FR)",
-                    "last_update": "2026-08-04T11:50:00Z",
+                    "last_update": "2026-09-01T11:50:00Z",
                     "markets": [
                         {
                             "key": "h2h",
@@ -300,18 +322,18 @@ EVENT_MARKET_BLOCKS: dict[str, dict[str, Any]] = {
 
 #: A distinct instant per market, so a flattening bug cannot hide behind equality.
 EVENT_MARKET_STAMPS: dict[str, str] = {
-    "draw_no_bet": "2026-08-04T11:40:00Z",
-    "double_chance": "2026-08-04T11:12:00Z",
-    "h2h_3_way_h1": "2026-08-04T11:47:00Z",
-    "totals_h1": "2026-08-04T11:22:00Z",
-    "double_chance_h1": "2026-08-04T11:03:00Z",
+    "draw_no_bet": "2026-09-01T11:40:00Z",
+    "double_chance": "2026-09-01T11:12:00Z",
+    "h2h_3_way_h1": "2026-09-01T11:47:00Z",
+    "totals_h1": "2026-09-01T11:22:00Z",
+    "double_chance_h1": "2026-09-01T11:03:00Z",
 }
 
 
 def event_odds_payload(
     markets: tuple[str, ...] = ADDITIONAL_MARKET_KEYS,
     *,
-    event_id: str = EVENT_ID,
+    event_id: str = SECOND_EVENT_ID,
     sport: str = SPORT,
     bookmaker: str = BOOKMAKER,
     stamped: bool = True,
@@ -372,6 +394,45 @@ def only_receipt(directory: Path, command: str) -> dict[str, Any]:
 
 def receipt_path(directory: Path, command: str) -> Path:
     return directory / only_receipt(directory, command)["_filename"]
+
+
+def receipt_names(directory: Path, command: str) -> set[str]:
+    """The filenames of every receipt for ``command`` currently on the boundary."""
+    return {r["_filename"] for r in receipts_in(directory) if r.get("command") == command}
+
+
+def spend_the_second_core(
+    monkeypatch: Any, receipts: Path, discovery_receipt: str, *, headers: dict[str, str]
+) -> str:
+    """Run the register's rank 2 ``core`` and return its receipt path.
+
+    The protocol 8 register spends **both** of ``soccer_epl``'s ``core`` before its
+    ``additional``, and the guard opposes that order before the key is read. A suite
+    whose subject is the five-market step therefore walks through rank 2 to get there —
+    one shared walk here rather than four slightly different ones, so a change to the
+    register is a change in one place.
+    """
+    before = receipt_names(receipts, "core")
+    install(
+        monkeypatch,
+        Recorder(
+            {
+                "/odds": lambda _r: httpx.Response(
+                    200, json=odds_payload(event_id=SECOND_EVENT_ID), headers=headers
+                )
+            }
+        ),
+    )
+    result = run(*core_args(discovery_receipt=discovery_receipt, event_id=SECOND_EVENT_ID))
+    assert result.exit_code == 0, result.stdout
+    # Identified by *difference*, never by « the last one listed »: the suites run on a
+    # frozen clock, so both `core` receipts carry the same instant and therefore the same
+    # filename stamp, and which of the two sorts last is then decided by a random
+    # receipt id. A chain that picked the wrong one would hand `additional` a proof for
+    # the other event and be refused for a reason no test is about.
+    fresh = sorted(receipt_names(receipts, "core") - before)
+    assert len(fresh) == 1, f"expected one new core receipt, got {len(fresh)}"
+    return str(receipts / fresh[0])
 
 
 def tamper(path: Path, **changes: Any) -> None:

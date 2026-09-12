@@ -34,6 +34,7 @@ the real 03B operations appears in this file or in the fixtures it uses.
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -44,12 +45,14 @@ from helpers_activation import (
     BOOKMAKER,
     EVENT_ID,
     FAKE_RECEIPT_SECRET,
+    NOW,
     OTHER_BOOKMAKER,
     Recorder,
     core_args,
     discover_args,
     events_payload,
     install,
+    iso_z,
     odds_payload,
     receipt_path,
     receipts_in,
@@ -329,8 +332,8 @@ class TestTheOutputSaysBookmakerNotReturnedMarketNotEvaluated:
 SYNTHETIC_EVENT_ID = "synthetic-fixture-event-0001"
 SYNTHETIC_HOME = "Synthetic Home FC"
 SYNTHETIC_AWAY = "Synthetic Away United"
-SYNTHETIC_BOOKMAKER_STAMP = "2026-08-04T11:50:00Z"
-SYNTHETIC_MARKET_STAMP = "2026-08-04T11:31:00Z"
+SYNTHETIC_BOOKMAKER_STAMP = iso_z(NOW - timedelta(minutes=10))
+SYNTHETIC_MARKET_STAMP = iso_z(NOW - timedelta(minutes=29))
 
 
 def synthetic_grouped_odds(
@@ -376,7 +379,7 @@ def synthetic_grouped_odds(
             "id": EVENT_ID,
             "sport_key": "soccer_france_ligue_one",
             "sport_title": "Synthetic League",
-            "commence_time": "2026-08-04T18:00:00Z",
+            "commence_time": iso_z(NOW + timedelta(hours=6)),
             "home_team": SYNTHETIC_HOME,
             "away_team": SYNTHETIC_AWAY,
             "bookmakers": books,

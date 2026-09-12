@@ -402,7 +402,7 @@ class TestEveryPublicationFailureIsReported:
             "receipt_id": ATTEMPT,
             "command": "discover",
             "status": "DISCOVERY_VERIFIED",
-            "recorded_at": "2026-08-04T12:00:00+00:00",
+            "recorded_at": "2026-09-01T12:00:00+00:00",
             "sport_key": "soccer_probe",
         }
         act.write_receipt(dict(document))

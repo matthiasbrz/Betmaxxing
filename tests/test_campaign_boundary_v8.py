@@ -574,7 +574,10 @@ class TestTheGuardRefusesBeforeAnythingIsSpent:
     def test_a_seventh_core_is_refused(
         self, boundary: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        plant(boundary, v8.nominal_campaign())
+        # The nominal campaign minus its two `additional`: six `core` is the ceiling,
+        # and stopping short of the twelfth step keeps COMPLETE — which answers before
+        # any ceiling, and says something larger — out of the way.
+        plant(boundary, v8.nominal_campaign()[:-2])
         result, _ = self.refuse(
             boundary,
             monkeypatch,
@@ -816,44 +819,57 @@ class TestTheCampaignBookmakerMustBeConfiguredForTheParser:
             monkeypatch.setenv(BOOKMAKERS_VARIABLE, value)
         reset_settings_cache()
 
-    def plant_reachable(self, boundary: Path) -> tuple[str, str]:
-        """A corpus that reaches this guard and nothing else, plus its two parents.
+    #: The two events the planted discovery lists, in canonical rank order. Their tags
+    #: are the real HMAC of these identifiers, so the register's rank check reads the
+    #: same value the command line produces rather than a synthetic placeholder.
+    GUARD_EVENTS = ("EV-GUARD-1", "EV-GUARD-2")
 
-        Three discoveries and one `core`, so no ceiling, no duplicate scope, no abort
-        and no conflict can refuse first — the fourth scope is deliberately left free so
-        that a `discover` has somewhere to go. The parents named on the
-        command line are files *of that corpus*: an extra receipt written beside it
-        would be a second discovery of one competition, and the campaign would be in
-        CONFLICT before this guard was ever consulted.
+    def plant_reachable(self, boundary: Path, command: str) -> tuple[str, str]:
+        """A corpus that puts ``command`` exactly at the register's next step.
 
-        Neither parent is ever read on these paths — the provider key, and therefore the
-        tripwire, comes first — but the corpus has to be genuinely complete for the
-        refusal to be attributable to this rule alone.
+        One corpus could serve all three while the guard only counted; since the twelve
+        steps are a closed order, only one command is ever next, so each gets the prefix
+        that makes it the one. The parents named on the command line are files *of that
+        prefix*: an extra receipt written beside it would be a second invocation of a
+        step already taken, and the campaign would be in CONFLICT before this guard was
+        ever consulted.
         """
-        receipts = [
-            v8.discovery(sport=sport, moment=v8.instant(index), rid=f"d{index:015x}")
-            for index, sport in enumerate(COMPETITIONS[:3])
-        ]
-        receipts.append(
-            v8.core(sport=FOOTBALL[0], moment=v8.instant(10), rid="c" * 16, tag="parent-tag")
-        )
+        tags = [act.event_tag(identifier, v8.SECRET) for identifier in self.GUARD_EVENTS]
+        discovery = v8.discovery(sport=FOOTBALL[0], moment=v8.instant(0), rid="d" * 16)
+        discovery["event_tags"] = list(tags)
+        for field in ("events_returned", "events_in_window", "events_admissible"):
+            discovery[field] = len(tags)
+        v8.sealed_again(discovery)
+
+        receipts = [discovery]
+        if command != "core":
+            receipts += [
+                v8.core(
+                    sport=FOOTBALL[0], moment=v8.instant(1 + rank), rid=f"c{rank:015x}", tag=tag
+                )
+                for rank, tag in enumerate(tags)
+            ]
+        if command == "discover":
+            receipts.append(
+                v8.additional(sport=FOOTBALL[0], moment=v8.instant(4), rid="e" * 16, tag=tags[-1])
+            )
         plant(boundary, receipts)
+
         found: dict[str, str] = {}
-        for path in boundary.glob("*.json"):
+        for path in sorted(boundary.glob("*.json")):
             document = json.loads(path.read_text(encoding="utf-8"))
-            if document.get("sport_key") == FOOTBALL[0]:
-                found[str(document["command"])] = str(path)
-        return found["discover"], found["core"]
+            found[str(document.get("command"))] = str(path)
+        return found["discover"], found.get("core", "")
 
     def argv(self, command: str, boundary: Path) -> list[str]:
-        discovery, core = self.plant_reachable(boundary)
+        discovery, core = self.plant_reachable(boundary, command)
         common = ["--sport", FOOTBALL[0], "--bookmaker", BOOKMAKER, "--allow-network"]
         if command == "discover":
-            # The one scope the corpus above leaves undiscovered.
+            # The scope the register puts next once the first competition is finished.
             return [
                 "discover",
                 "--sport",
-                COMPETITIONS[3],
+                COMPETITIONS[1],
                 "--bookmaker",
                 BOOKMAKER,
                 "--allow-network",
@@ -863,7 +879,7 @@ class TestTheCampaignBookmakerMustBeConfiguredForTheParser:
                 "core",
                 *common,
                 "--event-id",
-                "EV-GUARD-1",
+                self.GUARD_EVENTS[0],
                 "--discovery-receipt",
                 discovery,
                 "--max-credits",
@@ -875,7 +891,7 @@ class TestTheCampaignBookmakerMustBeConfiguredForTheParser:
             "additional",
             *common,
             "--event-id",
-            "EV-GUARD-2",
+            self.GUARD_EVENTS[1],
             "--core-receipt",
             core,
             "--max-credits",
@@ -932,19 +948,29 @@ class TestTheCampaignBookmakerMustBeConfiguredForTheParser:
         command: str,
         configured: str,
     ) -> None:
-        """It must reach the key tripwire — otherwise the test above proves nothing.
+        """This guard must *stop* refusing — otherwise the test above proves nothing.
 
-        Without this, every refusal above would be satisfied by *any* earlier guard, and
-        a check that never runs would look exactly like a check that always passes.
+        Without it, every refusal above would be satisfied by *any* earlier guard, and a
+        check that never runs would look exactly like a check that always passes. What
+        all three commands assert is therefore that the refusal is no longer **this**
+        one, which is the only thing the configuration changed.
+
+        `discover` additionally reaches the key tripwire, which is what shows the guard
+        is passable at all. `core` and `additional` stop just short of it since
+        03C-2F bis: their parent receipt is read, and the register's rank and parent
+        opposed, *before* the provider key — so a planted parent that has outlived its
+        six hours refuses on its expiry, one step earlier than it used to.
         """
         argv = self.argv(command, boundary)
         self.configure(monkeypatch, configured)
         wire = Tripwire()
         wire.install(monkeypatch)
         result = runner.invoke(act.app, argv)
-        assert wire.key_reads == 1, (
-            f"la commande n'a pas atteint la lecture de clé : {result.output}"
-        )
+        assert "bookmaker de campagne non configuré pour le parser" not in result.output.lower()
+        if command == "discover":
+            assert wire.key_reads == 1, (
+                f"la commande n'a pas atteint la lecture de clé : {result.output}"
+            )
         assert wire.intents == 0 and wire.clients == 0
 
     def test_the_refusal_never_echoes_the_configured_value(

@@ -110,6 +110,12 @@ qu'un marché demandé sera retourné. C'est un **préenregistrement de portée*
 preuve de couverture. Si une compétition est inactive, vide ou non couverte au moment
 autorisé, la campagne v8 échoue sans substitution.
 
+Depuis **D-083** (2026-09-05) le manifeste ne se limite plus à *quelles* compétitions :
+l'ordre des douze appels et le rang de l'événement de chacun sont fixés eux aussi, et le
+rang se lit dans l'ordre canonique `(instant du coup d'envoi, identifiant en octets
+UTF-8)` de la découverte — pas dans l'ordre où le fournisseur a répondu, qu'aucun
+contrat ne promet.
+
 `pinnacle` étant en zone `eu` seule, `effective_region_units(bookmakers=["pinnacle"])`
 vaut 1 : le chiffrage des crédits est inchangé.
 

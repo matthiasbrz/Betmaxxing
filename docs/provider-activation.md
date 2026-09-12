@@ -233,6 +233,45 @@ chaque commande réseau **avant** qu'elle ne coûte quoi que ce soit.
 Sources publiques du choix, consultées le **2026-08-24**, dans `docs/source-matrix.md`.
 `winamax_fr` et la piste B sont exclus de cette campagne.
 
+### Le registre des douze étapes
+
+Les plafonds disent combien d'appels ; le registre dit **lesquels, dans quel ordre, et
+sur quel événement**. Il est fermé depuis le 2026-09-05 (**D-083**) et la garde l'oppose
+avant tout coût.
+
+| # | Commande | Compétition | Rang d'événement | Parent |
+| --- | --- | --- | --- | --- |
+| 1 | `discover` | `soccer_epl` | — | — |
+| 2 | `core` | `soccer_epl` | 1 | étape 1 |
+| 3 | `core` | `soccer_epl` | 2 | étape 1 |
+| 4 | `additional` | `soccer_epl` | 2 | étape 3 |
+| 5 | `discover` | `soccer_spain_la_liga` | — | — |
+| 6 | `core` | `soccer_spain_la_liga` | 1 | étape 5 |
+| 7 | `additional` | `soccer_spain_la_liga` | 1 | étape 6 |
+| 8 | `discover` | `tennis_atp_us_open` | — | — |
+| 9 | `core` | `tennis_atp_us_open` | 1 | étape 8 |
+| 10 | `core` | `tennis_atp_us_open` | 2 | étape 8 |
+| 11 | `discover` | `tennis_wta_us_open` | — | — |
+| 12 | `core` | `tennis_wta_us_open` | 1 | étape 11 |
+
+Le **rang** est une position dans l'ordre canonique de la découverte parente :
+`(instant du coup d'envoi, identifiant en octets UTF-8)`, un instant illisible classé
+dernier, un identifiant répété compté une fois. C'est cet ordre-là que `discover`
+affiche, et il ne dépend pas de l'ordre dans lequel le fournisseur a répondu.
+
+Vous n'avez donc aucune décision à prendre entre deux appels. Demandez l'étape suivante
+à la machine :
+
+```bash
+python -m betmaxxing.providers.the_odds_api.activation status --json
+```
+
+`campaign_next_step_index`, `campaign_next_command`, `campaign_next_scope`,
+`campaign_next_event_rank` et `campaign_next_parent_step` disent quoi lancer. Les cinq
+valent `null` ensemble quand il n'y a rien à lancer — campagne terminée, arrêtée, en
+conflit, comptes non établis, ou reçus qui ne forment pas un début de ce registre. Un
+`null` n'est jamais « recommencez à l'étape 1 ».
+
 ### Ce que la garde refuse, et ce qu'elle laisse derrière elle
 
 `campaign_preflight` s'exécute après la lecture du secret de signature local et **avant**
@@ -244,7 +283,13 @@ la lecture de la clé fournisseur, la publication d'un intent et toute socket. E
 - une seconde découverte d'une compétition déjà découverte ;
 - un quatrième `core` dans une famille, un second `additional` sur une compétition ;
 - un événement déjà utilisé par la même commande ;
-- **toute** commande si la campagne est `ABORTED` ou `CONFLICT` ;
+- toute commande qui n'est pas l'étape suivante du registre — mauvaise commande,
+  mauvaise compétition, mauvais rang d'événement, mauvais reçu parent ;
+- toute commande dont la position ne peut pas être déterminée, parce que les reçus
+  présents ne forment pas un début de ce registre ;
+- un `core` dont la découverte parente a listé moins d'événements que sa compétition
+  n'en consomme ;
+- **toute** commande si la campagne est `COMPLETE`, `ABORTED` ou `CONFLICT` ;
 - **toute** commande si les comptes ne sont pas établis ;
 - **toute** commande si `BETMAXXING_BOOKMAKERS` ne nomme pas `pinnacle`.
 
@@ -537,8 +582,12 @@ s'arrête là, inutile de payer un crédit pour une réponse vide — puis
 Si l'un de ces deux endpoints annonce un coût non nul → `COST_MISMATCH`. S'il
 n'annonce aucun coût → `COST_UNVERIFIED`, et `core` refusera de partir.
 
-**Aucun événement n'est choisi pour vous.** La commande affiche la liste et le
-**chemin du reçu** ; relevez les deux.
+**Aucun événement n'est choisi au clavier.** La commande affiche la liste dans l'ordre
+canonique et le **chemin du reçu** ; relevez les deux. Depuis **D-083** c'est le registre
+qui dit quel rang de cette liste l'étape suivante utilise, et la garde refuse tout autre
+— le choix a été fait avant la réponse du fournisseur, pas devant elle. Si la liste est
+plus courte que ce que la compétition consomme, `discover` publie `COVERAGE_MISSING` :
+ni fenêtre élargie, ni événement réutilisé, ni compétition substituée.
 
 ### 3. `core` — 1 crédit
 

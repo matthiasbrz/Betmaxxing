@@ -57,6 +57,7 @@ from helpers_activation import (
     plan_args,
     receipts_in,
     run,
+    spend_the_second_core,
     sports_payload,
 )
 
@@ -770,11 +771,12 @@ def _harvest(monkeypatch: pytest.MonkeyPatch, receipts: Path) -> set[tuple[str, 
             continue
         install(monkeypatch, Recorder({"/odds": reply(odds_payload(), PAID)}))
         run(*core_args(discovery_receipt=parent))
-        core_receipts = [d for d in receipts_in(receipts) if d.get("command") == "core"]
-        if not core_receipts:
+        if not [d for d in receipts_in(receipts) if d.get("command") == "core"]:
             sweep()
             continue
-        core_receipt = str(receipts / core_receipts[0]["_filename"])
+        # The register puts `additional` after **both** of this competition's `core`, so
+        # the walk goes through rank 2 — and the parent it names is that second receipt.
+        core_receipt = spend_the_second_core(monkeypatch, receipts, parent, headers=PAID)
         install(monkeypatch, Recorder(routes))
         run(*additional_args(core_receipt=core_receipt))
         sweep()
