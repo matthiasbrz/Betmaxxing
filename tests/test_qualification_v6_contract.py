@@ -57,6 +57,7 @@ from helpers_activation import (
     plan_args,
     receipts_in,
     run,
+    spend_the_second_core,
     sports_payload,
 )
 
@@ -770,11 +771,12 @@ def _harvest(monkeypatch: pytest.MonkeyPatch, receipts: Path) -> set[tuple[str, 
             continue
         install(monkeypatch, Recorder({"/odds": reply(odds_payload(), PAID)}))
         run(*core_args(discovery_receipt=parent))
-        core_receipts = [d for d in receipts_in(receipts) if d.get("command") == "core"]
-        if not core_receipts:
+        if not [d for d in receipts_in(receipts) if d.get("command") == "core"]:
             sweep()
             continue
-        core_receipt = str(receipts / core_receipts[0]["_filename"])
+        # The register puts `additional` after **both** of this competition's `core`, so
+        # the walk goes through rank 2 — and the parent it names is that second receipt.
+        core_receipt = spend_the_second_core(monkeypatch, receipts, parent, headers=PAID)
         install(monkeypatch, Recorder(routes))
         run(*additional_args(core_receipt=core_receipt))
         sweep()
@@ -853,7 +855,17 @@ class TestTheProducerAndTheContractAgree:
         assert qual.classify(honest) != "unknown_command_status_pair"
         state = state_of([*threshold_corpus(FAKE_RECEIPT_SECRET), honest])
         assert state["qualification_unknown_pair_receipts"] == 0
-        assert state["eligible_for_human_promotion_review"] is True
+        # Every criterion is still satisfied: this receipt poisons no threshold and
+        # creates no unknown pair, which is the whole claim. The gate is nonetheless shut,
+        # and by the campaign rather than by this receipt's (command, status) pair — since
+        # 03C-2F quater the shared corpus is the register in full, whose four discoveries
+        # are steps 1, 5, 8 and 11, so a fifth one is an overrun of a ceiling frozen in
+        # bis whatever it says about its own cost.
+        assert all(entry["passed"] for entry in state["criteria_results"])
+        assert state["campaign_invocation_counts"]["discover"] == 5
+        assert any(
+            "invocations discover" in conflict for conflict in state["evidence_conflicts"]
+        ), state["evidence_conflicts"]
 
     def test_the_published_counts_match_the_table(self) -> None:
         entries = len(qual.RECEIPT_PHASES)

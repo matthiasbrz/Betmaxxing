@@ -45,6 +45,7 @@ from helpers_activation import (
     FAKE_KEY,
     NOW,
     OTHER_EVENT_ID,
+    SECOND_EVENT_ID,
     SPORT,
     Recorder,
     additional_args,
@@ -60,6 +61,7 @@ from helpers_activation import (
     receipts_in,
     run,
     runner,
+    spend_the_second_core,
     sports_payload,
 )
 
@@ -96,6 +98,23 @@ def verified_core(monkeypatch: pytest.MonkeyPatch, receipts: Path) -> str:
     result = run(*core_args(discovery_receipt=discovery))
     assert result.exit_code == 0, result.stdout
     return str(receipt_path(receipts, "core"))
+
+
+def verified_core_for_additional(monkeypatch: pytest.MonkeyPatch, receipts: Path) -> str:
+    """Walk the register as far as its `additional`, and return the parent it names.
+
+    Two `core` on `soccer_epl`, then the five-market step on the second of them: the
+    order is the register's, and the guard refuses any other.
+    """
+    discovery = approved(monkeypatch, receipts)
+    install(
+        monkeypatch,
+        Recorder(
+            {"/odds": lambda _r: httpx.Response(200, json=odds_payload(), headers=PAID_HEADERS)}
+        ),
+    )
+    assert run(*core_args(discovery_receipt=discovery)).exit_code == 0
+    return spend_the_second_core(monkeypatch, receipts, discovery, headers=PAID_HEADERS)
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +313,9 @@ class TestConsentGates:
 
     def _receipt_for(self, monkeypatch: pytest.MonkeyPatch, keyed: Path, command: str) -> str:
         return (
-            approved(monkeypatch, keyed) if command == "core" else verified_core(monkeypatch, keyed)
+            approved(monkeypatch, keyed)
+            if command == "core"
+            else verified_core_for_additional(monkeypatch, keyed)
         )
 
     @pytest.mark.parametrize(
@@ -332,7 +353,7 @@ class TestConsentGates:
         max_credits: str,
         ack: str,
     ) -> None:
-        core = verified_core(monkeypatch, keyed)
+        core = verified_core_for_additional(monkeypatch, keyed)
         recorder = Recorder({"/events/": event_odds_payload()})
         install(monkeypatch, recorder)
         result = run(*additional_args(core_receipt=core, max_credits=max_credits, acknowledge=ack))
@@ -510,7 +531,9 @@ class TestDiscover:
         )
         payload = json.loads(self._run(monkeypatch, recorder, "--json").stdout)
         assert payload["status"] == "DISCOVERY_VERIFIED"
-        assert len(payload["events"]) == 2
+        # Every admissible event is listed and none is chosen — counted against the
+        # listing itself, so the shared payload can grow without the claim weakening.
+        assert len(payload["events"]) == len(two)
         assert "selected_event_id" not in payload
 
     def test_a_nonzero_reported_cost_is_a_mismatch(
@@ -691,7 +714,7 @@ class TestCore:
 # ---------------------------------------------------------------------------
 class TestAdditional:
     def _run(self, monkeypatch: pytest.MonkeyPatch, keyed: Path, routes: Any, *extra: str) -> Any:
-        core = verified_core(monkeypatch, keyed)
+        core = verified_core_for_additional(monkeypatch, keyed)
         recorder = Recorder(routes)
         install(monkeypatch, recorder)
         result = run(*additional_args(core_receipt=core, extra=extra))
@@ -708,7 +731,7 @@ class TestAdditional:
         result = self._run(monkeypatch, keyed, {"/events/": self._ok})
         assert result.exit_code == 0, result.stdout
         assert len(self.recorder.requests) == 1
-        assert self.recorder.paths[0].endswith(f"/v4/sports/{SPORT}/events/{EVENT_ID}/odds")
+        assert self.recorder.paths[0].endswith(f"/v4/sports/{SPORT}/events/{SECOND_EVENT_ID}/odds")
 
     def test_it_requests_exactly_the_five_markets(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None

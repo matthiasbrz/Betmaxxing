@@ -207,7 +207,19 @@ def result_for(document: dict[str, Any], criterion_id: str) -> dict[str, Any]:
 
 
 def everything_passing() -> list[dict[str, Any]]:
-    return football_core_passing() + tennis_core_passing() + additional_football_passing()
+    """The corpus that satisfies every criterion: the pre-registered register in full.
+
+    The three factories above stay as they are — every threshold test below reads them,
+    one family at a time, and their observations are what the criteria count. What changed
+    in 03C-2F quater is that the campaign's position is *recognised* from the receipts, so
+    eight paid steps with no discovery behind them is a corpus no command could have
+    produced: the register reports it as a contradiction, and a corpus assembled to reach
+    the gate would have proved the opposite of its purpose. The criteria, their thresholds
+    and the ceiling vocabulary are untouched.
+    """
+    import helpers_campaign_v8 as v8
+
+    return v8.register_corpus(secret=_SIGNING)
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +233,16 @@ class TestTheFloor:
         assert all(entry["passed"] is False for entry in document["criteria_results"])
 
     def test_one_successful_observation_does_not_qualify(self) -> None:
-        document = _evaluate([signed()], 0)
+        """One event is weak evidence, and must read as weak rather than as contradictory.
+
+        The corpus is the register's first two steps — the discovery and the ``core`` that
+        descends from it — because since 03C-2F quater a paid receipt with no discovery
+        behind it matches no step and is a contradiction, which is a different verdict
+        from « not enough ». One paid event, either way.
+        """
+        import helpers_campaign_v8 as v8
+
+        document = _evaluate(v8.register_corpus(2, secret=_SIGNING), 0)
         assert document["qualification_state"] == str(qual.QualificationState.INSUFFICIENT_EVIDENCE)
         core = result_for(document, "CORE_MAPPING_FOOTBALL")
         assert core["passed"] is False
@@ -621,9 +642,13 @@ class TestTheStatusCommand:
         assert "\x1b[" not in result.stdout
 
     def test_the_human_output_says_what_is_missing(self, workspace: Path) -> None:
+        import helpers_campaign_v8 as v8
         from helpers_activation import run
 
-        self._write_all(workspace, [signed(receipt_id="b1" * 8)])
+        # The register's first two steps: one paid event is weak evidence, while a `core`
+        # with no discovery behind it would be a contradiction — and the rendering under
+        # test is the one that lists what is still missing.
+        self._write_all(workspace, v8.register_corpus(2, secret=_SIGNING))
         result = run("status")
         assert result.exit_code == 0
         assert "INSUFFICIENT_EVIDENCE" in result.stdout
@@ -650,10 +675,15 @@ class TestTheStatusCommand:
         # The local HMAC tags *are* printed, in the coverage block and only there:
         # that is what bounds an observation to one event without ever naming it
         # (D-062). The assertion this replaces looked for a sentinel the fixture
-        # never produces — `everything_passing()` uses a, b, c, d, f, 0, 1 and 2 —
-        # so it could not fail, and its comment said the opposite of the truth.
+        # never produces — the corpus carries the register's own tags — so it could
+        # not fail, and its comment said the opposite of the truth. Only the paid steps
+        # carry an `event_tag`: a discovery publishes the whole list under `event_tags`.
         payload = jsonlib.loads(result.stdout)
-        injected = {str(receipt["event_tag"]) for receipt in everything_passing()}
+        injected = {
+            str(receipt["event_tag"])
+            for receipt in everything_passing()
+            if receipt.get("event_tag")
+        }
         shown = {
             observation["event_tag"] for observation in payload["bookmaker_coverage_observations"]
         }

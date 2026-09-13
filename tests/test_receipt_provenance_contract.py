@@ -86,6 +86,22 @@ def _evaluate(audit: Any) -> Any:
     return qual.evaluate(audit)
 
 
+def _paid(audit: Any) -> Any:
+    """The first *paid* receipt of a batch, asked for by name rather than by position.
+
+    The shared corpus became the whole pre-registered register in 03C-2F quater, so its
+    first file is now a ``discover`` — a receipt with no market map, no freshness and no
+    ``event_tag``. Every sealing test below is about the nested containers a paid receipt
+    carries, and none of them was ever about which file the audit listed first.
+    """
+    return next(receipt for receipt in audit.batch if receipt["command"] != "discover")
+
+
+def _paid_document(corpus: list[dict[str, Any]]) -> dict[str, Any]:
+    """The same choice, on raw documents that have not been audited yet."""
+    return next(document for document in corpus if document["command"] != "discover")
+
+
 def _state(audit: Any) -> Any:
     return act.build_activation_state(audit)
 
@@ -99,11 +115,14 @@ def local_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
 
 class TestOnlyTheAuditMintsAuthority:
     def test_the_audit_of_signed_files_is_the_positive_control(self, local_audit: Any) -> None:
-        assert len(local_audit.batch) == 8
+        # Twelve since 03C-2F quater: the shared positive control is the pre-registered
+        # register in full, because the campaign position is recognised from the receipts
+        # and eight paid steps with no discovery behind them form no register at all.
+        assert len(local_audit.batch) == 12
         assert local_audit.unverifiable == 0
         assert _gate(_evaluate(local_audit)) == {
             "state": "CRITERIA_MET_AWAITING_HUMAN_REVIEW",
-            "usable": 8,
+            "usable": 12,
             "eligible": True,
         }
 
@@ -171,7 +190,7 @@ class TestOnlyTheAuditMintsAuthority:
             monkeypatch=monkeypatch,
         )
         assert len(audit.batch) == 0
-        assert audit.unverifiable == 8
+        assert audit.unverifiable == 12
         assert _gate(_evaluate(audit))["eligible"] is False
 
     def test_no_module_level_minting_token_exists(self) -> None:
@@ -214,15 +233,16 @@ class TestTheAdmittedReceiptIsAFrozenValue:
         corpus = threshold_corpus(LOCAL)
         audit = audited_corpus(tmp_path / "receipts", corpus, secret=LOCAL, monkeypatch=monkeypatch)
         before = _gate(_evaluate(audit))
-        corpus[0]["market_states"]["h2h"] = "FABRICATED"
-        corpus[0]["freshness"]["h2h"] = 10**9
-        corpus[0]["markets_mapped"].append("invented")
-        assert audit.batch[0]["market_states"]["h2h"] == "OBSERVED_MAPPED"
+        source = _paid_document(corpus)
+        source["market_states"]["h2h"] = "FABRICATED"
+        source["freshness"]["h2h"] = 10**9
+        source["markets_mapped"].append("invented")
+        assert _paid(audit)["market_states"]["h2h"] == "OBSERVED_MAPPED"
         assert _gate(_evaluate(audit)) == before
 
     @pytest.mark.parametrize("key", ["market_states", "freshness"])
     def test_a_nested_mapping_handed_out_is_not_writable(self, local_audit: Any, key: str) -> None:
-        nested = local_audit.batch[0][key]
+        nested = _paid(local_audit)[key]
         with pytest.raises(TypeError):
             nested["h2h"] = "TAMPERED"
         with pytest.raises((TypeError, AttributeError)):
@@ -232,7 +252,7 @@ class TestTheAdmittedReceiptIsAFrozenValue:
         "key", ["markets_requested", "markets_mapped", "markets_observed", "markets_rejected"]
     )
     def test_a_nested_sequence_handed_out_is_not_writable(self, local_audit: Any, key: str) -> None:
-        nested = local_audit.batch[0][key]
+        nested = _paid(local_audit)[key]
         with pytest.raises((TypeError, AttributeError)):
             nested.append("invented")
 
@@ -241,10 +261,10 @@ class TestTheAdmittedReceiptIsAFrozenValue:
     )
     def test_no_scalar_can_be_replaced_after_verification(self, local_audit: Any, key: str) -> None:
         with pytest.raises(TypeError):
-            local_audit.batch[0][key] = "REWRITTEN"
+            _paid(local_audit)[key] = "REWRITTEN"
 
     def test_no_reachable_attribute_replaces_the_payload(self, local_audit: Any) -> None:
-        receipt = local_audit.batch[0]
+        receipt = _paid(local_audit)
         original = dict(receipt)
         for name in ("_payload", "_frozen", "_receipt", "payload"):
             holder = getattr(receipt, name, None)
@@ -261,28 +281,31 @@ class TestTheAdmittedReceiptIsAFrozenValue:
         stale = []
         for document in threshold_corpus(LOCAL):
             copy_of = dict(document)
-            copy_of["freshness"] = dict.fromkeys(
-                document["freshness"], qual.PROTOCOL_MAX_ODDS_AGE_SECONDS + 600
-            )
+            if "freshness" in document:
+                copy_of["freshness"] = dict.fromkeys(
+                    document["freshness"], qual.PROTOCOL_MAX_ODDS_AGE_SECONDS + 600
+                )
             copy_of[act.SIGNATURE_FIELD] = _sign(copy_of)
             stale.append(copy_of)
         audit = audited_corpus(tmp_path / "receipts", stale, secret=LOCAL, monkeypatch=monkeypatch)
         assert _gate(_evaluate(audit))["eligible"] is False
         for receipt in audit.batch:
+            if "freshness" not in receipt:
+                continue
             with pytest.raises((TypeError, AttributeError)):
                 receipt["freshness"]["h2h"] = 300
         assert _gate(_evaluate(audit))["eligible"] is False
         assert _state(audit)["eligible_for_human_promotion_review"] is False
 
     def test_copies_keep_the_same_bytes_and_share_nothing_mutable(self, local_audit: Any) -> None:
-        receipt = local_audit.batch[0]
+        receipt = _paid(local_audit)
         for clone in (copy.copy(receipt), copy.deepcopy(receipt)):
             assert dict(clone) == dict(receipt)
             with pytest.raises((TypeError, AttributeError)):
                 clone["market_states"]["h2h"] = "VIA_COPY"
 
     def test_pickle_round_trips_without_creating_authority(self, local_audit: Any) -> None:
-        receipt = local_audit.batch[0]
+        receipt = _paid(local_audit)
         try:
             payload = pickle.dumps(receipt)
         except (TypeError, pickle.PicklingError):
@@ -293,7 +316,7 @@ class TestTheAdmittedReceiptIsAFrozenValue:
             restored["status"] = "REWRITTEN"
 
     def test_a_receipt_still_reads_like_the_mapping_it_replaces(self, local_audit: Any) -> None:
-        receipt = local_audit.batch[0]
+        receipt = _paid(local_audit)
         assert receipt["command"] in {"core", "additional"}
         assert set(receipt) == set(dict(receipt))
         assert len(receipt) == len(dict(receipt))
@@ -330,15 +353,18 @@ class TestNoPublicMutatorReachesASealedContainer:
         corpus = []
         for document in threshold_corpus(LOCAL):
             copy_of = dict(document)
-            copy_of["freshness"] = dict.fromkeys(
-                document["freshness"], qual.PROTOCOL_MAX_ODDS_AGE_SECONDS + 600
-            )
+            # Only the paid steps quote odds: a `discover` receipt has no `freshness` at
+            # all, and the register's four discoveries joined this corpus in 03C-2F quater.
+            if "freshness" in document:
+                copy_of["freshness"] = dict.fromkeys(
+                    document["freshness"], qual.PROTOCOL_MAX_ODDS_AGE_SECONDS + 600
+                )
             copy_of[act.SIGNATURE_FIELD] = _sign(copy_of)
             corpus.append(copy_of)
         return audited_corpus(tmp_path / "receipts", corpus, secret=LOCAL, monkeypatch=monkeypatch)
 
     def test_the_sealed_containers_are_not_mutable_builtins(self, stale: Any) -> None:
-        receipt = stale.batch[0]
+        receipt = _paid(stale)
         assert not isinstance(receipt["freshness"], dict)
         assert not isinstance(receipt["markets_requested"], list)
         assert isinstance(receipt["freshness"], store.FrozenMapping)
@@ -358,7 +384,7 @@ class TestNoPublicMutatorReachesASealedContainer:
         ],
     )
     def test_no_dict_base_call_reaches_a_sealed_mapping(self, stale: Any, call: Any) -> None:
-        nested = stale.batch[0]["freshness"]
+        nested = _paid(stale)["freshness"]
         before = dict(nested)
         with pytest.raises(TypeError):
             call(nested)
@@ -382,14 +408,14 @@ class TestNoPublicMutatorReachesASealedContainer:
         ],
     )
     def test_no_list_base_call_reaches_a_sealed_sequence(self, stale: Any, call: Any) -> None:
-        nested = stale.batch[0]["markets_requested"]
+        nested = _paid(stale)["markets_requested"]
         before = tuple(nested)
         with pytest.raises(TypeError):
             call(nested)
         assert tuple(nested) == before
 
     def test_a_deeply_nested_mapping_is_sealed_too(self, stale: Any) -> None:
-        receipt = stale.batch[0]
+        receipt = _paid(stale)
         states = receipt["market_states"]
         with pytest.raises(TypeError):
             dict.__setitem__(states, "h2h", "FABRICATED")
@@ -400,7 +426,7 @@ class TestNoPublicMutatorReachesASealedContainer:
     def test_no_ordinary_assignment_reaches_an_internal_attribute(
         self, stale: Any, attribute: str
     ) -> None:
-        receipt = stale.batch[0]
+        receipt = _paid(stale)
         before = dict(receipt)
         with pytest.raises((AttributeError, TypeError)):
             setattr(receipt, attribute, {"status": "REWRITTEN"})
@@ -408,7 +434,7 @@ class TestNoPublicMutatorReachesASealedContainer:
 
     def test_only_one_attribute_name_exists_at_all(self, stale: Any) -> None:
         """`__slots__` is why: there is no dictionary to add a name to."""
-        receipt = stale.batch[0]
+        receipt = _paid(stale)
         assert type(receipt).__slots__ == ("_frozen",)
         assert not hasattr(receipt, "__dict__")
 
@@ -416,7 +442,7 @@ class TestNoPublicMutatorReachesASealedContainer:
         before = _gate(_evaluate(stale))
         assert before == {
             "state": "INSUFFICIENT_EVIDENCE",
-            "usable": 8,
+            "usable": 12,
             "eligible": False,
         }
         attempts = (
@@ -429,6 +455,8 @@ class TestNoPublicMutatorReachesASealedContainer:
             lambda m, s: copy.deepcopy(m).__setitem__("h2h", 300),
         )
         for receipt in stale.batch:
+            if receipt["command"] == "discover":
+                continue  # a discovery quotes no odds and requests no market
             freshness = receipt["freshness"]
             markets = receipt["markets_requested"]
             for attempt in attempts:
@@ -442,7 +470,7 @@ class TestNoPublicMutatorReachesASealedContainer:
         assert _state(stale)["eligible_for_human_promotion_review"] is False
 
     def test_a_sealed_mapping_cannot_be_pickled_into_a_writable_one(self, stale: Any) -> None:
-        nested = stale.batch[0]["freshness"]
+        nested = _paid(stale)["freshness"]
         try:
             payload = pickle.dumps(nested)
         except (TypeError, pickle.PicklingError):
@@ -452,7 +480,7 @@ class TestNoPublicMutatorReachesASealedContainer:
             restored["h2h"] = 300
 
     def test_copies_of_a_sealed_mapping_are_still_sealed(self, stale: Any) -> None:
-        nested = stale.batch[0]["freshness"]
+        nested = _paid(stale)["freshness"]
         for clone in (copy.copy(nested), copy.deepcopy(nested)):
             assert dict(clone) == dict(nested)
             with pytest.raises(TypeError):
@@ -463,7 +491,7 @@ class TestNoPublicMutatorReachesASealedContainer:
     def test_the_repr_of_each_sealed_object_is_readable_and_says_nothing_new(
         self, stale: Any
     ) -> None:
-        receipt = stale.batch[0]
+        receipt = _paid(stale)
         assert repr(receipt).startswith("VerifiedReceipt(receipt_id=")
         assert repr(receipt["freshness"]).startswith("FrozenMapping(")
         assert repr(stale).startswith("AuditResult(")
@@ -471,7 +499,7 @@ class TestNoPublicMutatorReachesASealedContainer:
         assert LOCAL not in repr(receipt) + repr(receipt["freshness"]) + repr(stale)
 
     def test_to_builtin_gives_a_detached_mutable_copy(self, stale: Any) -> None:
-        receipt = stale.batch[0]
+        receipt = _paid(stale)
         plain = receipt.to_builtin()
         assert isinstance(plain, dict)
         assert isinstance(plain["freshness"], dict)

@@ -194,7 +194,11 @@ class TestProvenanceIsExplicit:
         _audit = act.audit_receipts()
         batch = _audit.batch
         one = batch[0]
-        assert one["command"] in {"core", "additional"}
+        # `discover` since 03C-2F quater: the shared corpus is the whole pre-registered
+        # register now, and its first step is the discovery the two paid commands descend
+        # from. Which command it is was never the point here — that the wrapper reads like
+        # the mapping it wraps is.
+        assert one["command"] in {"discover", "core", "additional"}
         assert dict(one)["status"] == one["status"]
         assert set(one) == set(dict(one))
         assert len(one) == len(dict(one))
@@ -236,10 +240,12 @@ class TestStatusNeverCreatesASecret:
         _audit = act.audit_receipts()
         batch, unverifiable = _audit.batch, _audit.unverifiable
         assert len(batch) == 0
-        assert unverifiable == 8
+        # Twelve since 03C-2F quater: the shared corpus is the whole pre-registered
+        # register, four discoveries included, and none of the files can be verified.
+        assert unverifiable == 12
         state = act.build_activation_state(_audit)
         assert state["eligible_for_human_promotion_review"] is False
         assert not (corpus_dir / act.SECRET_FILENAME).exists()
         reason = " ".join(str(value) for value in state.values())
         assert "signature" not in reason.lower() or True
-        assert state["qualification_unverifiable_receipts"] == 8
+        assert state["qualification_unverifiable_receipts"] == 12

@@ -54,6 +54,7 @@ from helpers_activation import (
     receipt_path,
     receipts_in,
     run,
+    spend_the_second_core,
     sports_payload,
 )
 
@@ -85,6 +86,23 @@ def chain(monkeypatch: pytest.MonkeyPatch, receipts: Path) -> Path:
     result = run(*core_args(discovery_receipt=str(receipt_path(receipts, "discover"))))
     assert result.exit_code == 0, result.stdout
     return receipt_path(receipts, "core")
+
+
+def chain_to_additional(monkeypatch: pytest.MonkeyPatch, receipts: Path) -> Path:
+    """The same walk, carried to the step the register puts `additional` after.
+
+    `soccer_epl` spends two `core` before its five-market step, so the parent this
+    returns is the **second** of them and the event is rank 2 of the discovery.
+    """
+    chain(monkeypatch, receipts)
+    return Path(
+        spend_the_second_core(
+            monkeypatch,
+            receipts,
+            str(receipt_path(receipts, "discover")),
+            headers={"x-requests-last": "1"},
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +427,7 @@ class TestAdditionalCoverageIsClassifiedPerMarket:
     def test_all_five_present_is_fully_verified(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        core = chain(monkeypatch, keyed)
+        core = chain_to_additional(monkeypatch, keyed)
         result = _additional(monkeypatch, core, event_odds_payload())
         payload = json.loads(result.stdout)
         assert payload["status"] == "ADDITIONAL_LIVE_VERIFIED"
@@ -420,7 +438,7 @@ class TestAdditionalCoverageIsClassifiedPerMarket:
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
         """The bookmaker is quoted, and not one requested market came back."""
-        core = chain(monkeypatch, keyed)
+        core = chain_to_additional(monkeypatch, keyed)
         payload = event_odds_payload(markets=())
         result = _additional(monkeypatch, core, payload)
         document = json.loads(result.stdout)
@@ -434,7 +452,7 @@ class TestAdditionalCoverageIsClassifiedPerMarket:
     def test_a_partial_set_is_reported_as_partial(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        core = chain(monkeypatch, keyed)
+        core = chain_to_additional(monkeypatch, keyed)
         result = _additional(
             monkeypatch, core, event_odds_payload(markets=("draw_no_bet", "double_chance"))
         )
@@ -451,7 +469,7 @@ class TestAdditionalCoverageIsClassifiedPerMarket:
     def test_a_returned_but_unmappable_market_is_rejected_not_missing(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        core = chain(monkeypatch, keyed)
+        core = chain_to_additional(monkeypatch, keyed)
         result = _additional(
             monkeypatch,
             core,
@@ -464,7 +482,7 @@ class TestAdditionalCoverageIsClassifiedPerMarket:
     def test_every_market_returned_but_none_mapped_is_not_a_success(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        core = chain(monkeypatch, keyed)
+        core = chain_to_additional(monkeypatch, keyed)
         result = _additional(monkeypatch, core, event_odds_payload(broken=ADDITIONAL_MARKET_KEYS))
         document = json.loads(result.stdout)
         assert document["status"] == "SCHEMA_MISMATCH"
@@ -475,7 +493,7 @@ class TestAdditionalCoverageIsClassifiedPerMarket:
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
         """No timestamp means no provable freshness, so nothing is retained."""
-        core = chain(monkeypatch, keyed)
+        core = chain_to_additional(monkeypatch, keyed)
         result = _additional(monkeypatch, core, event_odds_payload(stamped=False))
         document = json.loads(result.stdout)
         assert document["status"] != "ADDITIONAL_LIVE_VERIFIED"
@@ -484,7 +502,7 @@ class TestAdditionalCoverageIsClassifiedPerMarket:
     def test_the_receipt_keeps_the_per_market_granularity(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        core = chain(monkeypatch, keyed)
+        core = chain_to_additional(monkeypatch, keyed)
         _additional(monkeypatch, core, event_odds_payload(markets=("draw_no_bet",)), extra=())
         receipt = [r for r in receipts_in(keyed) if r["command"] == "additional"][-1]
         assert receipt["market_states"]["draw_no_bet"] == "OBSERVED_MAPPED"
@@ -493,7 +511,7 @@ class TestAdditionalCoverageIsClassifiedPerMarket:
     def test_nothing_is_substituted_for_an_absent_market(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        core = chain(monkeypatch, keyed)
+        core = chain_to_additional(monkeypatch, keyed)
         recorder = Recorder(
             {
                 "/events/": lambda _r: httpx.Response(
@@ -515,14 +533,14 @@ class TestFreshnessStaysPerMarket:
     def test_five_markets_yield_five_distinct_ages(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        core = chain(monkeypatch, keyed)
+        core = chain_to_additional(monkeypatch, keyed)
         document = json.loads(_additional(monkeypatch, core, event_odds_payload()).stdout)
         assert len(set(document["freshness"].values())) == 5
 
     def test_the_reception_time_is_never_used_as_the_age(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        core = chain(monkeypatch, keyed)
+        core = chain_to_additional(monkeypatch, keyed)
         document = json.loads(_additional(monkeypatch, core, event_odds_payload()).stdout)
         assert all(age > 0 for age in document["freshness"].values())
 
@@ -586,7 +604,7 @@ class TestNoGlobalPromotion:
     def test_a_successful_run_says_the_adapter_stays_unverified(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        core = chain(monkeypatch, keyed)
+        core = chain_to_additional(monkeypatch, keyed)
         document = json.loads(_additional(monkeypatch, core, event_odds_payload()).stdout)
         assert document["adapter_status"] == "IMPLEMENTED_UNVERIFIED"
         assert document["model_impact"].startswith("aucun")
@@ -594,7 +612,7 @@ class TestNoGlobalPromotion:
     def test_the_receipt_records_the_exact_scope_of_the_proof(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        core = chain(monkeypatch, keyed)
+        core = chain_to_additional(monkeypatch, keyed)
         _additional(monkeypatch, core, event_odds_payload(), extra=())
         receipt = [r for r in receipts_in(keyed) if r["command"] == "additional"][-1]
         for field in ("endpoint", "sport_key", "bookmaker", "event_tag", "recorded_at"):

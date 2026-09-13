@@ -360,13 +360,24 @@ class TestEvidenceIsBoundToProtocolAndImplementation:
         assert document["qualification_reasons"]["other_adapter_evidence_version"] == 8
 
     def test_a_v4_corpus_of_the_current_versions_after_the_date_qualifies(self) -> None:
-        document = _evaluate(full_corpus(), 0)
+        """The gate's corpus is the pre-registered register, since 03C-2F quater.
+
+        ``full_corpus()`` above is this module's eight paid receipts, and they are what
+        every *other* test here needs: one field flipped, one population counted. They no
+        longer reach the gate on their own, because the campaign position is recognised
+        from the receipts and eight paid steps with no discovery behind them is a corpus
+        no command could have produced. The criteria and their thresholds are untouched —
+        what changed is that a corpus has to be producible to be believed.
+        """
+        import helpers_campaign_v8 as v8
+
+        document = _evaluate(v8.register_corpus(secret=_SIGNING), 0)
         assert sorted(passing(document)) == sorted(c.criterion_id for c in qual.CRITERIA)
         assert document["qualification_state"] == str(
             qual.QualificationState.CRITERIA_MET_AWAITING_HUMAN_REVIEW
         )
         assert document["eligible_for_human_promotion_review"] is True
-        assert document["qualification_admissible_receipts"] == 8
+        assert document["qualification_admissible_receipts"] == 12
 
     def test_two_old_coverage_missing_calls_no_longer_feed_the_cost_criterion(self) -> None:
         """They used to contribute 2/6 while proving nothing about the parser."""

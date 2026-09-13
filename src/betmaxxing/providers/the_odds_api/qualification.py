@@ -138,6 +138,8 @@ ship. It does not validate the provider's payload, and no version number can.
 
 from __future__ import annotations
 
+import dataclasses
+import itertools
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -413,6 +415,141 @@ def campaign_scopes_for(command: str) -> tuple[str, ...]:
     if command == "additional":
         return CAMPAIGN_ADDITIONAL_SCOPES
     return CAMPAIGN_COMPETITIONS
+
+
+#: How each family's three ``core`` split across its two competitions. Dealt out in
+#: manifest order, so the extra invocation lands on the competition named **first** on
+#: 2026-08-24 — decided before any answer came back, not after one came back thin.
+#:
+#: The static preflight 03C-2F measured why this had to be written down: the guard
+#: capped the family at three and nothing below that, so ``2+1``, ``1+2`` and ``3+0``
+#: were all accepted, and the operator picked one at the keyboard with the first
+#: discovery already on screen. That is the fault **D-082** recorded against protocol
+#: 7 — a scope chosen after seeing the data — in a smaller place.
+CAMPAIGN_CORE_BY_COMPETITION: dict[str, int] = {
+    sport: CAMPAIGN_CORE_PER_FAMILY // len(scopes)
+    + (1 if position < CAMPAIGN_CORE_PER_FAMILY % len(scopes) else 0)
+    for scopes in CAMPAIGN_SCOPES.values()
+    for position, sport in enumerate(scopes)
+}
+
+
+@dataclass(frozen=True)
+class CampaignStep:
+    """One pre-registered invocation, with nothing left to decide when it is reached.
+
+    ``event_rank`` is a **rank in the canonical order** of the parent discovery, not an
+    identifier: the register is written before any fixture exists, so it can name « the
+    first event of the discovery » and never « Arsenal-Chelsea ». :func:`canonical_event_order`
+    is what turns the provider's answer — whose order is not contractual — into that rank.
+    """
+
+    index: int
+    command: str
+    sport: str
+    #: ``None`` for ``discover``, which addresses no single event.
+    event_rank: int | None
+    #: The step whose receipt authorises this one; ``None`` for ``discover``.
+    parent_step: int | None
+
+
+def _build_campaign_sequence() -> tuple[CampaignStep, ...]:
+    """Deal the pre-registered quotas out into twelve ordered steps.
+
+    Competition by competition, in manifest order: discover it, spend its ``core``
+    quota on the first events of its canonical order, then — for the two football
+    scopes — spend its one ``additional`` on the event the last of those ``core``
+    already proved. Nothing here reads a receipt; the order exists before the campaign.
+    """
+    steps: list[CampaignStep] = []
+    for sport in CAMPAIGN_COMPETITIONS:
+        discovery_at = len(steps) + 1
+        steps.append(CampaignStep(discovery_at, "discover", sport, None, None))
+        last_core = discovery_at
+        for rank in range(1, CAMPAIGN_CORE_BY_COMPETITION[sport] + 1):
+            last_core = len(steps) + 1
+            steps.append(CampaignStep(last_core, "core", sport, rank, discovery_at))
+        if sport in CAMPAIGN_ADDITIONAL_SCOPES:
+            for _ in range(CAMPAIGN_ADDITIONAL_PER_COMPETITION):
+                steps.append(
+                    CampaignStep(
+                        len(steps) + 1,
+                        "additional",
+                        sport,
+                        CAMPAIGN_CORE_BY_COMPETITION[sport],
+                        last_core,
+                    )
+                )
+
+    # Derived, then checked against the totals that were pre-registered separately. Two
+    # tables that agree by construction still drift the day one of them is edited alone,
+    # and the campaign's whole claim is that its size was fixed before the first call.
+    derived = dict.fromkeys(CAMPAIGN_COMMANDS, 0)
+    for step in steps:
+        derived[step.command] += 1
+    if derived != CAMPAIGN_INVOCATIONS:
+        raise ValueError(
+            f"Le registre dérivé {derived} ne reproduit pas les quotas préenregistrés "
+            f"{CAMPAIGN_INVOCATIONS} : la campagne v8 n'a plus une seule définition."
+        )
+    return tuple(steps)
+
+
+#: The twelve steps, in the only order the campaign may be run in. One source, read by
+#: the guard, by the report and by the documentation.
+CAMPAIGN_SEQUENCE: tuple[CampaignStep, ...] = _build_campaign_sequence()
+
+
+def canonical_event_order(events: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """Order a discovery's events the one way that does not depend on the provider.
+
+    ``/v4/sports/{sport}/events`` promises no order, and « the first one the API
+    returned » is therefore a preference dressed as a rule: replay the same call and the
+    rank can move. The order here is the pair *(kick-off instant, identifier)*, the
+    identifier compared as **UTF-8 bytes** so two runs on two machines with two locales
+    cannot disagree about which of two simultaneous fixtures comes first. UTF-8 preserves
+    code-point order, so the encode does not change today's result — it states which
+    comparison is meant, and keeps the rank out of reach of any collation that is not it.
+
+    An event whose ``commence_time`` cannot be read never outranks one whose can: it
+    sorts last rather than being dropped, so a malformed instant costs a rank instead of
+    silently renumbering every event after it. Repeated identifiers are kept once, in
+    first position seen after ordering — a provider echoing an event must not create a rank.
+    """
+
+    def key(event: Mapping[str, Any]) -> tuple[int, float, bytes]:
+        moment = _instant(event.get("commence_time"))
+        identifier = str(event.get("id", ""))
+        if moment is None:
+            return (1, 0.0, identifier.encode("utf-8"))
+        return (0, moment.astimezone(UTC).timestamp(), identifier.encode("utf-8"))
+
+    ordered: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    for event in sorted(events, key=key):
+        identifier = str(event.get("id", ""))
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+        ordered.append(event)
+    return ordered
+
+
+def discovery_is_sufficient(sport: object, unique_events: int) -> bool:
+    """Whether a discovery of ``sport`` found enough events to serve its own steps.
+
+    A competition whose register asks for two ``core`` is not served by a listing of
+    one: the second step would have no event of rank 2 to address, and the only ways out
+    would be re-running the discovery on a wider window or reusing the first event —
+    both of them substitutions the campaign forbids. Saying so at the discovery, which
+    costs nothing, is the difference between stopping for free and stopping one credit later.
+
+    A competition outside the manifest is never sufficient, whatever it returned.
+    """
+    needed = CAMPAIGN_CORE_BY_COMPETITION.get(sport if isinstance(sport, str) else "")
+    if needed is None:
+        return False
+    return unique_events >= needed
 
 
 #: Every way a receipt can fail to be current evidence, aggregated. Counts only —
@@ -1784,9 +1921,22 @@ class CampaignLedger:
     #: The scopes already consumed, so the guard can refuse a repeat without
     #: re-reading the directory.
     discovered: tuple[str, ...]
+    #: Each discovered competition's event tags, **in the canonical order the discovery
+    #: published them**. This is how a rank in the register becomes an event: the guard
+    #: reads rank *r* of the competition rather than « the r-th core receipt found »,
+    #: which would depend on a tie-break between two receipts of the same second.
+    discovered_tags: dict[str, tuple[str, ...]]
     core_by_family: dict[str, int]
     additional_by_competition: dict[str, int]
     used_event_tags: dict[str, tuple[str, ...]]
+    #: How many register steps are recognised as a contiguous prefix from step 1. Counts
+    #: alone say *how many* invocations happened and never *which steps they were*; this
+    #: is the answer to the second question, and the only basis for a next step.
+    progress: int = 0
+    #: ``step index → receipt_id`` for each recognised step. The guard reads it to check
+    #: that the parent receipt an operator names is the one the evidence recognises for
+    #: that step — the event tag alone proves the event, never the lineage.
+    recognised_ids: dict[int, str] = dataclasses.field(default_factory=dict)
 
     @property
     def established(self) -> bool:
@@ -1811,10 +1961,23 @@ def _unestablished_ledger(reason: str) -> CampaignLedger:
         conflicts=(),
         unestablished_reason=reason,
         discovered=(),
+        discovered_tags={},
         core_by_family={},
         additional_by_competition={},
         used_event_tags={},
     )
+
+
+def _sort_instant(receipt: Mapping[str, Any]) -> tuple[int, float]:
+    """A receipt's ``recorded_at`` as a comparable instant, unreadable ones last.
+
+    The instant, never its representation: ``12:00:00+02:00`` and ``10:00:00Z`` are the
+    same moment written two ways, and a textual sort would separate them.
+    """
+    moment = _instant(receipt.get("recorded_at"))
+    if moment is None:
+        return (1, 0.0)
+    return (0, moment.astimezone(UTC).timestamp())
 
 
 def campaign_receipts(receipts: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
@@ -1867,6 +2030,7 @@ def campaign_ledger(audit: AuditResult, *, unresolved_intents: int = 0) -> Campa
 
     counts = dict.fromkeys(CAMPAIGN_COMMANDS, 0)
     discovered: list[str] = []
+    discovered_tags: dict[str, tuple[str, ...]] = {}
     core_by_family: dict[str, int] = {}
     additional_by_competition: dict[str, int] = {}
     used: dict[str, list[str]] = {command: [] for command in CAMPAIGN_COMMANDS}
@@ -1874,7 +2038,13 @@ def campaign_ledger(audit: AuditResult, *, unresolved_intents: int = 0) -> Campa
     abort_reason = ""
     abort_at: datetime | None = None
 
-    ordered = sorted(mine, key=lambda receipt: str(receipt.get("recorded_at") or ""))
+    # Ordered by **instant**, not by its text: the same moment can be written with two
+    # UTC offsets, and comparing strings would call them different. Ties keep the order
+    # they were read in, and nothing downstream depends on that: the register is
+    # recognised receipt by receipt in :func:`recognise_register`, which resolves each
+    # step from its own evidence and then *checks* the chronology. Sorting by step number
+    # here is precisely what must not happen — it would make any permutation conforming.
+    ordered = sorted(mine, key=_sort_instant)
     for receipt in ordered:
         command = _text(receipt.get("command")) or ""
         sport = _text(receipt.get("sport_key")) or ""
@@ -1899,6 +2069,15 @@ def campaign_ledger(audit: AuditResult, *, unresolved_intents: int = 0) -> Campa
                     "qu'une fois, et un échec ne rouvre pas sa place"
                 )
             discovered.append(sport)
+            # A tuple as readily as a list: a verified receipt freezes its sequences,
+            # and a reader that only knew about lists would silently publish « this
+            # competition discovered nothing » for every real receipt.
+            raw_tags = receipt.get("event_tags")
+            discovered_tags[sport] = (
+                tuple(tag for tag in raw_tags if isinstance(tag, str))
+                if isinstance(raw_tags, list | tuple)
+                else ()
+            )
         elif command == "core":
             family = campaign_family(sport)
             core_by_family[family] = core_by_family.get(family, 0) + 1
@@ -1944,11 +2123,22 @@ def campaign_ledger(audit: AuditResult, *, unresolved_intents: int = 0) -> Campa
                 f"{limit}, et un dépassement n'est pas un détail comptable"
             )
 
+    # The register is read only once the corpus is otherwise sound. An abort is not a
+    # contradiction — a readable failure consumes its invocation and stops the campaign,
+    # and demanding a success's lineage from it would turn an honest stop into a forged
+    # corpus. Existing conflicts already stop everything, so re-reading the order after
+    # them would add noise, not information.
+    recognised: dict[int, Mapping[str, Any]] = {}
+    progress = 0
+    if not conflicts and not abort_reason:
+        recognised, register_reasons, progress = recognise_register(ordered)
+        conflicts.extend(register_reasons)
+
     if conflicts:
         execution = CampaignExecutionState.CONFLICT
     elif abort_reason:
         execution = CampaignExecutionState.ABORTED
-    elif counts == CAMPAIGN_INVOCATION_LIMITS:
+    elif progress == len(CAMPAIGN_SEQUENCE):
         execution = CampaignExecutionState.COMPLETE
     elif any(counts.values()):
         execution = CampaignExecutionState.IN_PROGRESS
@@ -1963,14 +2153,169 @@ def campaign_ledger(audit: AuditResult, *, unresolved_intents: int = 0) -> Campa
         conflicts=tuple(dict.fromkeys(conflicts)),
         unestablished_reason="",
         discovered=tuple(discovered),
+        discovered_tags=discovered_tags,
         core_by_family=core_by_family,
         additional_by_competition=additional_by_competition,
         used_event_tags={command: tuple(tags) for command, tags in used.items()},
+        progress=progress,
+        recognised_ids={
+            index: _text(receipt.get("receipt_id")) or "" for index, receipt in recognised.items()
+        },
     )
 
 
+def _discovery_step_of(step: CampaignStep) -> int | None:
+    """Which discovery numbers this step's event rank.
+
+    A ``core`` counts ranks in the discovery it names as its parent. An ``additional``
+    inherits the event its parent ``core`` proved, so its ranks are numbered in *that*
+    core's discovery — one hop further back.
+    """
+    if step.command == "core":
+        return step.parent_step
+    if step.command == "additional" and step.parent_step is not None:
+        return CAMPAIGN_SEQUENCE[step.parent_step - 1].parent_step
+    return None
+
+
+def recognise_register(
+    receipts: Sequence[Mapping[str, Any]],
+) -> tuple[dict[int, Mapping[str, Any]], tuple[str, ...], int]:
+    """Match each register step to the one receipt that can only be that step.
+
+    Returns the recognised receipts by step index, the contradictions found, and the
+    length of the contiguous prefix from step 1 — the campaign's position.
+
+    Recognition is by **evidence**, never by position in a listing, by a filename, or by
+    the ``(command, competition)`` pair alone. For a paid step that means four things at
+    once: the command and competition of the register, the event at the *rank* the
+    register names in the applicable discovery's own signed order, and the *identity* of
+    the parent receipt through ``parent_receipt_id``. The independent re-audit 03C-2F ter
+    measured what reading only the first two costs: a ``core`` on an event the register
+    never names, and an ``additional`` attached to the wrong ``core``, both advanced the
+    position in silence, and a corpus with the right totals in the wrong order reached
+    ``COMPLETE`` and the human-promotion gate.
+
+    Chronology is checked, not assumed: a step recorded strictly after one that follows
+    it in the register is a contradiction. The register is **not** used to sort distinct
+    instants back into shape — that would make any permutation look conforming, which is
+    the very fault this function exists to catch.
+    """
+    recognised: dict[int, Mapping[str, Any]] = {}
+    published_tags: dict[int, tuple[str, ...]] = {}
+    claimed: set[int] = set()
+    reasons: list[str] = []
+
+    for step in CAMPAIGN_SEQUENCE:
+        if step.command == "discover":
+            wanted_tag: str | None = None
+            wanted_parent: str | None = None
+        else:
+            parent = recognised.get(step.parent_step or 0)
+            discovery_step = _discovery_step_of(step)
+            if parent is None or discovery_step is None:
+                continue
+            order = published_tags.get(discovery_step, ())
+            rank = step.event_rank or 0
+            if not 0 < rank <= len(order):
+                continue
+            wanted_tag = order[rank - 1]
+            wanted_parent = _text(parent.get("receipt_id"))
+
+        candidates = [
+            position
+            for position, receipt in enumerate(receipts)
+            if position not in claimed
+            and (_text(receipt.get("command")) or "") == step.command
+            and (_text(receipt.get("sport_key")) or "") == step.sport
+            and (wanted_tag is None or _text(receipt.get("event_tag")) == wanted_tag)
+            and (wanted_parent is None or _text(receipt.get("parent_receipt_id")) == wanted_parent)
+        ]
+        if not candidates:
+            continue
+        if len(candidates) > 1:
+            # Never reduced to one arbitrarily: two receipts that both answer to a step
+            # is a question the evidence cannot settle, and picking either would be the
+            # reader choosing on the operator's behalf.
+            reasons.append(
+                f"{len(candidates)} reçus peuvent être l'étape {step.index} de la campagne "
+                "v8 : la preuve n'attribue pas cette étape de façon univoque"
+            )
+            continue
+        position = candidates[0]
+        claimed.add(position)
+        recognised[step.index] = receipts[position]
+        if step.command == "discover":
+            raw = receipts[position].get("event_tags")
+            published_tags[step.index] = (
+                tuple(tag for tag in raw if isinstance(tag, str))
+                if isinstance(raw, list | tuple)
+                else ()
+            )
+
+    progress = 0
+    while progress + 1 in recognised:
+        progress += 1
+
+    ahead = sorted(index for index in recognised if index > progress)
+    if ahead:
+        reasons.append(
+            f"{len(ahead)} étape(s) de la campagne v8 sont attestées alors qu'une étape "
+            "antérieure du registre ne l'est pas : le registre se parcourt dans l'ordre"
+        )
+    orphans = len(receipts) - len(claimed)
+    if orphans:
+        reasons.append(
+            f"{orphans} reçu(s) de campagne ne correspondent à aucune étape du registre "
+            "v8 — commande, compétition, rang d'événement ou reçu parent attendu"
+        )
+
+    chronology = [
+        (index, _instant(recognised[index].get("recorded_at"))) for index in sorted(recognised)
+    ]
+    for (earlier, before), (later, after) in itertools.pairwise(chronology):
+        if before is None or after is None:
+            continue
+        if before.astimezone(UTC) > after.astimezone(UTC):
+            reasons.append(
+                f"l'étape {earlier} de la campagne v8 est enregistrée après l'étape "
+                f"{later}, qui la suit dans le registre : la chronologie contredit l'ordre"
+            )
+
+    return recognised, tuple(dict.fromkeys(reasons)), progress
+
+
+def campaign_next_step(ledger: CampaignLedger) -> CampaignStep | None:
+    """Which step of the register comes next, or ``None`` when nothing may be said.
+
+    ``None`` is a real answer and never a synonym for « step one ». It is returned when
+    the count is not established, when the campaign is stopped or finished, and — the
+    case that matters — when what is on disk is **not a prefix of the register**: a
+    corpus that ran the steps in another order is not a campaign that is somewhere in
+    this one, and inventing a position for it would be the guard choosing on the
+    operator's behalf from evidence that already contradicts the plan.
+    """
+    # Two reasons, each carried by exactly one check. An allow-list of NOT_STARTED and
+    # IN_PROGRESS would have excluded ``UNESTABLISHED`` as well, and the count check
+    # above it would then have been dead: a mutation run removed it and every test
+    # stayed green, because the neighbour was answering in its place. One rule, one
+    # guard, so that disabling either is visible.
+    if not ledger.established:
+        return None
+    if ledger.execution_state in (
+        CampaignExecutionState.COMPLETE,
+        CampaignExecutionState.ABORTED,
+        CampaignExecutionState.CONFLICT,
+    ):
+        return None
+    if ledger.progress >= len(CAMPAIGN_SEQUENCE):
+        return None
+    return CAMPAIGN_SEQUENCE[ledger.progress]
+
+
 def campaign_block(ledger: CampaignLedger) -> dict[str, Any]:
-    """The eight published fields, in one place so two reports cannot disagree."""
+    """The thirteen published fields, in one place so two reports cannot disagree."""
+    step = campaign_next_step(ledger)
     return {
         "campaign_protocol_version": PROVIDER_VALIDATION_PROTOCOL_VERSION,
         "campaign_counts_state": str(ledger.counts_state),
@@ -1982,6 +2327,15 @@ def campaign_block(ledger: CampaignLedger) -> dict[str, Any]:
         "campaign_required_scopes": {
             family: list(scopes) for family, scopes in CAMPAIGN_SCOPES.items()
         },
+        # The next step, published rather than left to be worked out from the counts.
+        # All five are ``None`` together: « the campaign is finished », « it is stopped »
+        # and « what is on disk is not this campaign » are not a step, and must not be
+        # readable as one.
+        "campaign_next_step_index": step.index if step is not None else None,
+        "campaign_next_command": step.command if step is not None else None,
+        "campaign_next_scope": step.sport if step is not None else None,
+        "campaign_next_event_rank": step.event_rank if step is not None else None,
+        "campaign_next_parent_step": step.parent_step if step is not None else None,
     }
 
 

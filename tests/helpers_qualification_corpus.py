@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,10 +26,9 @@ from betmaxxing.providers.the_odds_api import qualification as qual
 #: The protocol 8 manifest, restated. A corpus meant to satisfy every threshold has
 #: to be inside the pre-registered campaign: outside it, every receipt below would
 #: be an evidence conflict and the corpus would prove the opposite of its purpose.
+#: The register's own scopes live in :mod:`helpers_campaign_v8`, which builds the corpus
+#: below; only the bookmaker is needed here, by :func:`receipt`.
 BOOKMAKER = "pinnacle"
-SOCCER = ("soccer_epl", "soccer_spain_la_liga")
-TENNIS = ("tennis_atp_us_open", "tennis_wta_us_open")
-FIVE = list(act.ADDITIONAL_MARKETS)
 
 
 def effective_instant() -> datetime:
@@ -91,52 +90,29 @@ def receipt(
 
 
 def threshold_corpus(secret: str) -> list[dict[str, Any]]:
-    """Eight receipts: enough for all eight criteria, and no more.
+    """The twelve pre-registered invocations: enough for all eight criteria, and no more.
 
     * ``CORE_MAPPING_FOOTBALL`` — three soccer events, two competitions, two days;
     * ``CORE_MAPPING_TENNIS`` — the same for tennis;
     * the five ``ADDITIONAL_MAPPING_FOOTBALL_*`` — two soccer events, two
-      competitions, one day, all five markets mapped;
-    * ``COST_CONFORMITY`` — eight conforming paid calls, above the six required.
+      competitions, all five markets mapped;
+    * ``COST_CONFORMITY`` — eight conforming paid calls, above the six required. The
+      four ``discover`` receipts are unpaid, so they enter no cost bucket.
+
+    Six ``core`` and two ``additional`` were enough while the campaign was only counted.
+    Since 03C-2F quater the position is *recognised* from the receipts, and eight paid
+    steps with no discovery behind them is a corpus no command could have produced: the
+    register would report it as a contradiction, and a corpus meant to satisfy every
+    threshold would prove the opposite of its purpose. So the four discoveries they
+    descend from are here, and every paid step names its parent and its event rank.
+
+    Delegated to :mod:`helpers_campaign_v8` rather than restated: one builder for the
+    register means the campaign suites and the qualification suites cannot disagree
+    about what « conforming » is.
     """
-    day_one = effective_instant() + timedelta(days=1)
-    day_two = day_one + timedelta(days=1)
-    out: list[dict[str, Any]] = []
-    core_plan = [
-        (SOCCER[0], day_one, "a"),
-        (SOCCER[1], day_one, "b"),
-        (SOCCER[0], day_two, "c"),
-        (TENNIS[0], day_one, "d"),
-        (TENNIS[1], day_one, "e"),
-        (TENNIS[0], day_two, "f"),
-    ]
-    for sport, moment, letter in core_plan:
-        out.append(
-            receipt(
-                command="core",
-                status="CORE_LIVE_VERIFIED",
-                sport=sport,
-                moment=moment,
-                tag=letter * 32,
-                markets=["h2h"],
-                credits=1,
-                secret=secret,
-            )
-        )
-    for sport, letter in ((SOCCER[0], "g"), (SOCCER[1], "h")):
-        out.append(
-            receipt(
-                command="additional",
-                status="ADDITIONAL_LIVE_VERIFIED",
-                sport=sport,
-                moment=day_one,
-                tag=letter * 32,
-                markets=FIVE,
-                credits=5,
-                secret=secret,
-            )
-        )
-    return out
+    import helpers_campaign_v8 as v8
+
+    return v8.register_corpus(secret=secret)
 
 
 def write_threshold_corpus(directory: Path, secret: str) -> list[Path]:
@@ -144,7 +120,7 @@ def write_threshold_corpus(directory: Path, secret: str) -> list[Path]:
     directory.mkdir(parents=True, exist_ok=True)
     written = []
     for index, document in enumerate(threshold_corpus(secret)):
-        path = directory / f"20260901T12000{index}-{document['command']}-corpus{index:02d}.json"
+        path = directory / f"20260901T1200{index:02d}-{document['command']}-corpus{index:02d}.json"
         path.write_text(
             json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
             encoding="utf-8",

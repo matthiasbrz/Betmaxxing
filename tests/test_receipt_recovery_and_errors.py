@@ -225,7 +225,9 @@ class TestHostileBytesAreARefusalNotACrash:
         audit = audited_corpus(
             tmp_path / "receipts", [*corpus, hostile], secret=LOCAL, monkeypatch=monkeypatch
         )
-        assert len(audit.batch) == 8
+        # Twelve verified files since 03C-2F quater: the shared corpus is the whole
+        # pre-registered register. The one hostile copy beside them is what is counted.
+        assert len(audit.batch) == 12
         assert audit.unverifiable == 1
 
     def test_the_reporting_path_survives_it_in_both_renderings(
@@ -266,7 +268,7 @@ class TestHostileBytesAreARefusalNotACrash:
         audited_corpus(directory, threshold_corpus(LOCAL), secret=LOCAL, monkeypatch=monkeypatch)
         (directory / "20260901T129999-core-badbytes.json").write_bytes(b"\xff\xfe{}")
         audit = act.audit_receipts()
-        assert len(audit.batch) == 8
+        assert len(audit.batch) == 12
         assert audit.unverifiable == 1
 
 
@@ -402,7 +404,7 @@ class TestEveryPublicationFailureIsReported:
             "receipt_id": ATTEMPT,
             "command": "discover",
             "status": "DISCOVERY_VERIFIED",
-            "recorded_at": "2026-08-04T12:00:00+00:00",
+            "recorded_at": "2026-09-01T12:00:00+00:00",
             "sport_key": "soccer_probe",
         }
         act.write_receipt(dict(document))

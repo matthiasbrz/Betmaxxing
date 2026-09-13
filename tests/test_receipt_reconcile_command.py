@@ -146,6 +146,59 @@ def receipt_of(**over: Any) -> dict[str, Any]:
     return document
 
 
+#: The register's step 1 for :data:`_SPORT`, planted so the ``core`` above is step 2.
+#: Since 03C-2F quater the campaign position is recognised from the receipts, and a paid
+#: receipt with no discovery behind it is a receipt no command could have produced: it
+#: matches no step, and the corpus would be contradictory for a reason that has nothing to
+#: do with the crash window this suite is about. A discovery is free and spends nothing, so
+#: the evidence under test is still exactly one paid event.
+_DISCOVERY_ID = "d0d0d0d0d0d0d0d0"
+
+
+def discovery_of() -> dict[str, Any]:
+    """The signed ``discover`` receipt the ``core`` of :func:`receipt_of` descends from."""
+    now = max(
+        ensure_utc(act._clock()),
+        ensure_utc(datetime.fromisoformat(qual.QUALIFICATION_EVIDENCE_NOT_BEFORE_UTC)),
+    ) - timedelta(hours=1)
+    document: dict[str, Any] = {
+        "schema_version": act.RECEIPT_SCHEMA_VERSION,
+        "qualification_protocol_version": qual.PROVIDER_VALIDATION_PROTOCOL_VERSION,
+        "provider_adapter_evidence_version": qual.PROVIDER_ADAPTER_EVIDENCE_VERSION,
+        "receipt_id": _DISCOVERY_ID,
+        "command": "discover",
+        "status": "DISCOVERY_VERIFIED",
+        "recorded_at": now.isoformat(),
+        "expires_at": (now + timedelta(hours=6)).isoformat(),
+        "sport_key": _SPORT,
+        "bookmaker": _BOOKMAKER,
+        "network_attempted": True,
+        "may_have_reached_provider": True,
+        "attempts": 2,
+        "estimated_credits": 0,
+        "observed_credits": 0,
+        "accounted_credits": 0,
+        "quota_remaining": 400,
+        # The event the `core` addresses is the first of the canonical order, which is the
+        # rank the register names for step 2.
+        "event_tags": [act.event_tag("EV-PROBE-1", LOCAL), act.event_tag("EV-PROBE-2", LOCAL)],
+        "events_returned": 2,
+        "events_in_window": 2,
+        "events_admissible": 2,
+    }
+    document[act.SIGNATURE_FIELD] = act.sign_receipt(document, LOCAL)
+    return document
+
+
+def plant_step_one(directory: Path) -> dict[str, Any]:
+    """Write the register's step 1 and return the lineage fields its child must carry."""
+    publish(directory, discovery_of(), f"20260901T000000-discover-{_DISCOVERY_ID}.json")
+    return {
+        "parent_receipt_id": _DISCOVERY_ID,
+        "parent_schema_version": act.RECEIPT_SCHEMA_VERSION,
+    }
+
+
 def publish(directory: Path, document: dict[str, Any], name: str | None = None) -> Path:
     """Write a receipt the way the audit will find it: a regular, durable file."""
     stem = name or f"20260901T000000-core-{document.get('receipt_id', 'x')}.json"
@@ -261,8 +314,9 @@ class TestTheCrashWindowIsRecoverable:
         assert again["remaining_intents"] == 0
 
     def test_the_artificial_conflict_is_gone_afterwards(self, receipts: Path) -> None:
+        lineage = plant_step_one(receipts)
         act.publish_intent(attempt())
-        publish(receipts, receipt_of())
+        publish(receipts, receipt_of(**lineage))
         document = payload_of(reconcile("--json"))
         assert document["qualification_state"] != "EVIDENCE_CONFLICT"
         recomputed = qual.evaluate(act.audit_receipts(), unresolved_intents=pending())
@@ -271,8 +325,9 @@ class TestTheCrashWindowIsRecoverable:
 
     def test_one_verified_receipt_does_not_qualify_anything(self, receipts: Path) -> None:
         """Recovery is accounting, not evidence: the gate stays shut on one event."""
+        lineage = plant_step_one(receipts)
         act.publish_intent(attempt())
-        publish(receipts, receipt_of())
+        publish(receipts, receipt_of(**lineage))
         document = payload_of(reconcile("--json"))
         assert document["eligible_for_human_promotion_review"] is False
         assert document["qualification_state"] == "INSUFFICIENT_EVIDENCE"
@@ -1052,8 +1107,9 @@ class TestNoCountIsPublishedBeforeItIsTaken:
         self, receipts: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The second pass establishes the directory durably, resolving nothing new."""
+        lineage = plant_step_one(receipts)
         act.publish_intent(attempt())
-        publish(receipts, receipt_of())
+        publish(receipts, receipt_of(**lineage))
         real_fsync = os.fsync
         broken = {"on": True}
 

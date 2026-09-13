@@ -51,6 +51,7 @@ from helpers_activation import (
     odds_payload,
     receipt_path,
     run,
+    spend_the_second_core,
     sports_payload,
 )
 
@@ -511,13 +512,12 @@ class TestNoRawOsErrorReachesTheOperator:
             args = core_args(discovery_receipt=str(receipt_path(workspace, "discover")))
         else:
             assert run(*discover_args()).exit_code == 0
-            assert (
-                run(
-                    *core_args(discovery_receipt=str(receipt_path(workspace, "discover")))
-                ).exit_code
-                == 0
-            )
-            args = additional_args(core_receipt=str(receipt_path(workspace, "core")))
+            discovery = str(receipt_path(workspace, "discover"))
+            assert run(*core_args(discovery_receipt=discovery)).exit_code == 0
+            # Both `core` of the competition come before its `additional` in the
+            # register, and the five-credit step inherits the second of them.
+            parent = spend_the_second_core(monkeypatch, workspace, discovery, headers=PAID)
+            args = additional_args(core_receipt=parent)
 
         install(monkeypatch, Recorder({**paid_routes(), **free_routes()}))
         real_publish = store.SecureDirectory.publish_bytes

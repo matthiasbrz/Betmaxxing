@@ -918,6 +918,112 @@ protocole ultérieur distinct.
 | `core` : 6 invocations | trois par famille | 3 × 2 familles |
 | `additional` : 2 invocations | une par compétition football | 1 × 2 compétitions |
 
+### Le registre des douze étapes
+
+Les plafonds ci-dessus bornaient la campagne sans la décrire. Le préflight statique
+**03C-2F** a mesuré ce qu'ils laissaient ouvert, et a trouvé deux décisions qu'aucun
+document ne prenait :
+
+- la répartition des trois `core` d'une famille entre ses deux compétitions. La garde
+  plafonnait la famille à trois et rien en dessous : `2+1`, `1+2` et `3+0` passaient
+  tous, et l'opérateur tranchait au clavier, la première découverte déjà à l'écran ;
+- **quel** événement chaque `core` utilise. Le runbook le disait franchement —
+  « aucun événement n'est choisi pour vous » — et les seuls contrôles étaient que
+  l'événement figure au reçu de découverte et n'ait pas déjà servi.
+
+Ce sont deux sélections faites sur des données déjà vues, c'est-à-dire exactement la
+faute que **D-082** a consignée contre le choix de compétition de la v7, en plus petit.
+La campagne v8 est donc un **ordre total de douze étapes nommées**, fermé avant le
+premier appel :
+
+| # | Commande | Compétition | Rang d'événement | Parent |
+| --- | --- | --- | --- | --- |
+| 1 | `discover` | `soccer_epl` | — | — |
+| 2 | `core` | `soccer_epl` | 1 | étape 1 |
+| 3 | `core` | `soccer_epl` | 2 | étape 1 |
+| 4 | `additional` | `soccer_epl` | 2 | étape 3 |
+| 5 | `discover` | `soccer_spain_la_liga` | — | — |
+| 6 | `core` | `soccer_spain_la_liga` | 1 | étape 5 |
+| 7 | `additional` | `soccer_spain_la_liga` | 1 | étape 6 |
+| 8 | `discover` | `tennis_atp_us_open` | — | — |
+| 9 | `core` | `tennis_atp_us_open` | 1 | étape 8 |
+| 10 | `core` | `tennis_atp_us_open` | 2 | étape 8 |
+| 11 | `discover` | `tennis_wta_us_open` | — | — |
+| 12 | `core` | `tennis_wta_us_open` | 1 | étape 11 |
+
+**La répartition `2 + 1`** donne l'invocation supplémentaire de chaque famille à la
+compétition nommée **en premier** le 2026-08-24. C'est arbitraire au sens où toute règle
+l'aurait été ; ce qui ne l'est pas, c'est qu'elle soit écrite avant la première réponse
+plutôt qu'après.
+
+**« Rang » est un rang dans l'ordre canonique**, pas un identifiant : le registre est
+écrit quand aucune rencontre n'existe encore, donc il peut nommer « le premier événement
+de la découverte » et jamais « Arsenal–Chelsea ».
+
+`/v4/sports/{sport}/events` ne promet aucun ordre. « Le premier événement retourné » est
+donc une préférence déguisée en règle : rejouez le même appel et le rang peut bouger.
+L'ordre canonique est le couple **(instant du coup d'envoi, identifiant)**, l'identifiant
+comparé en **octets UTF-8** pour que deux machines et deux locales ne puissent pas
+diverger sur deux rencontres simultanées. Un identifiant répété ne compte qu'une fois.
+
+Le classement **dernier** d'un événement dont `commence_time` est illisible est une
+propriété du helper de tri, pas un comportement observable de `discover` : sur le chemin
+de découverte actuel, `_inside()` exige un instant lisible pour retenir un événement, donc
+une date malformée est écartée de la fenêtre **avant** le classement et n'atteint jamais
+l'ordre canonique. La règle reste écrite parce qu'elle décrit le helper sans l'aide de son
+appelant ; ce qu'elle ne décrit pas, c'est un rang que l'opérateur pourrait voir.
+
+**Une découverte trop maigre n'est pas une découverte vérifiée.** Une compétition dont le
+registre demande deux `core` n'est pas servie par une liste d'un seul événement : la
+seconde étape n'aurait aucun événement de rang 2 à viser, et les seules issues seraient
+d'élargir la fenêtre ou de réutiliser le premier — deux substitutions que cette campagne
+s'interdit. `discover` publie donc `COVERAGE_MISSING` à l'étape gratuite, où s'arrêter ne
+coûte rien, plutôt que de laisser la découverte passer pour bonne et l'échec tomber un
+crédit plus tard.
+
+**La fidélité au registre se lit dans les reçus, étape par étape.** `recognise_register`
+attribue chaque étape au seul reçu qui ne peut être qu'elle, et il faut tout à la fois :
+la commande et la compétition du registre, l'événement au **rang** que le registre nomme
+dans l'ordre canonique signé de la découverte applicable, et l'**identité** du reçu parent
+par `parent_receipt_id` comparé à l'identifiant du reçu effectivement reconnu pour l'étape
+parente. Comparer le seul tag d'événement ne démontre pas cette identité : une copie
+exacte d'un reçu garde son identité et sa déduplication, mais un autre reçu n'est pas
+interchangeable parce qu'il porte le même événement. Deux candidats pour une même étape ne
+sont jamais réduits arbitrairement à un seul — la preuve n'attribue pas, donc le lecteur
+refuse. Un reçu de campagne qui ne correspond à aucune étape, une étape attestée alors
+qu'une étape antérieure ne l'est pas, ou une chronologie qui contredit l'ordre du registre
+sont des contradictions établies, pas des preuves faibles.
+
+**La chronologie est le premier ordre**, comparée sur les **instants UTC** de `recorded_at`
+et jamais sur leur représentation : `12:00:00+02:00` et `10:00:00Z` sont le même moment
+écrit deux fois, et un tri textuel les séparerait. À instant **strictement égal** seulement,
+les étapes se départagent par leur rang dans le registre, après vérification de leurs rangs
+et de leurs liens. C'est une convention déterministe appliquée à des étapes déjà compatibles
+avec leurs preuves : une égalité d'horodatage ne prouve aucun ordre physique entre deux
+opérations, et elle n'est pas invoquée pour en inventer un. Un tri global par numéro d'étape
+est précisément ce qui est interdit — il ferait paraître conforme n'importe quelle
+permutation — donc une étape antérieure enregistrée strictement après sa descendante reste
+une contradiction.
+
+`campaign_preflight` détermine l'étape suivante **depuis les reçus vérifiés**, par la même
+lecture que l'évaluateur, et refuse toute commande qui n'y correspond pas exactement —
+commande, compétition, rang d'événement, reçu parent. Il ne devine jamais une position : si
+les reçus présents ne forment pas un début de ce registre, il refuse plutôt que d'inventer
+où l'on en est. Pour un pas payant, le reçu parent est lu — son identité et son rang
+opposés — **avant** la lecture de la clé fournisseur, parce qu'un rang faux ne doit pas
+coûter davantage qu'une commande fausse.
+
+`status --json` publie l'étape suivante en cinq champs : `campaign_next_step_index`,
+`campaign_next_command`, `campaign_next_scope`, `campaign_next_event_rank` et
+`campaign_next_parent_step`. Les cinq clés sont **toujours présentes**, et le rendu humain
+de `status` nomme étape, commande, compétition, rang et étape parente quand ils
+s'appliquent. Ils valent `null` **ensemble** quand il n'y a pas d'étape suivante à dire :
+campagne terminée, arrêtée, en conflit, comptes non établis, ou corpus qui n'est pas un
+début de ce registre. « Je ne sais pas » ne se lit jamais « étape 1 ». Pour une découverte
+à venir, seuls le rang et le parent sont `null` — ce n'est pas l'absence d'étape suivante.
+Rien de tout cela n'autorise un appel : chacune des douze invocations exige son
+autorisation humaine distincte.
+
 `campaign_preflight` vérifie tout cela **avant** la lecture de la clé fournisseur,
 **avant** la publication d'un intent et **avant** toute socket. Un refus laisse zéro
 socket, zéro lecture de clé, zéro intent, zéro reçu, zéro crédit. Le secret de signature

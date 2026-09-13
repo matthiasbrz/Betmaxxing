@@ -397,6 +397,12 @@ class TestAnOutOfManifestCorpusConflicts:
         assert any(FOOTBALL[0] in conflict for conflict in document["evidence_conflicts"])
 
     def test_a_seventh_core_conflicts(self, boundary: Path) -> None:
+        """The evaluator is where the pre-registered ceiling of six stays reachable.
+
+        The guard cannot get here any more — the only non-contradictory corpus with six
+        ``core`` is the finished register — so this is the test that keeps the ceiling
+        itself asserted by name, on the corpus that really holds a seventh.
+        """
         corpus = v8.nominal_campaign()
         corpus.append(
             v8.core(sport=FOOTBALL[0], moment=v8.instant(9), rid="c" * 16, tag="core-tag-99")
@@ -405,6 +411,10 @@ class TestAnOutOfManifestCorpusConflicts:
         document = published(boundary)
         assert document["campaign_execution_state"] == "CONFLICT"
         assert document["qualification_state"] == "EVIDENCE_CONFLICT"
+        assert any(
+            "7 invocations core" in conflict and str(LIMITS["core"]) in conflict
+            for conflict in document["evidence_conflicts"]
+        ), document["evidence_conflicts"]
 
     def test_a_third_additional_conflicts(self, boundary: Path) -> None:
         corpus = v8.nominal_campaign()
@@ -550,8 +560,14 @@ class TestTheGuardRefusesBeforeAnythingIsSpent:
         disabled, a fifth discovery was still refused — by the one-per-competition rule,
         which happens to cover the same case for this manifest. The command stopped, and
         the guard under test had stopped guarding.
+
+        The corpus is the conforming eleven-step prefix rather than four discoveries in a
+        row: since 03C-2F quater the four ``discover`` of the register are steps 1, 5, 8
+        and 11, so four of them with nothing in between is a contradiction and the refusal
+        would be about the contradiction instead of the ceiling. Eleven steps put the
+        fourth discovery legitimately behind us, with the twelfth step still to come.
         """
-        plant(boundary, v8.discoveries(4))
+        plant(boundary, v8.register_corpus(11))
         result, _ = self.refuse(
             boundary,
             monkeypatch,
@@ -574,7 +590,18 @@ class TestTheGuardRefusesBeforeAnythingIsSpent:
     def test_a_seventh_core_is_refused(
         self, boundary: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        plant(boundary, v8.nominal_campaign())
+        """Refused, and the reason is the largest true one: the campaign is finished.
+
+        Until 03C-2F quater this planted six ``core`` with no ``additional`` and asserted
+        the ceiling by name. That corpus is a contradiction now that the position is
+        recognised from the receipts — the register's six ``core`` are steps 2, 3, 6, 9,
+        10 and 12, and steps 4 and 7 sit *between* them — so the only corpus holding six
+        conforming ``core`` is the whole register, and a finished campaign answers before
+        any ceiling. The pre-registered ceiling of six is not weakened: it stays in the
+        guard as a redundant second line, and the evaluator still names it on a corpus
+        that really holds seven — see ``test_a_seventh_core_conflicts``.
+        """
+        plant(boundary, v8.register_corpus())
         result, _ = self.refuse(
             boundary,
             monkeypatch,
@@ -595,9 +622,8 @@ class TestTheGuardRefusesBeforeAnythingIsSpent:
                 "--allow-network",
             ],
         )
-        # The ceiling, named — the per-family rule would refuse this case too.
-        assert "plafond" in result.output.lower()
-        assert str(LIMITS["core"]) in result.output
+        assert "COMPLETE" in result.output
+        assert "douze" in result.output
 
     def test_a_fourth_core_in_one_family_is_refused(
         self, boundary: Path, monkeypatch: pytest.MonkeyPatch
@@ -668,6 +694,103 @@ class TestTheGuardRefusesBeforeAnythingIsSpent:
                 "--allow-network",
             ],
         )
+
+    def test_a_wrong_event_rank_costs_no_key_read(
+        self, boundary: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The rank is opposed **before** the provider key, not after it.
+
+        The command, the competition and the ceilings are answered before the operator's
+        receipt is even opened — a ceiling breach must be reported as a ceiling breach.
+        The rank cannot be: it is only readable once that receipt is loaded. What this
+        pins is that loading it, and refusing on it, still happens on this side of
+        `get_settings` and `_require_key`. A guard moved after the key would leave this
+        refusal identical in every respect except the one that costs something.
+        """
+        tags = [act.event_tag(identifier, v8.SECRET) for identifier in ("EV-RANK-1", "EV-RANK-2")]
+        discovery = v8.discovery(sport=FOOTBALL[0], moment=v8.instant(0), rid="d" * 16)
+        discovery["event_tags"] = list(tags)
+        for field in ("events_returned", "events_in_window", "events_admissible"):
+            discovery[field] = len(tags)
+        v8.sealed_again(discovery)
+        plant(boundary, [discovery])
+        # The receipt must still be inside its six hours when `load_parent` reads it.
+        monkeypatch.setattr(act, "_clock", lambda: v8.instant(1))
+
+        parent = next(
+            str(path)
+            for path in boundary.glob("*.json")
+            if json.loads(path.read_text(encoding="utf-8")).get("command") == "discover"
+        )
+        result, wire = self.refuse(
+            boundary,
+            monkeypatch,
+            [
+                "core",
+                "--sport",
+                FOOTBALL[0],
+                "--bookmaker",
+                BOOKMAKER,
+                # Rank 2 of the discovery, where the register's step 2 is rank 1.
+                "--event-id",
+                "EV-RANK-2",
+                "--discovery-receipt",
+                parent,
+                "--max-credits",
+                "1",
+                "--acknowledge-credits",
+                "1",
+                "--allow-network",
+            ],
+        )
+        assert wire.engaged == {"clé": 0, "intent": 0, "client": 0}, wire.engaged
+        sortie = result.output.lower()
+        assert "rang 1" in sortie, result.output
+        # Attributed to the rank, not to a neighbouring rule that covers the same case.
+        for etranger in ("plafond", "bookmaker de campagne non configuré", "expiré"):
+            assert etranger not in sortie, f"refus attribué à {etranger!r} : {result.output}"
+
+    def test_the_planned_rank_reaches_the_key(
+        self, boundary: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The positive control: without it, any earlier guard satisfies the test above."""
+        tags = [act.event_tag(identifier, v8.SECRET) for identifier in ("EV-RANK-1", "EV-RANK-2")]
+        discovery = v8.discovery(sport=FOOTBALL[0], moment=v8.instant(0), rid="d" * 16)
+        discovery["event_tags"] = list(tags)
+        for field in ("events_returned", "events_in_window", "events_admissible"):
+            discovery[field] = len(tags)
+        v8.sealed_again(discovery)
+        plant(boundary, [discovery])
+        monkeypatch.setattr(act, "_clock", lambda: v8.instant(1))
+
+        parent = next(
+            str(path)
+            for path in boundary.glob("*.json")
+            if json.loads(path.read_text(encoding="utf-8")).get("command") == "discover"
+        )
+        wire = Tripwire()
+        wire.install(monkeypatch)
+        result = runner.invoke(
+            act.app,
+            [
+                "core",
+                "--sport",
+                FOOTBALL[0],
+                "--bookmaker",
+                BOOKMAKER,
+                "--event-id",
+                "EV-RANK-1",
+                "--discovery-receipt",
+                parent,
+                "--max-credits",
+                "1",
+                "--acknowledge-credits",
+                "1",
+                "--allow-network",
+            ],
+        )
+        assert wire.key_reads == 1, f"l'étape prévue n'a pas atteint la clé : {result.output}"
+        assert wire.intents == 0 and wire.clients == 0
 
     def test_counts_that_cannot_be_established_refuse_the_call(
         self, boundary: Path, monkeypatch: pytest.MonkeyPatch
@@ -816,44 +939,72 @@ class TestTheCampaignBookmakerMustBeConfiguredForTheParser:
             monkeypatch.setenv(BOOKMAKERS_VARIABLE, value)
         reset_settings_cache()
 
-    def plant_reachable(self, boundary: Path) -> tuple[str, str]:
-        """A corpus that reaches this guard and nothing else, plus its two parents.
+    #: The two events the planted discovery lists, in canonical rank order. Their tags
+    #: are the real HMAC of these identifiers, so the register's rank check reads the
+    #: same value the command line produces rather than a synthetic placeholder.
+    GUARD_EVENTS = ("EV-GUARD-1", "EV-GUARD-2")
 
-        Three discoveries and one `core`, so no ceiling, no duplicate scope, no abort
-        and no conflict can refuse first — the fourth scope is deliberately left free so
-        that a `discover` has somewhere to go. The parents named on the
-        command line are files *of that corpus*: an extra receipt written beside it
-        would be a second discovery of one competition, and the campaign would be in
-        CONFLICT before this guard was ever consulted.
+    def plant_reachable(self, boundary: Path, command: str) -> tuple[str, str]:
+        """A corpus that puts ``command`` exactly at the register's next step.
 
-        Neither parent is ever read on these paths — the provider key, and therefore the
-        tripwire, comes first — but the corpus has to be genuinely complete for the
-        refusal to be attributable to this rule alone.
+        One corpus could serve all three while the guard only counted; since the twelve
+        steps are a closed order, only one command is ever next, so each gets the prefix
+        that makes it the one. The parents named on the command line are files *of that
+        prefix*: an extra receipt written beside it would be a second invocation of a
+        step already taken, and the campaign would be in CONFLICT before this guard was
+        ever consulted.
         """
-        receipts = [
-            v8.discovery(sport=sport, moment=v8.instant(index), rid=f"d{index:015x}")
-            for index, sport in enumerate(COMPETITIONS[:3])
-        ]
-        receipts.append(
-            v8.core(sport=FOOTBALL[0], moment=v8.instant(10), rid="c" * 16, tag="parent-tag")
-        )
+        tags = [act.event_tag(identifier, v8.SECRET) for identifier in self.GUARD_EVENTS]
+        discovery = v8.discovery(sport=FOOTBALL[0], moment=v8.instant(0), rid="d" * 16)
+        discovery["event_tags"] = list(tags)
+        for field in ("events_returned", "events_in_window", "events_admissible"):
+            discovery[field] = len(tags)
+        v8.sealed_again(discovery)
+
+        receipts = [discovery]
+        if command != "core":
+            # Each `core` names the discovery it descends from, and the `additional` names
+            # the `core` that proved its event: since 03C-2F quater the register is
+            # recognised from the receipts, and a chain with no `parent_receipt_id` is
+            # attributed to no step at all — the corpus would be in CONFLICT and this
+            # guard would never be consulted.
+            receipts += [
+                v8.core(
+                    sport=FOOTBALL[0],
+                    moment=v8.instant(1 + rank),
+                    rid=f"c{rank:015x}",
+                    tag=tag,
+                    parent_rid=discovery["receipt_id"],
+                )
+                for rank, tag in enumerate(tags)
+            ]
+        if command == "discover":
+            receipts.append(
+                v8.additional(
+                    sport=FOOTBALL[0],
+                    moment=v8.instant(4),
+                    rid="e" * 16,
+                    tag=tags[-1],
+                    parent_rid=f"c{len(tags) - 1:015x}",
+                )
+            )
         plant(boundary, receipts)
+
         found: dict[str, str] = {}
-        for path in boundary.glob("*.json"):
+        for path in sorted(boundary.glob("*.json")):
             document = json.loads(path.read_text(encoding="utf-8"))
-            if document.get("sport_key") == FOOTBALL[0]:
-                found[str(document["command"])] = str(path)
-        return found["discover"], found["core"]
+            found[str(document.get("command"))] = str(path)
+        return found["discover"], found.get("core", "")
 
     def argv(self, command: str, boundary: Path) -> list[str]:
-        discovery, core = self.plant_reachable(boundary)
+        discovery, core = self.plant_reachable(boundary, command)
         common = ["--sport", FOOTBALL[0], "--bookmaker", BOOKMAKER, "--allow-network"]
         if command == "discover":
-            # The one scope the corpus above leaves undiscovered.
+            # The scope the register puts next once the first competition is finished.
             return [
                 "discover",
                 "--sport",
-                COMPETITIONS[3],
+                COMPETITIONS[1],
                 "--bookmaker",
                 BOOKMAKER,
                 "--allow-network",
@@ -863,7 +1014,7 @@ class TestTheCampaignBookmakerMustBeConfiguredForTheParser:
                 "core",
                 *common,
                 "--event-id",
-                "EV-GUARD-1",
+                self.GUARD_EVENTS[0],
                 "--discovery-receipt",
                 discovery,
                 "--max-credits",
@@ -875,7 +1026,7 @@ class TestTheCampaignBookmakerMustBeConfiguredForTheParser:
             "additional",
             *common,
             "--event-id",
-            "EV-GUARD-2",
+            self.GUARD_EVENTS[1],
             "--core-receipt",
             core,
             "--max-credits",
@@ -932,19 +1083,29 @@ class TestTheCampaignBookmakerMustBeConfiguredForTheParser:
         command: str,
         configured: str,
     ) -> None:
-        """It must reach the key tripwire — otherwise the test above proves nothing.
+        """This guard must *stop* refusing — otherwise the test above proves nothing.
 
-        Without this, every refusal above would be satisfied by *any* earlier guard, and
-        a check that never runs would look exactly like a check that always passes.
+        Without it, every refusal above would be satisfied by *any* earlier guard, and a
+        check that never runs would look exactly like a check that always passes. What
+        all three commands assert is therefore that the refusal is no longer **this**
+        one, which is the only thing the configuration changed.
+
+        `discover` additionally reaches the key tripwire, which is what shows the guard
+        is passable at all. `core` and `additional` stop just short of it since
+        03C-2F bis: their parent receipt is read, and the register's rank and parent
+        opposed, *before* the provider key — so a planted parent that has outlived its
+        six hours refuses on its expiry, one step earlier than it used to.
         """
         argv = self.argv(command, boundary)
         self.configure(monkeypatch, configured)
         wire = Tripwire()
         wire.install(monkeypatch)
         result = runner.invoke(act.app, argv)
-        assert wire.key_reads == 1, (
-            f"la commande n'a pas atteint la lecture de clé : {result.output}"
-        )
+        assert "bookmaker de campagne non configuré pour le parser" not in result.output.lower()
+        if command == "discover":
+            assert wire.key_reads == 1, (
+                f"la commande n'a pas atteint la lecture de clé : {result.output}"
+            )
         assert wire.intents == 0 and wire.clients == 0
 
     def test_the_refusal_never_echoes_the_configured_value(

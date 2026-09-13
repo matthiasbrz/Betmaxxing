@@ -98,7 +98,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import typer
@@ -130,6 +130,9 @@ from betmaxxing.providers.the_odds_api.provider import (
     _last_update_of,
     additional_markets_for,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - `qualification` imports this module at runtime
+    from .qualification import CampaignLedger, CampaignStep
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1384,7 +1387,12 @@ def _signing_secret() -> str:
 
 
 def campaign_preflight(
-    command: str, *, sport: str, bookmaker: str, event_tag_value: str | None = None
+    command: str,
+    *,
+    sport: str,
+    bookmaker: str,
+    event_tag_value: str | None = None,
+    parent: dict[str, Any] | None = None,
 ) -> None:
     """Refuse a network command the pre-registered campaign does not authorise.
 
@@ -1398,6 +1406,19 @@ def campaign_preflight(
     a prose table nothing consulted. The static audit 03C-2D bis showed the
     consequence by measurement: an overrun of the four allocated discoveries was
     indistinguishable, in every published field, from a conforming corpus.
+
+    Since 03C-2F bis it also opposes the **register**: the campaign is twelve named
+    steps in one order, and this function refuses any command that is not the next of
+    them — wrong command, wrong competition, wrong event rank, wrong parent receipt.
+    The static preflight 03C-2F had found the two holes the counts alone left open: a
+    family capped at three ``core`` accepted ``2+1`` and ``1+2`` alike, and no rule at
+    all said *which* discovered event a ``core`` should address. Both were selections
+    made on data already seen, which is the fault **D-082** recorded against protocol 7.
+
+    ``parent`` is the receipt the operator named for a paid step, already loaded and
+    verified. It is optional because the ceilings must be answered *before* that file is
+    opened — « the core ceiling is reached » and « your receipt path does not exist »
+    are different findings, and the operator is owed the first one when it is true.
     """
     from .qualification import (
         CAMPAIGN_ADDITIONAL_PER_COMPETITION,
@@ -1407,6 +1428,7 @@ def campaign_preflight(
         CampaignExecutionState,
         campaign_family,
         campaign_ledger,
+        campaign_next_step,
         campaign_scopes_for,
     )
 
@@ -1474,12 +1496,43 @@ def campaign_preflight(
             "réseau n'est autorisée, et un échec ne crée aucun droit de relance."
         )
 
+    # Before the per-command ceiling, because a finished campaign is a finished
+    # campaign: every command is at its ceiling once the twelve steps are done, and
+    # « le plafond core est atteint » would be a true but much smaller thing to say.
+    if ledger.execution_state is CampaignExecutionState.COMPLETE:
+        refuse(
+            "La campagne v8 est COMPLETE : les douze invocations préenregistrées ont "
+            "toutes été faites. Une treizième n'en fait pas partie ; la suite est une "
+            "lecture des reçus, pas un appel de plus."
+        )
+
     limit = CAMPAIGN_INVOCATION_LIMITS[command]
     if ledger.counts[command] >= limit:
         refuse(
             f"Le plafond préenregistré de {limit} invocation(s) {command} est déjà atteint "
             f"({ledger.counts[command]}). Un échec consomme sa place et n'ouvre aucun "
             "remplacement."
+        )
+
+    step = campaign_next_step(ledger)
+    if step is None:
+        refuse(
+            "La position de la campagne v8 dans son registre de douze étapes n'est pas "
+            "déterminée : les reçus présents n'en forment pas un début. Aucune étape n'est "
+            "devinée à partir des seuls compteurs, et aucune requête n'est émise."
+        )
+        return
+    if step.command != command:
+        refuse(
+            f"L'étape {step.index} de la campagne v8 est {step.command} sur {step.sport} ; "
+            f"{command} n'est pas cette étape. Le registre des douze invocations est fermé "
+            "et ne se réordonne pas en cours de route."
+        )
+    if step.sport != sport:
+        refuse(
+            f"L'étape {step.index} de la campagne v8 est {step.command} sur {step.sport} ; "
+            f"{sport} n'est pas cette compétition. Aucune substitution n'est faite, et une "
+            "compétition sautée ne se rattrape pas."
         )
 
     if command == "discover":
@@ -1507,6 +1560,84 @@ def campaign_preflight(
         refuse(
             f"Cet événement a déjà fait l'objet d'un appel {command}. Rejouer un événement "
             "ne rapproche d'aucun seuil et n'était pas autorisé deux fois."
+        )
+
+    if parent is not None:
+        _campaign_parent_preflight(
+            step, ledger, sport=sport, event_tag_value=event_tag_value, parent=parent
+        )
+
+
+def _text_or_empty(value: object) -> str:
+    """A receipt field as a string, or ``""`` — never a silent match on ``None``."""
+    return value if isinstance(value, str) else ""
+
+
+def _campaign_parent_preflight(
+    step: CampaignStep,
+    ledger: CampaignLedger,
+    *,
+    sport: str,
+    event_tag_value: str | None,
+    parent: dict[str, Any],
+) -> None:
+    """The half of the register that needs the parent receipt in hand.
+
+    Separate because of the order it has to run in, not because it is a different rule:
+    the ceilings answer before the operator's file is opened, and the event rank cannot
+    be read until it is. Both halves are still entirely local — one directory, one HMAC,
+    no key, no intent, no socket — so the whole register is opposed for free.
+    """
+    from .qualification import CAMPAIGN_CORE_BY_COMPETITION, discovery_is_sufficient
+
+    def refuse(message: str) -> None:
+        raise Refused(ActivationStatus.PREPARED_NOT_EXECUTED, message)
+
+    rank = step.event_rank
+    if rank is None or step.parent_step is None:
+        return
+
+    # The same identity the evaluator recognised for the parent step. A receipt carrying
+    # the right event is not the right receipt: `parent_receipt_id` is what chains the
+    # steps, and comparing tags alone let another receipt on the same event stand in.
+    expected_parent = ledger.recognised_ids.get(step.parent_step)
+    if expected_parent is None or _text_or_empty(parent.get("receipt_id")) != expected_parent:
+        refuse(
+            f"L'étape {step.index} de la campagne v8 s'appuie sur le reçu de l'étape "
+            f"{step.parent_step} reconnu sur cette frontière ; le reçu fourni n'est pas "
+            "celui-là. Un même événement ne rend pas deux reçus interchangeables, et la "
+            "chaîne des preuves ne se recompose pas après coup."
+        )
+
+    if step.command == "core":
+        raw = parent.get("event_tags")
+        tags = [tag for tag in raw if isinstance(tag, str)] if isinstance(raw, list | tuple) else []
+        # Read before the rank is indexed: a listing too thin to serve this competition's
+        # own steps has to stop the campaign here, where it is free, rather than one
+        # credit later when the second `core` finds no second event to address. On the
+        # nominal path `run_discovery` has already refused to publish such a discovery;
+        # this is the second line, because the parent is a file the operator names.
+        if not discovery_is_sufficient(sport, len(tags)):
+            refuse(
+                f"La découverte parente n'a retenu que {len(tags)} événement(s) pour "
+                f"{sport}, dont le registre de la campagne v8 en demande "
+                f"{CAMPAIGN_CORE_BY_COMPETITION.get(sport, 0)}. Ni fenêtre élargie, ni "
+                "événement réutilisé, ni compétition substituée : la campagne s'arrête ici."
+            )
+        if event_tag_value != tags[rank - 1]:
+            refuse(
+                f"L'étape {step.index} de la campagne v8 porte sur l'événement de rang "
+                f"{rank} de l'ordre canonique de la découverte parente ; l'événement fourni "
+                "n'est pas celui-là. Aucun événement n'est choisi pour vous et aucun n'est "
+                "substitué — le rang était fixé avant la réponse du fournisseur."
+            )
+        return
+
+    if step.command == "additional" and event_tag_value != _text_or_empty(parent.get("event_tag")):
+        refuse(
+            f"L'étape {step.index} de la campagne v8 porte sur l'événement déjà prouvé "
+            f"par l'étape {step.parent_step} ; l'événement fourni en est un autre. Cinq "
+            "crédits ne se dépensent que là où un seul a déjà réussi."
         )
 
 
@@ -2527,6 +2658,8 @@ def run_discovery(
     attempt: Attempt, settings: Settings, secret: str, signing: str
 ) -> tuple[dict[str, Any], ActivationStatus]:
     """The two documented-free endpoints, and nothing else."""
+    from .qualification import canonical_event_order, discovery_is_sufficient
+
     client = _client(settings, secret, ledger=None)
 
     attempt.record("/v4/sports")
@@ -2558,6 +2691,11 @@ def run_discovery(
     )
     _settle_cost(attempt, listing.quota, endpoint)
 
+    # Canonically ordered before anything is numbered. `/v4/sports/{sport}/events`
+    # promises no order, so « the first event returned » is a preference that can move
+    # between two identical calls; the campaign's register names *ranks*, and a rank has
+    # to mean the same thing on every machine and every replay. Ordering here is what
+    # makes the paid steps addressable in advance instead of chosen off a screen.
     attempt.events = [
         {
             "id": str(item["id"]),
@@ -2565,7 +2703,7 @@ def run_discovery(
             "home_team": str(item.get("home_team", "")),
             "away_team": str(item.get("away_team", "")),
         }
-        for item in _count_the_funnel(attempt, listing.payload)
+        for item in canonical_event_order(_count_the_funnel(attempt, listing.payload))
     ]
     # Deduplicated: a provider repeating an event must not inflate the count.
     attempt.event_tags = list(dict.fromkeys(event_tag(e["id"], signing) for e in attempt.events))
@@ -2576,8 +2714,33 @@ def run_discovery(
             _discovery_reason(attempt),
             build_receipt(attempt, ActivationStatus.COVERAGE_MISSING, secret),
         )
+    if not discovery_is_sufficient(attempt.sport, attempt.events_admissible):
+        raise Refused(
+            ActivationStatus.COVERAGE_MISSING,
+            _thin_discovery_reason(attempt),
+            build_receipt(attempt, ActivationStatus.COVERAGE_MISSING, secret),
+        )
     return build_receipt(attempt, ActivationStatus.DISCOVERY_VERIFIED, secret), (
         ActivationStatus.DISCOVERY_VERIFIED
+    )
+
+
+def _thin_discovery_reason(attempt: Attempt) -> str:
+    """A listing that cannot serve this competition's own steps is not a verification.
+
+    Said at the free step, where stopping costs nothing. The alternative is to publish
+    ``DISCOVERY_VERIFIED`` over a listing of one, spend a credit on the first `core`, and
+    discover at the second that the register's rank 2 has no event to point at — with the
+    only ways forward being a wider window or a reused event, both of them substitutions
+    this campaign pre-registered itself against.
+    """
+    from .qualification import CAMPAIGN_CORE_BY_COMPETITION
+
+    needed = CAMPAIGN_CORE_BY_COMPETITION.get(attempt.sport, 0)
+    return (
+        f"{attempt.events_admissible} événement(s) exploitable(s) pour {attempt.sport}, "
+        f"et le registre de la campagne v8 en demande {needed}. La fenêtre n'est pas "
+        "élargie, aucun événement n'est réutilisé et aucune compétition n'est substituée."
     )
 
 
@@ -2850,9 +3013,10 @@ def core(
             bookmaker=one_book,
             event_tag_value=event_tag(one_event, signing),
         )
-        settings = get_settings()
-        secret = _require_key(settings)
-
+        # The parent is read before the key, and the register is opposed a second time
+        # with it in hand. Both halves stay on this side of `get_settings`: the event's
+        # rank is as much a pre-registered thing as the command and the competition, and
+        # a rank that is wrong must cost no key read, no intent and no socket either.
         now = _clock()
         parent = load_parent(
             discovery_receipt,
@@ -2864,6 +3028,15 @@ def core(
             now=now,
         )
         _check_discovery(parent, one_event, discovery_receipt, signing)
+        campaign_preflight(
+            "core",
+            sport=one_sport,
+            bookmaker=one_book,
+            event_tag_value=event_tag(one_event, signing),
+            parent=parent,
+        )
+        settings = get_settings()
+        secret = _require_key(settings)
 
         attempt = Attempt(
             command="core",
@@ -3071,9 +3244,9 @@ def additional(
             bookmaker=one_book,
             event_tag_value=event_tag(one_event, signing),
         )
-        settings = get_settings()
-        secret = _require_key(settings)
-
+        # Same two-step reading as `core`, and for the same reason: which `core` receipt
+        # this call inherits from is written in the register, and checking it is a local
+        # file comparison that must not be paid for with a key read.
         now = _clock()
         parent = load_parent(
             core_receipt,
@@ -3085,6 +3258,15 @@ def additional(
             now=now,
         )
         _check_core(parent, one_event, core_receipt, signing)
+        campaign_preflight(
+            "additional",
+            sport=one_sport,
+            bookmaker=one_book,
+            event_tag_value=event_tag(one_event, signing),
+            parent=parent,
+        )
+        settings = get_settings()
+        secret = _require_key(settings)
 
         attempt = Attempt(
             command="additional",
@@ -3515,6 +3697,17 @@ def build_activation_state(audit: receipt_store.AuditResult) -> dict[str, Any]:
         "campaign_abort_reason": qualification["campaign_abort_reason"],
         "campaign_required_bookmaker": qualification["campaign_required_bookmaker"],
         "campaign_required_scopes": qualification["campaign_required_scopes"],
+        # The next step, projected from the same evaluation of the same audit — not
+        # recomputed here from the counters. The independent re-audit 03C-2F ter measured
+        # what the omission cost: `evaluate()` had the five fields, this projection did
+        # not, and the runbook sent the operator to `status --json` to read five keys the
+        # command never emitted. Absent and `null` are different answers, so all five are
+        # always present.
+        "campaign_next_step_index": qualification["campaign_next_step_index"],
+        "campaign_next_command": qualification["campaign_next_command"],
+        "campaign_next_scope": qualification["campaign_next_scope"],
+        "campaign_next_event_rank": qualification["campaign_next_event_rank"],
+        "campaign_next_parent_step": qualification["campaign_next_parent_step"],
         "campaign_note": qualification["campaign_note"],
         "qualification_note": qualification["qualification_note"],
         "scope_note": (
@@ -3528,6 +3721,53 @@ def build_activation_state(audit: receipt_store.AuditResult) -> dict[str, Any]:
 def _reason_suffix(document: Mapping[str, Any]) -> str:
     reason = document.get("receipt_boundary_reason") or ""
     return f" ({reason})" if reason else ""
+
+
+def campaign_lines(document: Mapping[str, Any]) -> list[str]:
+    """The campaign's position, rendered for a terminal.
+
+    It reports and never authorises: it names the step the register puts next, or says
+    that none is determinable and why, and it stops there. Each of the twelve invocations
+    needs its own explicit authorisation, which no reading of the boundary can grant.
+    """
+    lines = [
+        "",
+        f"Campagne v{document['campaign_protocol_version']} — "
+        f"{document['campaign_execution_state']} "
+        f"(comptes {document['campaign_counts_state']})",
+    ]
+    counts = document["campaign_invocation_counts"]
+    if counts is None:
+        lines.append("  invocations : non établies — aucun compte n'est publié")
+    else:
+        limits = document["campaign_invocation_limits"]
+        spent = ", ".join(f"{name} {counts[name]}/{limits[name]}" for name in sorted(counts))
+        lines.append(f"  invocations : {spent}")
+
+    index = document["campaign_next_step_index"]
+    if index is None:
+        lines.append(
+            f"  étape suivante : aucune n'est déterminable — {document['campaign_execution_state']}"
+        )
+        if document["campaign_abort_reason"]:
+            lines.append(f"  abandon : {document['campaign_abort_reason']}")
+    else:
+        rank = document["campaign_next_event_rank"]
+        parent = document["campaign_next_parent_step"]
+        detail = (
+            f"événement de rang {rank} du reçu de l'étape {parent}"
+            if rank is not None and parent is not None
+            else "aucun événement — la commande en découvre la liste"
+        )
+        lines.append(
+            f"  étape suivante : {index} — {document['campaign_next_command']} sur "
+            f"{document['campaign_next_scope']}, {detail}"
+        )
+        lines.append(
+            "  cette ligne est un constat : chaque invocation exige son autorisation "
+            "humaine distincte."
+        )
+    return lines
 
 
 def status_lines(document: Mapping[str, Any]) -> list[str]:
@@ -3595,6 +3835,7 @@ def status_lines(document: Mapping[str, Any]) -> list[str]:
             )
     else:
         lines.append("Aucune observation de couverture enregistrée.")
+    lines += campaign_lines(document)
     from .qualification import summary_lines
 
     lines += summary_lines(document)

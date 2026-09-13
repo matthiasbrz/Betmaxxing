@@ -42,6 +42,44 @@ FOREIGN_COMPETITION = "soccer_france_ligue_one"
 
 FIVE = tuple(act.ADDITIONAL_MARKETS)
 
+#: The pre-registered order of the twelve invocations:
+#: ``(index, command, competition, event rank, parent step)``. Literals for the same
+#: reason as the manifest above — a builder that read ``CAMPAIGN_SEQUENCE`` would call
+#: « conforming » whatever order that object happened to hold. Since 03C-2F quater the
+#: position is *recognised* from the receipts, so a corpus is only conforming when its
+#: event ranks, its ``parent_receipt_id`` chain and its chronology all agree with this
+#: table; ``tests/test_campaign_register_fidelity_v8.py`` restates it once more on
+#: purpose, because a closure proof's oracle must not be this builder's twin.
+REGISTER: tuple[tuple[int, str, str, int | None, int | None], ...] = (
+    (1, "discover", "soccer_epl", None, None),
+    (2, "core", "soccer_epl", 1, 1),
+    (3, "core", "soccer_epl", 2, 1),
+    (4, "additional", "soccer_epl", 2, 3),
+    (5, "discover", "soccer_spain_la_liga", None, None),
+    (6, "core", "soccer_spain_la_liga", 1, 5),
+    (7, "additional", "soccer_spain_la_liga", 1, 6),
+    (8, "discover", "tennis_atp_us_open", None, None),
+    (9, "core", "tennis_atp_us_open", 1, 8),
+    (10, "core", "tennis_atp_us_open", 2, 8),
+    (11, "discover", "tennis_wta_us_open", None, None),
+    (12, "core", "tennis_wta_us_open", 1, 11),
+)
+
+#: Events per synthetic discovery. Three, so a rank the register never names exists and
+#: a corpus can aim at it deliberately.
+REGISTER_EVENTS = 3
+
+#: A UTC day per step, so that each family's three ``core`` span two days — which
+#: ``CORE_MAPPING_FOOTBALL`` and ``CORE_MAPPING_TENNIS`` require — while the register's
+#: own order stays chronologically increasing. Football's cores are steps 2, 3 and 6,
+#: tennis's are 9, 10 and 12, so the two boundaries fall between 5 and 6 and between 10
+#: and 11: a single boundary anywhere would leave one of the two families inside one day.
+REGISTER_DAYS: dict[int, int] = {
+    **dict.fromkeys(range(1, 6), 0),
+    **dict.fromkeys(range(6, 11), 1),
+    **dict.fromkeys(range(11, 13), 2),
+}
+
 
 def instant(offset_hours: int = 0) -> datetime:
     """An instant inside the campaign's evidence window."""
@@ -149,6 +187,7 @@ def paid(
     bookmaker: str = BOOKMAKER,
     protocol: int = 8,
     secret: str = SECRET,
+    parent_rid: str | None = None,
 ) -> dict[str, Any]:
     """A ``core`` or ``additional`` receipt in the ``CLASSIFIED`` phase."""
     payload = _spine(
@@ -178,11 +217,21 @@ def paid(
             "bookmaker_state": "OBSERVED",
         }
     )
+    # The lineage the real producer always writes. Protocol 8's schema 4 carries
+    # `parent_receipt_id`, and since the register is read from the receipts the
+    # identity of the parent is evidence, not decoration: a corpus that omitted it
+    # would be a corpus no `core` or `additional` command could ever have produced.
+    if parent_rid is not None:
+        payload["parent_receipt_id"] = parent_rid
+        payload["parent_schema_version"] = act.RECEIPT_SCHEMA_VERSION
     return _sealed(payload, secret)
 
 
-def core(*, sport: str, moment: datetime, rid: str, tag: str, **over: Any) -> dict[str, Any]:
+def core(
+    *, sport: str, moment: datetime, rid: str, tag: str, parent_rid: str | None = None, **over: Any
+) -> dict[str, Any]:
     return paid(
+        parent_rid=parent_rid,
         command="core",
         status=over.pop("status", "CORE_LIVE_VERIFIED"),
         sport=sport,
@@ -195,8 +244,11 @@ def core(*, sport: str, moment: datetime, rid: str, tag: str, **over: Any) -> di
     )
 
 
-def additional(*, sport: str, moment: datetime, rid: str, tag: str, **over: Any) -> dict[str, Any]:
+def additional(
+    *, sport: str, moment: datetime, rid: str, tag: str, parent_rid: str | None = None, **over: Any
+) -> dict[str, Any]:
     return paid(
+        parent_rid=parent_rid,
         command="additional",
         status=over.pop("status", "ADDITIONAL_LIVE_VERIFIED"),
         sport=sport,
@@ -229,39 +281,85 @@ def historical_v7_discovery(moment: datetime | None = None) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Whole corpora
 # ---------------------------------------------------------------------------
-def nominal_campaign() -> list[dict[str, Any]]:
-    """Exactly 4 + 6 + 2, every scope used once, every threshold reachable."""
-    out: list[dict[str, Any]] = []
-    for index, sport in enumerate(COMPETITIONS):
-        out.append(discovery(sport=sport, moment=instant(index), rid=f"d{index:015x}"))
-    # Three core per family, spread over both competitions and two UTC days.
-    plan = [
-        (FOOTBALL[0], 0),
-        (FOOTBALL[1], 0),
-        (FOOTBALL[0], 1),
-        (TENNIS[0], 0),
-        (TENNIS[1], 0),
-        (TENNIS[0], 1),
+def register_rid(step: int) -> str:
+    """The receipt identifier the synthetic corpus gives to a register step."""
+    return f"{step:016x}"
+
+
+def register_tags(step: int, count: int = REGISTER_EVENTS) -> list[str]:
+    """The event tags the discovery of ``step`` publishes, in canonical rank order.
+
+    The same construction :func:`discovery` uses, restated so a caller can name the rank
+    it wants — including the third, which the register never names.
+    """
+    return [f"{register_rid(step)}{position:02d}" for position in range(count)]
+
+
+def _numbering_discovery(step: int) -> int:
+    """Which discovery numbers this paid step's event rank.
+
+    A ``core`` counts ranks in the discovery it names as its parent. An ``additional``
+    inherits the event its parent ``core`` proved, so its rank is numbered in *that*
+    core's discovery — one hop further back.
+    """
+    _, command, _, _, parent = REGISTER[step - 1]
+    assert parent is not None
+    if command == "core":
+        return parent
+    grandparent = REGISTER[parent - 1][4]
+    assert grandparent is not None
+    return grandparent
+
+
+def register_receipt(
+    step: int,
+    *,
+    secret: str = SECRET,
+    day: int = 0,
+    events: int = REGISTER_EVENTS,
+) -> dict[str, Any]:
+    """The receipt a conforming invocation of register step ``step`` would publish."""
+    index, command, sport, rank, parent = REGISTER[step - 1]
+    moment = instant(index + 24 * day)
+    if command == "discover":
+        return discovery(
+            sport=sport, moment=moment, rid=register_rid(index), events=events, secret=secret
+        )
+    assert rank is not None and parent is not None
+    maker = core if command == "core" else additional
+    return maker(
+        sport=sport,
+        moment=moment,
+        rid=register_rid(index),
+        tag=register_tags(_numbering_discovery(index))[rank - 1],
+        parent_rid=register_rid(parent),
+        secret=secret,
+    )
+
+
+def register_corpus(
+    upto: int = len(REGISTER),
+    *,
+    secret: str = SECRET,
+    days: dict[int, int] | None = None,
+) -> list[dict[str, Any]]:
+    """The first ``upto`` steps of the register, conforming in every respect.
+
+    Conforming means all of it at once, since 03C-2F quater: the command and competition
+    of each step, the event at the rank the register names in the applicable discovery's
+    own signed order, the identity of the parent receipt, and a chronology that agrees
+    with the order. Any corpus short of that is a contradiction, not weak evidence.
+    """
+    schedule = REGISTER_DAYS if days is None else days
+    return [
+        register_receipt(step[0], secret=secret, day=schedule.get(step[0], 0))
+        for step in REGISTER[:upto]
     ]
-    for index, (sport, day) in enumerate(plan):
-        out.append(
-            core(
-                sport=sport,
-                moment=instant(24 * day + index),
-                rid=f"c{index:015x}",
-                tag=f"core-tag-{index:02d}",
-            )
-        )
-    for index, sport in enumerate(FOOTBALL):
-        out.append(
-            additional(
-                sport=sport,
-                moment=instant(index),
-                rid=f"e{index:015x}",
-                tag=f"add-tag-{index:02d}",
-            )
-        )
-    return out
+
+
+def nominal_campaign() -> list[dict[str, Any]]:
+    """The whole register: 4 + 6 + 2, every scope used once, every threshold reachable."""
+    return register_corpus()
 
 
 def discoveries(count: int, *, failed_last: bool = False) -> list[dict[str, Any]]:
