@@ -855,7 +855,17 @@ class TestTheProducerAndTheContractAgree:
         assert qual.classify(honest) != "unknown_command_status_pair"
         state = state_of([*threshold_corpus(FAKE_RECEIPT_SECRET), honest])
         assert state["qualification_unknown_pair_receipts"] == 0
-        assert state["eligible_for_human_promotion_review"] is True
+        # Every criterion is still satisfied: this receipt poisons no threshold and
+        # creates no unknown pair, which is the whole claim. The gate is nonetheless shut,
+        # and by the campaign rather than by this receipt's (command, status) pair — since
+        # 03C-2F quater the shared corpus is the register in full, whose four discoveries
+        # are steps 1, 5, 8 and 11, so a fifth one is an overrun of a ceiling frozen in
+        # bis whatever it says about its own cost.
+        assert all(entry["passed"] for entry in state["criteria_results"])
+        assert state["campaign_invocation_counts"]["discover"] == 5
+        assert any(
+            "invocations discover" in conflict for conflict in state["evidence_conflicts"]
+        ), state["evidence_conflicts"]
 
     def test_the_published_counts_match_the_table(self) -> None:
         entries = len(qual.RECEIPT_PHASES)

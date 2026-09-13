@@ -116,6 +116,13 @@ rang se lit dans l'ordre canonique `(instant du coup d'envoi, identifiant en oct
 UTF-8)` de la découverte — pas dans l'ordre où le fournisseur a répondu, qu'aucun
 contrat ne promet.
 
+La note de rectification de D-083 du **2026-09-13** ajoute que la conformité au registre se
+vérifie dans les reçus : chaque étape est reconnue par sa commande, sa compétition, le rang
+de son événement dans l'ordre signé de la découverte applicable **et l'identité de son reçu
+parent**. Un corpus aux bons totaux dans le mauvais ordre est un conflit de preuve, et
+`COMPLETE` exige les douze étapes reconnues. Cela ne change ni la portée préenregistrée ni
+le chiffrage ci-dessous.
+
 `pinnacle` étant en zone `eu` seule, `effective_region_units(bookmakers=["pinnacle"])`
 vaut 1 : le chiffrage des crédits est inchangé.
 

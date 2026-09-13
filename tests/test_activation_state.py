@@ -622,31 +622,78 @@ class TestAnExistingV2ReceiptStaysUsableAndUntouched:
         path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         return path, payload
 
-    def test_a_valid_v2_discovery_still_authorises_core(
+    def _read_parent(self, path: Path) -> dict[str, Any]:
+        """`load_parent` on the operator's file, with the arguments `core` passes it."""
+        from betmaxxing.providers.the_odds_api import activation as A
+        from helpers_activation import BOOKMAKER, SPORT
+
+        return A.load_parent(
+            str(path),
+            signing=FAKE_RECEIPT_SECRET,
+            command="discover",
+            status=A.ActivationStatus.DISCOVERY_VERIFIED,
+            sport=SPORT,
+            bookmaker=BOOKMAKER,
+            now=A.ensure_utc(A._clock()),
+        )
+
+    def test_a_valid_v2_discovery_is_still_read_as_authority(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
+        """The reader's tolerance is unchanged; the register's is what refuses the file.
+
+        Until 03C-2F quater this ran the paid call and asserted it succeeded. The campaign
+        position is recognised from the receipts now, and step 2's parent is *the receipt
+        of step 1* — identified by ``parent_receipt_id``, not by the event it carries. A v2
+        copy beside the v8 discovery is a second receipt on the same events, which is
+        exactly the substitution the re-audit 03C-2F ter measured as advancing the campaign
+        in silence. So the two halves are asserted separately: the reader still accepts
+        every supported schema and hands back the v2 receipt's own chaining fields, and the
+        register refuses to accept it as the step's parent — before any request.
+        """
         legacy, _ = self._as_v2(Path(approved(monkeypatch, keyed)))
+
+        parent = self._read_parent(legacy)
+        assert parent["schema_version"] == 2
+        assert parent["receipt_id"] == "0" * 16
+        assert parent["event_tags"], "the v2 receipt's chaining fields keep their meaning"
+
         recorder = Recorder(
             {"/odds": lambda _r: httpx.Response(200, json=odds_payload(), headers=PAID_HEADERS)}
         )
         install(monkeypatch, recorder)
         result = run(*core_args(discovery_receipt=str(legacy)))
-        assert result.exit_code == 0, result.stdout
-        assert len(recorder.requests) == 1
+        assert result.exit_code != 0
+        assert "l'étape 1" in result.stdout.lower()
+        assert recorder.requests == []
 
     def test_the_child_records_the_parent_schema_it_trusted(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None
     ) -> None:
-        legacy, _ = self._as_v2(Path(approved(monkeypatch, keyed)))
+        """Copied from the parent the reader returned, not assumed to be the current one.
+
+        The v2 route to a child receipt closed with the register — a paid step's parent is
+        the receipt recognised for its own step, and a v2 copy is never that — so the claim
+        is asserted where it lives: the value written is ``int(parent["schema_version"])``
+        of the file ``load_parent`` actually read, and that reader returns 2 for a v2
+        receipt and 4 for this one.
+        """
+        discovery = Path(approved(monkeypatch, keyed))
+        legacy, _ = self._as_v2(discovery)
+        assert self._read_parent(legacy)["schema_version"] == 2
+
         install(
             monkeypatch,
             Recorder(
                 {"/odds": lambda _r: httpx.Response(200, json=odds_payload(), headers=PAID_HEADERS)}
             ),
         )
-        run(*core_args(discovery_receipt=str(legacy)))
+        result = run(*core_args(discovery_receipt=str(discovery)))
+        assert result.exit_code == 0, result.stdout
         core = [r for r in receipts_in(keyed) if r["command"] == "core"][-1]
-        assert core["parent_schema_version"] == 2
+        parent = json.loads(discovery.read_text(encoding="utf-8"))
+        assert core["parent_schema_version"] == parent["schema_version"]
+        assert core["parent_receipt_id"] == parent["receipt_id"]
 
     def test_the_v2_file_is_not_rewritten_or_upgraded(
         self, keyed: Path, monkeypatch: pytest.MonkeyPatch, frozen_clock: None

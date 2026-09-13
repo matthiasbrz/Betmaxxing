@@ -1568,6 +1568,11 @@ def campaign_preflight(
         )
 
 
+def _text_or_empty(value: object) -> str:
+    """A receipt field as a string, or ``""`` — never a silent match on ``None``."""
+    return value if isinstance(value, str) else ""
+
+
 def _campaign_parent_preflight(
     step: CampaignStep,
     ledger: CampaignLedger,
@@ -1589,12 +1594,29 @@ def _campaign_parent_preflight(
         raise Refused(ActivationStatus.PREPARED_NOT_EXECUTED, message)
 
     rank = step.event_rank
-    if step.command == "core" and rank is not None:
+    if rank is None or step.parent_step is None:
+        return
+
+    # The same identity the evaluator recognised for the parent step. A receipt carrying
+    # the right event is not the right receipt: `parent_receipt_id` is what chains the
+    # steps, and comparing tags alone let another receipt on the same event stand in.
+    expected_parent = ledger.recognised_ids.get(step.parent_step)
+    if expected_parent is None or _text_or_empty(parent.get("receipt_id")) != expected_parent:
+        refuse(
+            f"L'étape {step.index} de la campagne v8 s'appuie sur le reçu de l'étape "
+            f"{step.parent_step} reconnu sur cette frontière ; le reçu fourni n'est pas "
+            "celui-là. Un même événement ne rend pas deux reçus interchangeables, et la "
+            "chaîne des preuves ne se recompose pas après coup."
+        )
+
+    if step.command == "core":
         raw = parent.get("event_tags")
         tags = [tag for tag in raw if isinstance(tag, str)] if isinstance(raw, list | tuple) else []
         # Read before the rank is indexed: a listing too thin to serve this competition's
         # own steps has to stop the campaign here, where it is free, rather than one
-        # credit later when the second `core` finds no second event to address.
+        # credit later when the second `core` finds no second event to address. On the
+        # nominal path `run_discovery` has already refused to publish such a discovery;
+        # this is the second line, because the parent is a file the operator names.
         if not discovery_is_sufficient(sport, len(tags)):
             refuse(
                 f"La découverte parente n'a retenu que {len(tags)} événement(s) pour "
@@ -1611,25 +1633,12 @@ def _campaign_parent_preflight(
             )
         return
 
-    if step.command == "additional" and rank is not None:
-        # Resolved through the *discovery's* canonical order, not through « the n-th core
-        # receipt on disk »: the register names a rank, and a rank is a property of the
-        # listing, not of the order two receipts of the same second happen to be read in.
-        published = ledger.discovered_tags.get(sport, ())
-        expected = published[rank - 1] if rank - 1 < len(published) else None
-        parent_tag = parent.get("event_tag")
-        if expected is None or parent_tag != expected:
-            refuse(
-                f"L'étape {step.index} de la campagne v8 s'appuie sur le reçu core de "
-                f"l'étape {step.parent_step} ; le reçu fourni n'est pas celui-là. La chaîne "
-                "des preuves est préenregistrée et ne se recompose pas après coup."
-            )
-        if event_tag_value != parent_tag:
-            refuse(
-                f"L'étape {step.index} de la campagne v8 porte sur l'événement déjà prouvé "
-                f"par l'étape {step.parent_step} ; l'événement fourni en est un autre. Cinq "
-                "crédits ne se dépensent que là où un seul a déjà réussi."
-            )
+    if step.command == "additional" and event_tag_value != _text_or_empty(parent.get("event_tag")):
+        refuse(
+            f"L'étape {step.index} de la campagne v8 porte sur l'événement déjà prouvé "
+            f"par l'étape {step.parent_step} ; l'événement fourni en est un autre. Cinq "
+            "crédits ne se dépensent que là où un seul a déjà réussi."
+        )
 
 
 def _persist_or_report(
@@ -3688,6 +3697,17 @@ def build_activation_state(audit: receipt_store.AuditResult) -> dict[str, Any]:
         "campaign_abort_reason": qualification["campaign_abort_reason"],
         "campaign_required_bookmaker": qualification["campaign_required_bookmaker"],
         "campaign_required_scopes": qualification["campaign_required_scopes"],
+        # The next step, projected from the same evaluation of the same audit — not
+        # recomputed here from the counters. The independent re-audit 03C-2F ter measured
+        # what the omission cost: `evaluate()` had the five fields, this projection did
+        # not, and the runbook sent the operator to `status --json` to read five keys the
+        # command never emitted. Absent and `null` are different answers, so all five are
+        # always present.
+        "campaign_next_step_index": qualification["campaign_next_step_index"],
+        "campaign_next_command": qualification["campaign_next_command"],
+        "campaign_next_scope": qualification["campaign_next_scope"],
+        "campaign_next_event_rank": qualification["campaign_next_event_rank"],
+        "campaign_next_parent_step": qualification["campaign_next_parent_step"],
         "campaign_note": qualification["campaign_note"],
         "qualification_note": qualification["qualification_note"],
         "scope_note": (
@@ -3701,6 +3721,53 @@ def build_activation_state(audit: receipt_store.AuditResult) -> dict[str, Any]:
 def _reason_suffix(document: Mapping[str, Any]) -> str:
     reason = document.get("receipt_boundary_reason") or ""
     return f" ({reason})" if reason else ""
+
+
+def campaign_lines(document: Mapping[str, Any]) -> list[str]:
+    """The campaign's position, rendered for a terminal.
+
+    It reports and never authorises: it names the step the register puts next, or says
+    that none is determinable and why, and it stops there. Each of the twelve invocations
+    needs its own explicit authorisation, which no reading of the boundary can grant.
+    """
+    lines = [
+        "",
+        f"Campagne v{document['campaign_protocol_version']} — "
+        f"{document['campaign_execution_state']} "
+        f"(comptes {document['campaign_counts_state']})",
+    ]
+    counts = document["campaign_invocation_counts"]
+    if counts is None:
+        lines.append("  invocations : non établies — aucun compte n'est publié")
+    else:
+        limits = document["campaign_invocation_limits"]
+        spent = ", ".join(f"{name} {counts[name]}/{limits[name]}" for name in sorted(counts))
+        lines.append(f"  invocations : {spent}")
+
+    index = document["campaign_next_step_index"]
+    if index is None:
+        lines.append(
+            f"  étape suivante : aucune n'est déterminable — {document['campaign_execution_state']}"
+        )
+        if document["campaign_abort_reason"]:
+            lines.append(f"  abandon : {document['campaign_abort_reason']}")
+    else:
+        rank = document["campaign_next_event_rank"]
+        parent = document["campaign_next_parent_step"]
+        detail = (
+            f"événement de rang {rank} du reçu de l'étape {parent}"
+            if rank is not None and parent is not None
+            else "aucun événement — la commande en découvre la liste"
+        )
+        lines.append(
+            f"  étape suivante : {index} — {document['campaign_next_command']} sur "
+            f"{document['campaign_next_scope']}, {detail}"
+        )
+        lines.append(
+            "  cette ligne est un constat : chaque invocation exige son autorisation "
+            "humaine distincte."
+        )
+    return lines
 
 
 def status_lines(document: Mapping[str, Any]) -> list[str]:
@@ -3768,6 +3835,7 @@ def status_lines(document: Mapping[str, Any]) -> list[str]:
             )
     else:
         lines.append("Aucune observation de couverture enregistrée.")
+    lines += campaign_lines(document)
     from .qualification import summary_lines
 
     lines += summary_lines(document)

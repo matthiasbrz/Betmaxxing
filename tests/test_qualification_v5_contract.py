@@ -335,7 +335,16 @@ class TestTheProtocolIsVersionFive:
         assert document["qualification_reasons"]["other_protocol_version"] == 8
 
     def test_a_current_well_formed_corpus_still_reaches_the_gate(self) -> None:
-        document = _evaluate(threshold_corpus(), 0)
+        """Well formed includes producible, since 03C-2F quater.
+
+        ``threshold_corpus()`` is this module's paid evidence and stays what the rest of
+        the suite reads. The gate now also asks that the receipts form the pre-registered
+        register: the campaign position is recognised from them, and paid steps with no
+        discovery behind them are attributed to no step at all. No threshold moved.
+        """
+        import helpers_campaign_v8 as v8
+
+        document = _evaluate(v8.register_corpus(secret=_SIGNING), 0)
         assert passing(document) == sorted(c.criterion_id for c in qual.CRITERIA)
         assert document["eligible_for_human_promotion_review"] is True
         assert document["qualification_state"] == str(

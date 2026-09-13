@@ -138,6 +138,8 @@ ship. It does not validate the provider's payload, and no version number can.
 
 from __future__ import annotations
 
+import dataclasses
+import itertools
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -1927,11 +1929,14 @@ class CampaignLedger:
     core_by_family: dict[str, int]
     additional_by_competition: dict[str, int]
     used_event_tags: dict[str, tuple[str, ...]]
-    #: The ``(command, competition)`` of each campaign receipt, oldest first. This is
-    #: what :func:`campaign_next_step` compares with :data:`CAMPAIGN_SEQUENCE`: the
-    #: counts alone say *how many* invocations happened and never *in which order*, and
-    #: the register is an order.
-    recorded: tuple[tuple[str, str], ...] = ()
+    #: How many register steps are recognised as a contiguous prefix from step 1. Counts
+    #: alone say *how many* invocations happened and never *which steps they were*; this
+    #: is the answer to the second question, and the only basis for a next step.
+    progress: int = 0
+    #: ``step index → receipt_id`` for each recognised step. The guard reads it to check
+    #: that the parent receipt an operator names is the one the evidence recognises for
+    #: that step — the event tag alone proves the event, never the lineage.
+    recognised_ids: dict[int, str] = dataclasses.field(default_factory=dict)
 
     @property
     def established(self) -> bool:
@@ -1961,6 +1966,18 @@ def _unestablished_ledger(reason: str) -> CampaignLedger:
         additional_by_competition={},
         used_event_tags={},
     )
+
+
+def _sort_instant(receipt: Mapping[str, Any]) -> tuple[int, float]:
+    """A receipt's ``recorded_at`` as a comparable instant, unreadable ones last.
+
+    The instant, never its representation: ``12:00:00+02:00`` and ``10:00:00Z`` are the
+    same moment written two ways, and a textual sort would separate them.
+    """
+    moment = _instant(receipt.get("recorded_at"))
+    if moment is None:
+        return (1, 0.0)
+    return (0, moment.astimezone(UTC).timestamp())
 
 
 def campaign_receipts(receipts: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
@@ -2017,30 +2034,22 @@ def campaign_ledger(audit: AuditResult, *, unresolved_intents: int = 0) -> Campa
     core_by_family: dict[str, int] = {}
     additional_by_competition: dict[str, int] = {}
     used: dict[str, list[str]] = {command: [] for command in CAMPAIGN_COMMANDS}
-    recorded: list[tuple[str, str]] = []
     conflicts: list[str] = []
     abort_reason = ""
     abort_at: datetime | None = None
 
-    # Ordered by instant, then by the only order the steps can have happened in. Two
-    # receipts can share a ``recorded_at`` — a same-second chain, a clock of one-second
-    # resolution — and a plain sort then falls back to whatever order the directory was
-    # listed in, which for ``…-core-…`` and ``…-discover-…`` at the same stamp is
-    # alphabetical and therefore backwards. The register is read from this order, so an
-    # arbitrary tie-break would report a conforming campaign as out of order.
-    ordered = sorted(
-        mine,
-        key=lambda receipt: (
-            str(receipt.get("recorded_at") or ""),
-            CAMPAIGN_COMMANDS.index(_text(receipt.get("command")) or ""),
-        ),
-    )
+    # Ordered by **instant**, not by its text: the same moment can be written with two
+    # UTC offsets, and comparing strings would call them different. Ties keep the order
+    # they were read in, and nothing downstream depends on that: the register is
+    # recognised receipt by receipt in :func:`recognise_register`, which resolves each
+    # step from its own evidence and then *checks* the chronology. Sorting by step number
+    # here is precisely what must not happen — it would make any permutation conforming.
+    ordered = sorted(mine, key=_sort_instant)
     for receipt in ordered:
         command = _text(receipt.get("command")) or ""
         sport = _text(receipt.get("sport_key")) or ""
         status = _text(receipt.get("status")) or ""
         counts[command] += 1
-        recorded.append((command, sport))
 
         if (_text(receipt.get("bookmaker")) or "") != CAMPAIGN_BOOKMAKER:
             conflicts.append(
@@ -2114,11 +2123,22 @@ def campaign_ledger(audit: AuditResult, *, unresolved_intents: int = 0) -> Campa
                 f"{limit}, et un dépassement n'est pas un détail comptable"
             )
 
+    # The register is read only once the corpus is otherwise sound. An abort is not a
+    # contradiction — a readable failure consumes its invocation and stops the campaign,
+    # and demanding a success's lineage from it would turn an honest stop into a forged
+    # corpus. Existing conflicts already stop everything, so re-reading the order after
+    # them would add noise, not information.
+    recognised: dict[int, Mapping[str, Any]] = {}
+    progress = 0
+    if not conflicts and not abort_reason:
+        recognised, register_reasons, progress = recognise_register(ordered)
+        conflicts.extend(register_reasons)
+
     if conflicts:
         execution = CampaignExecutionState.CONFLICT
     elif abort_reason:
         execution = CampaignExecutionState.ABORTED
-    elif counts == CAMPAIGN_INVOCATION_LIMITS:
+    elif progress == len(CAMPAIGN_SEQUENCE):
         execution = CampaignExecutionState.COMPLETE
     elif any(counts.values()):
         execution = CampaignExecutionState.IN_PROGRESS
@@ -2137,8 +2157,132 @@ def campaign_ledger(audit: AuditResult, *, unresolved_intents: int = 0) -> Campa
         core_by_family=core_by_family,
         additional_by_competition=additional_by_competition,
         used_event_tags={command: tuple(tags) for command, tags in used.items()},
-        recorded=tuple(recorded),
+        progress=progress,
+        recognised_ids={
+            index: _text(receipt.get("receipt_id")) or "" for index, receipt in recognised.items()
+        },
     )
+
+
+def _discovery_step_of(step: CampaignStep) -> int | None:
+    """Which discovery numbers this step's event rank.
+
+    A ``core`` counts ranks in the discovery it names as its parent. An ``additional``
+    inherits the event its parent ``core`` proved, so its ranks are numbered in *that*
+    core's discovery — one hop further back.
+    """
+    if step.command == "core":
+        return step.parent_step
+    if step.command == "additional" and step.parent_step is not None:
+        return CAMPAIGN_SEQUENCE[step.parent_step - 1].parent_step
+    return None
+
+
+def recognise_register(
+    receipts: Sequence[Mapping[str, Any]],
+) -> tuple[dict[int, Mapping[str, Any]], tuple[str, ...], int]:
+    """Match each register step to the one receipt that can only be that step.
+
+    Returns the recognised receipts by step index, the contradictions found, and the
+    length of the contiguous prefix from step 1 — the campaign's position.
+
+    Recognition is by **evidence**, never by position in a listing, by a filename, or by
+    the ``(command, competition)`` pair alone. For a paid step that means four things at
+    once: the command and competition of the register, the event at the *rank* the
+    register names in the applicable discovery's own signed order, and the *identity* of
+    the parent receipt through ``parent_receipt_id``. The independent re-audit 03C-2F ter
+    measured what reading only the first two costs: a ``core`` on an event the register
+    never names, and an ``additional`` attached to the wrong ``core``, both advanced the
+    position in silence, and a corpus with the right totals in the wrong order reached
+    ``COMPLETE`` and the human-promotion gate.
+
+    Chronology is checked, not assumed: a step recorded strictly after one that follows
+    it in the register is a contradiction. The register is **not** used to sort distinct
+    instants back into shape — that would make any permutation look conforming, which is
+    the very fault this function exists to catch.
+    """
+    recognised: dict[int, Mapping[str, Any]] = {}
+    published_tags: dict[int, tuple[str, ...]] = {}
+    claimed: set[int] = set()
+    reasons: list[str] = []
+
+    for step in CAMPAIGN_SEQUENCE:
+        if step.command == "discover":
+            wanted_tag: str | None = None
+            wanted_parent: str | None = None
+        else:
+            parent = recognised.get(step.parent_step or 0)
+            discovery_step = _discovery_step_of(step)
+            if parent is None or discovery_step is None:
+                continue
+            order = published_tags.get(discovery_step, ())
+            rank = step.event_rank or 0
+            if not 0 < rank <= len(order):
+                continue
+            wanted_tag = order[rank - 1]
+            wanted_parent = _text(parent.get("receipt_id"))
+
+        candidates = [
+            position
+            for position, receipt in enumerate(receipts)
+            if position not in claimed
+            and (_text(receipt.get("command")) or "") == step.command
+            and (_text(receipt.get("sport_key")) or "") == step.sport
+            and (wanted_tag is None or _text(receipt.get("event_tag")) == wanted_tag)
+            and (wanted_parent is None or _text(receipt.get("parent_receipt_id")) == wanted_parent)
+        ]
+        if not candidates:
+            continue
+        if len(candidates) > 1:
+            # Never reduced to one arbitrarily: two receipts that both answer to a step
+            # is a question the evidence cannot settle, and picking either would be the
+            # reader choosing on the operator's behalf.
+            reasons.append(
+                f"{len(candidates)} reçus peuvent être l'étape {step.index} de la campagne "
+                "v8 : la preuve n'attribue pas cette étape de façon univoque"
+            )
+            continue
+        position = candidates[0]
+        claimed.add(position)
+        recognised[step.index] = receipts[position]
+        if step.command == "discover":
+            raw = receipts[position].get("event_tags")
+            published_tags[step.index] = (
+                tuple(tag for tag in raw if isinstance(tag, str))
+                if isinstance(raw, list | tuple)
+                else ()
+            )
+
+    progress = 0
+    while progress + 1 in recognised:
+        progress += 1
+
+    ahead = sorted(index for index in recognised if index > progress)
+    if ahead:
+        reasons.append(
+            f"{len(ahead)} étape(s) de la campagne v8 sont attestées alors qu'une étape "
+            "antérieure du registre ne l'est pas : le registre se parcourt dans l'ordre"
+        )
+    orphans = len(receipts) - len(claimed)
+    if orphans:
+        reasons.append(
+            f"{orphans} reçu(s) de campagne ne correspondent à aucune étape du registre "
+            "v8 — commande, compétition, rang d'événement ou reçu parent attendu"
+        )
+
+    chronology = [
+        (index, _instant(recognised[index].get("recorded_at"))) for index in sorted(recognised)
+    ]
+    for (earlier, before), (later, after) in itertools.pairwise(chronology):
+        if before is None or after is None:
+            continue
+        if before.astimezone(UTC) > after.astimezone(UTC):
+            reasons.append(
+                f"l'étape {earlier} de la campagne v8 est enregistrée après l'étape "
+                f"{later}, qui la suit dans le registre : la chronologie contredit l'ordre"
+            )
+
+    return recognised, tuple(dict.fromkeys(reasons)), progress
 
 
 def campaign_next_step(ledger: CampaignLedger) -> CampaignStep | None:
@@ -2164,13 +2308,9 @@ def campaign_next_step(ledger: CampaignLedger) -> CampaignStep | None:
         CampaignExecutionState.CONFLICT,
     ):
         return None
-    done = len(ledger.recorded)
-    if done >= len(CAMPAIGN_SEQUENCE):
+    if ledger.progress >= len(CAMPAIGN_SEQUENCE):
         return None
-    expected = tuple((step.command, step.sport) for step in CAMPAIGN_SEQUENCE[:done])
-    if ledger.recorded != expected:
-        return None
-    return CAMPAIGN_SEQUENCE[done]
+    return CAMPAIGN_SEQUENCE[ledger.progress]
 
 
 def campaign_block(ledger: CampaignLedger) -> dict[str, Any]:

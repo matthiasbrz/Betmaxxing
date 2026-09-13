@@ -251,7 +251,16 @@ class TestTheProtocolIsVersionThree:
         assert document["qualification_reasons"]["other_protocol_version"] == 8
 
     def test_a_current_well_formed_corpus_still_reaches_the_gate(self) -> None:
-        document = _evaluate(corpus(), 0)
+        """Well formed includes producible, since 03C-2F quater.
+
+        ``corpus()`` is this module's paid evidence and stays what the rest of the suite
+        reads. The gate now also asks that the receipts form the pre-registered register:
+        the campaign position is recognised from them, and paid steps with no discovery
+        behind them are attributed to no step at all. No criterion or threshold moved.
+        """
+        import helpers_campaign_v8 as v8
+
+        document = _evaluate(v8.register_corpus(secret=_SIGNING), 0)
         assert sorted(passing(document)) == sorted(c.criterion_id for c in qual.CRITERIA)
         assert document["eligible_for_human_promotion_review"] is True
 
@@ -682,8 +691,18 @@ class TestReceiptWritingIsExclusive:
 # ---------------------------------------------------------------------------
 class TestADuplicateIdentifierIsAConflict:
     def test_byte_identical_copies_count_once(self) -> None:
-        one = core(receipt_id="cc" * 8)
-        document = _evaluate([one, dict(one), dict(one)], 0)
+        """An exact copy keeps the receipt's identity, and adds no evidence.
+
+        The single ``core`` this used to build is the register's step 2 now, planted with
+        the discovery it descends from: since 03C-2F quater a lone paid receipt matches no
+        step and the corpus would be contradictory for a reason that has nothing to do
+        with duplication. Three files, one identity, one event — unchanged.
+        """
+        import helpers_campaign_v8 as v8
+
+        prefix = v8.register_corpus(2, secret=_SIGNING)
+        one = prefix[-1]
+        document = _evaluate([*prefix, dict(one), dict(one)], 0)
         assert entry(document, "CORE_MAPPING_FOOTBALL")["observed"]["events"] == 1
         assert document["evidence_conflicts"] == []
 

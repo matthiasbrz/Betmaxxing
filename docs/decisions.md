@@ -2488,3 +2488,74 @@ bornes locales, le vocabulaire de `QualificationState` ou le plafond machine
 `core` ni `additional`, aucun appel fournisseur, aucun crédit, aucune promotion. Les
 douze invocations restent soumises à des autorisations ultérieures, explicites et
 séparées — le registre dit seulement, à l'avance, laquelle serait la prochaine.
+
+#### Note de rectification — 2026-09-13
+
+La décision ci-dessus garde sa date et son contenu : c'est ce qui a été décidé le
+2026-09-05. Le réaudit indépendant **03C-2F ter** a mesuré quatre écarts entre ce qu'elle
+annonçait et ce que la livraison faisait, et la correction **03C-2F quater** les a fermés.
+Cette note dit lesquels, sans antidater l'implémentation.
+
+- **La publication dans `status` n'existait pas.** Les cinq champs
+  `campaign_next_step_index`, `campaign_next_command`, `campaign_next_scope`,
+  `campaign_next_event_rank` et `campaign_next_parent_step` étaient calculés par
+  `qualification.evaluate()` et **absents** de `status --json` comme de son rendu humain :
+  `build_activation_state()` énumérait les champs de campagne un par un et ne reprenait pas
+  ceux-là. Le runbook demandait à l'opérateur de lire cinq champs que la commande
+  n'émettait pas. L'exigence est conservée, et la projection ajoutée : les cinq clés sont
+  toujours présentes, et le rendu humain nomme étape, commande, compétition, rang et étape
+  parente quand ils s'appliquent — un constat, jamais une autorisation.
+- **Le sens de la dérivation était inversé.** La séquence n'est pas la source dont les
+  totaux sont dérivés : `_build_campaign_sequence()` **distribue les quotas** —
+  `CAMPAIGN_COMPETITIONS`, `CAMPAIGN_CORE_BY_COMPETITION`,
+  `CAMPAIGN_ADDITIONAL_PER_COMPETITION` — en douze étapes ordonnées, puis compte ce qu'il a
+  produit et compare ce **comptage dérivé** à la table préenregistrée
+  `CAMPAIGN_INVOCATIONS`, en levant `ValueError` à l'import si les deux divergent. La
+  protection est la même dans les deux sens de lecture ; la phrase, non.
+- **Le départage par commande n'était pas l'ordre du registre.** `discover`, puis `core`,
+  puis `additional` n'est pas la suite des douze étapes : aux trois frontières où un pas
+  payant précède un `discover` — 4/5, 7/8, 10/11 — une campagne conforme dont deux étapes
+  tombaient dans la même seconde était rapportée comme n'étant pas un début du registre, et
+  toute commande suivante refusée. Le départage porte désormais sur les **instants UTC** de
+  `recorded_at`, puis, à instant strictement égal seulement, sur le rang de l'étape
+  reconnue, après vérification des rangs et des liens. Et il ne prouve rien : une égalité
+  d'horodatage n'établit aucun ordre physique entre deux opérations, contrairement à ce que
+  la phrase « le seul ordre dans lequel ces reçus peuvent avoir été produits » affirmait.
+  Un tri global par numéro d'étape reste interdit — il ferait paraître conforme n'importe
+  quelle permutation.
+- **La fidélité au registre ne portait ni sur les rangs ni sur les parents.** La position
+  était lue du seul couple `(commande, compétition)`, donc un `core` sur un événement que le
+  registre ne nomme jamais, ou un `additional` rattaché au mauvais `core`, l'avançaient en
+  silence ; et un corpus aux bons totaux dans le mauvais ordre atteignait `COMPLETE` puis
+  `CRITERIA_MET_AWAITING_HUMAN_REVIEW`. `recognise_register` attribue maintenant chaque
+  étape au seul reçu qui ne peut être qu'elle — commande, compétition, événement au rang
+  nommé dans l'ordre signé de la découverte applicable, et **identité** du parent par
+  `parent_receipt_id` — refuse deux candidats pour une étape, et traite comme
+  contradictions un reçu orphelin, une étape attestée avant son antérieure et une
+  chronologie qui contredit l'ordre. `COMPLETE` exige les **douze étapes reconnues**, et ne
+  résulte plus des seuls totaux 4/6/2 ; il ne signifie pas non plus à lui seul que les
+  critères de qualification sont satisfaits — une campagne complète et conforme dont les
+  cotes sont périmées reste `INSUFFICIENT_EVIDENCE`.
+- **La date illisible.** « Un `commence_time` illisible classe son événement dernier » est
+  une propriété du helper de tri, pas un comportement observable de `discover` : sur le
+  chemin de découverte, `_inside()` exige un instant lisible pour retenir un événement, donc
+  une date malformée est écartée de la fenêtre avant le classement. La règle reste écrite
+  parce qu'elle décrit `canonical_event_order` sans l'aide de son appelant.
+
+**Conséquence mesurée sur la garde.** Le registre **subsume** plusieurs contrôles de
+comptage sur le chemin CLI : le plafond de six `core`, le quatrième `core` d'une famille, le
+second `additional` d'une compétition, la seconde découverte d'une compétition et le rejeu
+d'un événement ne sont plus atteignables depuis un corpus non contradictoire, parce que le
+seul corpus qui les approche est le registre terminé — et `COMPLETE` répond avant eux. Ces
+règles sont conservées comme seconde ligne, et restent atteignables côté évaluateur, où un
+corpus qui les dépasse vraiment est exactement ce qu'elles doivent nommer. Aucune garde
+n'est remplacée par une protection plus faible.
+
+**Ce que cette note ne change pas.** Ni le manifeste, ni le registre et sa répartition
+`2 + 1`, ni les plafonds 4 / 6 / 2, ni le budget 12 / 16 / 8 / 16, ni le protocole **8**, le
+schéma **4**, la version de preuve adaptateur **1**, le HMAC, les marchés, les tarifs, les
+TTL, les fenêtres ou les critères de qualification préexistants. `adapter_state` reste
+`IMPLEMENTED_UNVERIFIED`, le plafond machine reste `CRITERIA_MET_AWAITING_HUMAN_REVIEW`, et
+**D-082 et toutes les décisions antérieures restent inchangées, octet pour octet**. Aucune
+liberté de campagne, de substitution, de relance ou de fenêtre n'est ajoutée : les douze
+invocations restent soumises chacune à son autorisation humaine distincte.

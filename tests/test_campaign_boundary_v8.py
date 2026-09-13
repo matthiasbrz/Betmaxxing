@@ -397,6 +397,12 @@ class TestAnOutOfManifestCorpusConflicts:
         assert any(FOOTBALL[0] in conflict for conflict in document["evidence_conflicts"])
 
     def test_a_seventh_core_conflicts(self, boundary: Path) -> None:
+        """The evaluator is where the pre-registered ceiling of six stays reachable.
+
+        The guard cannot get here any more — the only non-contradictory corpus with six
+        ``core`` is the finished register — so this is the test that keeps the ceiling
+        itself asserted by name, on the corpus that really holds a seventh.
+        """
         corpus = v8.nominal_campaign()
         corpus.append(
             v8.core(sport=FOOTBALL[0], moment=v8.instant(9), rid="c" * 16, tag="core-tag-99")
@@ -405,6 +411,10 @@ class TestAnOutOfManifestCorpusConflicts:
         document = published(boundary)
         assert document["campaign_execution_state"] == "CONFLICT"
         assert document["qualification_state"] == "EVIDENCE_CONFLICT"
+        assert any(
+            "7 invocations core" in conflict and str(LIMITS["core"]) in conflict
+            for conflict in document["evidence_conflicts"]
+        ), document["evidence_conflicts"]
 
     def test_a_third_additional_conflicts(self, boundary: Path) -> None:
         corpus = v8.nominal_campaign()
@@ -550,8 +560,14 @@ class TestTheGuardRefusesBeforeAnythingIsSpent:
         disabled, a fifth discovery was still refused — by the one-per-competition rule,
         which happens to cover the same case for this manifest. The command stopped, and
         the guard under test had stopped guarding.
+
+        The corpus is the conforming eleven-step prefix rather than four discoveries in a
+        row: since 03C-2F quater the four ``discover`` of the register are steps 1, 5, 8
+        and 11, so four of them with nothing in between is a contradiction and the refusal
+        would be about the contradiction instead of the ceiling. Eleven steps put the
+        fourth discovery legitimately behind us, with the twelfth step still to come.
         """
-        plant(boundary, v8.discoveries(4))
+        plant(boundary, v8.register_corpus(11))
         result, _ = self.refuse(
             boundary,
             monkeypatch,
@@ -574,10 +590,18 @@ class TestTheGuardRefusesBeforeAnythingIsSpent:
     def test_a_seventh_core_is_refused(
         self, boundary: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # The nominal campaign minus its two `additional`: six `core` is the ceiling,
-        # and stopping short of the twelfth step keeps COMPLETE — which answers before
-        # any ceiling, and says something larger — out of the way.
-        plant(boundary, v8.nominal_campaign()[:-2])
+        """Refused, and the reason is the largest true one: the campaign is finished.
+
+        Until 03C-2F quater this planted six ``core`` with no ``additional`` and asserted
+        the ceiling by name. That corpus is a contradiction now that the position is
+        recognised from the receipts — the register's six ``core`` are steps 2, 3, 6, 9,
+        10 and 12, and steps 4 and 7 sit *between* them — so the only corpus holding six
+        conforming ``core`` is the whole register, and a finished campaign answers before
+        any ceiling. The pre-registered ceiling of six is not weakened: it stays in the
+        guard as a redundant second line, and the evaluator still names it on a corpus
+        that really holds seven — see ``test_a_seventh_core_conflicts``.
+        """
+        plant(boundary, v8.register_corpus())
         result, _ = self.refuse(
             boundary,
             monkeypatch,
@@ -598,9 +622,8 @@ class TestTheGuardRefusesBeforeAnythingIsSpent:
                 "--allow-network",
             ],
         )
-        # The ceiling, named — the per-family rule would refuse this case too.
-        assert "plafond" in result.output.lower()
-        assert str(LIMITS["core"]) in result.output
+        assert "COMPLETE" in result.output
+        assert "douze" in result.output
 
     def test_a_fourth_core_in_one_family_is_refused(
         self, boundary: Path, monkeypatch: pytest.MonkeyPatch
@@ -940,15 +963,30 @@ class TestTheCampaignBookmakerMustBeConfiguredForTheParser:
 
         receipts = [discovery]
         if command != "core":
+            # Each `core` names the discovery it descends from, and the `additional` names
+            # the `core` that proved its event: since 03C-2F quater the register is
+            # recognised from the receipts, and a chain with no `parent_receipt_id` is
+            # attributed to no step at all — the corpus would be in CONFLICT and this
+            # guard would never be consulted.
             receipts += [
                 v8.core(
-                    sport=FOOTBALL[0], moment=v8.instant(1 + rank), rid=f"c{rank:015x}", tag=tag
+                    sport=FOOTBALL[0],
+                    moment=v8.instant(1 + rank),
+                    rid=f"c{rank:015x}",
+                    tag=tag,
+                    parent_rid=discovery["receipt_id"],
                 )
                 for rank, tag in enumerate(tags)
             ]
         if command == "discover":
             receipts.append(
-                v8.additional(sport=FOOTBALL[0], moment=v8.instant(4), rid="e" * 16, tag=tags[-1])
+                v8.additional(
+                    sport=FOOTBALL[0],
+                    moment=v8.instant(4),
+                    rid="e" * 16,
+                    tag=tags[-1],
+                    parent_rid=f"c{len(tags) - 1:015x}",
+                )
             )
         plant(boundary, receipts)
 

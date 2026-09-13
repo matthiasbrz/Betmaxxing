@@ -255,9 +255,27 @@ avant tout coût.
 | 12 | `core` | `tennis_wta_us_open` | 1 | étape 11 |
 
 Le **rang** est une position dans l'ordre canonique de la découverte parente :
-`(instant du coup d'envoi, identifiant en octets UTF-8)`, un instant illisible classé
-dernier, un identifiant répété compté une fois. C'est cet ordre-là que `discover`
-affiche, et il ne dépend pas de l'ordre dans lequel le fournisseur a répondu.
+`(instant du coup d'envoi, identifiant en octets UTF-8)`, un identifiant répété compté une
+fois. C'est cet ordre-là que `discover` affiche, et il ne dépend pas de l'ordre dans lequel
+le fournisseur a répondu. Un événement dont la date de coup d'envoi est illisible ne vous
+sera jamais présenté avec un rang : `discover` ne retient dans sa fenêtre que les
+événements dont l'instant est lisible, donc une date malformée est écartée avant le
+classement plutôt que rangée en dernier.
+
+**Ce que la machine vérifie dans vos reçus.** La position n'est pas un compte : chaque étape
+est attribuée au seul reçu qui ne peut être qu'elle — la commande et la compétition du
+registre, l'événement au rang que le registre nomme dans l'ordre signé de la découverte
+applicable, et l'**identité** du reçu parent (`parent_receipt_id`). Un même événement ne
+rend pas deux reçus interchangeables. Une chronologie qui contredit l'ordre du registre, un
+reçu de campagne qui ne correspond à aucune étape, ou une étape attestée alors qu'une étape
+antérieure ne l'est pas, sont des **conflits de preuve** : `campaign_execution_state` passe
+à `CONFLICT`, les cinq champs d'étape suivante valent `null`, `qualification_state` devient
+`EVIDENCE_CONFLICT` et la porte de revue humaine se ferme. Les comptes d'invocations
+réellement attestées sont conservés — un conflit n'efface aucune dépense.
+
+`COMPLETE` demande les **douze étapes reconnues**, pas seulement les totaux 4 / 6 / 2. Et
+`COMPLETE` ne dit rien des autres critères : une campagne complète et conforme dont les
+cotes sont périmées reste `INSUFFICIENT_EVIDENCE`.
 
 Vous n'avez donc aucune décision à prendre entre deux appels. Demandez l'étape suivante
 à la machine :
@@ -267,10 +285,16 @@ python -m betmaxxing.providers.the_odds_api.activation status --json
 ```
 
 `campaign_next_step_index`, `campaign_next_command`, `campaign_next_scope`,
-`campaign_next_event_rank` et `campaign_next_parent_step` disent quoi lancer. Les cinq
-valent `null` ensemble quand il n'y a rien à lancer — campagne terminée, arrêtée, en
-conflit, comptes non établis, ou reçus qui ne forment pas un début de ce registre. Un
-`null` n'est jamais « recommencez à l'étape 1 ».
+`campaign_next_event_rank` et `campaign_next_parent_step` disent quoi lancer. Les cinq clés
+sont **toujours présentes**, et `status` sans `--json` les rend aussi en clair — étape,
+commande, compétition, rang et étape parente. Les cinq valent `null` ensemble quand il n'y a
+rien à lancer — campagne terminée, arrêtée, en conflit, comptes non établis, ou reçus qui ne
+forment pas un début de ce registre. Un `null` n'est jamais « recommencez à l'étape 1 ».
+Pour une découverte à venir, seuls le rang et le parent sont `null` : ce n'est pas l'absence
+d'étape suivante, c'est une commande qui découvre elle-même sa liste.
+
+Cette lecture est un **constat**, jamais une autorisation : chacune des douze invocations
+exige son autorisation humaine distincte, et aucune lecture de la frontière ne la donne.
 
 ### Ce que la garde refuse, et ce qu'elle laisse derrière elle
 
@@ -295,6 +319,15 @@ la lecture de la clé fournisseur, la publication d'un intent et toute socket. E
 
 Un refus laisse exactement : 0 socket, 0 lecture de clé fournisseur, 0 intent, 0 reçu,
 0 crédit.
+
+Depuis que la position est reconnue dans les reçus, plusieurs de ces refus sont des
+**secondes lignes** : le plafond de six `core`, le quatrième `core` d'une famille, le second
+`additional` d'une compétition, la seconde découverte d'une compétition et le rejeu d'un
+événement ne peuvent plus être atteints depuis un corpus non contradictoire, parce que le
+seul corpus qui en approche est le registre terminé — et `COMPLETE` répond avant eux. Ils
+sont conservés, et c'est l'évaluateur qui les nomme sur un corpus qui les dépasse vraiment.
+Concrètement, vous verrez « la campagne est COMPLETE » ou « l'étape suivante est *x* » bien
+avant de voir « le plafond est atteint ».
 
 ### Un échec consomme sa place
 

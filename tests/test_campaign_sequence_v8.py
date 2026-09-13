@@ -259,12 +259,23 @@ def sequence_corpus(upto: int) -> list[dict[str, Any]]:
             out.append(v8.discovery(sport=step.sport, moment=moment, rid=rid, events=3))
             continue
         assert step.parent_step is not None and step.event_rank is not None
+        # `parent_receipt_id`, because since 03C-2F quater the position is recognised from
+        # the receipts and the parent's *identity* is part of the evidence. Omitting it
+        # described a receipt no `core` or `additional` command ever emits, and the
+        # register would rightly refuse to attribute it to any step.
+        parent_rid = rid_of_step[step.parent_step]
         if step.command == "core":
             tag = tags_for(rid_of_step[step.parent_step], 3)[step.event_rank - 1]
-            out.append(v8.core(sport=step.sport, moment=moment, rid=rid, tag=tag))
+            out.append(
+                v8.core(sport=step.sport, moment=moment, rid=rid, tag=tag, parent_rid=parent_rid)
+            )
         else:
             tag = tag_of_step[step.parent_step]
-            out.append(v8.additional(sport=step.sport, moment=moment, rid=rid, tag=tag))
+            out.append(
+                v8.additional(
+                    sport=step.sport, moment=moment, rid=rid, tag=tag, parent_rid=parent_rid
+                )
+            )
         tag_of_step[step.index] = tag
     return out
 

@@ -356,7 +356,16 @@ class TestTheContractKnowsWhatDiscoverWrites:
         )
         document = state(workspace)
         assert document["qualification_unknown_pair_receipts"] == 0
-        assert document["qualification_state"] != "EVIDENCE_CONFLICT"
+        # The pair is honest, the receipt costs nothing and it spoils no threshold — that
+        # is the claim. What this corpus does contradict is the campaign's four
+        # pre-registered discoveries, a ceiling frozen in 03C-2F bis: since quater the
+        # shared corpus is the register in full, so this receipt is a *fifth* discovery
+        # whatever it says about its own cost.
+        assert all(entry["passed"] for entry in document["criteria_results"])
+        assert document["campaign_invocation_counts"]["discover"] == 5
+        assert any(
+            "invocations discover" in conflict for conflict in document["evidence_conflicts"]
+        ), document["evidence_conflicts"]
 
 
 # ---------------------------------------------------------------------------
